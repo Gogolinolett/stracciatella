@@ -228,21 +228,16 @@ public class PathWalker {
             offCourseTicks = 0;
 
             // Detect gap transition where residual momentum could cause overshoot:
-            // if the segment we just completed was a jump (gap >= 2) and the
-            // upcoming segment is shorter, brake until velocity drops to a safe
-            // level. Without this, residual sprint momentum causes overshoot on
-            // single-block platforms.
+            // if the segment we just completed was a jump (gap >= 2) and there
+            // is more path ahead, brake until velocity drops to a safe level.
+            // Without this, residual sprint momentum causes overshoot on
+            // single-block platforms — even for same-size gap=2 chains.
             if (index >= 2) {
                 MeshNode prev2 = currentPath.get(index - 2);
                 MeshNode prev1 = currentPath.get(index - 1);
                 int prevSegGap = Math.max(Math.abs(prev1.getX() - prev2.getX()), Math.abs(prev1.getZ() - prev2.getZ()));
                 int currSegGap = computeNodeGap();
-                // Brake when transitioning from a larger gap to a smaller gap,
-                // OR when chaining same-size sprint jumps (gap >= 3) on a single-
-                // block platform — residual sprint momentum from the landing can
-                // carry the player off the block before the next jump fires.
-                boolean needsBrake = (prevSegGap >= 2 && currSegGap < prevSegGap && currSegGap > 0)
-                        || (prevSegGap >= 3 && currSegGap > 0);
+                boolean needsBrake = prevSegGap >= 2 && currSegGap > 0;
                 if (needsBrake) {
                     landingBrakeActive = true;
                     // Smaller gaps need lower velocity to avoid overshoot.
@@ -794,11 +789,13 @@ public class PathWalker {
         if (angle >= 45.0) {
             return false;
         }
-        // Only allow when the total gap from prev to next is within one sprint
-        // jump's reach (~4.5 blocks). Beyond that the player must land on the
-        // intermediate block to set up the next jump.
+        // Only allow when the total gap from prev to next is short enough that
+        // the player can comfortably clear both segments in one arc. A totalGap
+        // of 4 barely reaches the far block with a sprint jump (~4.5 range),
+        // leaving zero margin to stop on a single-block platform. Cap at 3 to
+        // force landing on the intermediate block for anything longer.
         int totalGap = Math.max(Math.abs(next.getX() - prev.getX()), Math.abs(next.getZ() - prev.getZ()));
-        return totalGap <= 4;
+        return totalGap <= 3;
     }
 
     private static boolean shouldCancelOffCourse(double distance, LocalPlayer player, MeshNode target, boolean canMoveForward, boolean shouldBrake) {
