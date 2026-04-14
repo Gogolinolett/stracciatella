@@ -127,7 +127,15 @@ public class BotController {
         return taskQueue;
     }
 
-    // --- Tick handler ---
+    // --- Tick handlers ---
+
+    /**
+     * Called at START_CLIENT_TICK, before handleKeybinds processes input.
+     * Drives block interaction by calling startAttack/continueAttack directly.
+     */
+    public static void tickStart(Minecraft client) {
+        BlockInteractor.tickInteraction();
+    }
 
     public static void tick(Minecraft client) {
         if (paused || phase == Phase.IDLE) {
@@ -284,11 +292,9 @@ public class BotController {
             player.setXRot(pitch);
         }
 
-        // Start mining if not already, and tick the interaction each frame
+        // Start mining if not already
         if (!BlockInteractor.isInteracting()) {
             BlockInteractor.startInteraction(currentTask.interactionType());
-        } else {
-            BlockInteractor.tickInteraction();
         }
 
         // Check if block is broken

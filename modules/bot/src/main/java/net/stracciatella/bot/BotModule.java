@@ -11,6 +11,9 @@ public class BotModule implements Module {
     public void init() {
         BotController.loadConfig();
         BotCommands.register();
+        // Drive block interaction before handleKeybinds processes input.
+        // Calls startAttack/continueAttack directly to avoid GLFW key reset issues.
+        ClientTickEvents.START_CLIENT_TICK.register(BotController::tickStart);
         ClientTickEvents.END_CLIENT_TICK.register(BotController::tick);
         TestRunner.instance().registerSuite(BotTests.class);
     }

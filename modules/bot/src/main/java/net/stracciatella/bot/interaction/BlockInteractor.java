@@ -1,52 +1,53 @@
 package net.stracciatella.bot.interaction;
 
-import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.Options;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.stracciatella.bot.task.InteractionType;
 
 /**
- * Simulates block interaction through vanilla key press input.
- * Mining = hold attack key while looking at block.
- * Using = hold use key while looking at block.
- *
- * Uses both setDown (for continuous hold) and KeyMapping.click (for registering
- * click events that trigger startAttack/startUse in creative mode).
+ * Drives block interaction by calling Minecraft's attack methods directly.
+ * <p>
+ * Uses startAttack() for the initial hit and continueAttack() each subsequent
+ * tick. This bypasses key simulation which has timing issues with the tick
+ * multiplier's GLFW event reset cycle.
  */
 public class BlockInteractor {
 
     private static boolean interacting = false;
     private static InteractionType currentType = null;
+    private static boolean started = false;
 
+    /**
+     * Begin block interaction. The actual startAttack/continueAttack calls
+     * happen in {@link #tickInteraction()} which must be called each tick.
+     */
     public static void startInteraction(InteractionType type) {
-        Options options = Minecraft.getInstance().options;
         interacting = true;
         currentType = type;
-        if (type == InteractionType.ATTACK) {
-            options.keyAttack.setDown(true);
-            KeyMapping.click(options.keyAttack.key);
-        } else {
-            options.keyUse.setDown(true);
-            KeyMapping.click(options.keyUse.key);
-        }
+        started = false;
     }
 
     /**
-     * Register another click event on the current interaction key.
-     * Called each tick to ensure continuous mining works in both
-     * creative mode (needs clicks) and survival mode (needs isDown).
+     * Called at START_CLIENT_TICK (before handleKeybinds) to drive the mining.
+     * On the first tick, calls startAttack() to begin breaking.
+     * On subsequent ticks, calls continueAttack(true) to progress the break.
      */
     public static void tickInteraction() {
-        if (!interacting) {
+        if (!interacting || currentType != InteractionType.ATTACK) {
             return;
         }
-        Options options = Minecraft.getInstance().options;
-        if (currentType == InteractionType.ATTACK) {
-            KeyMapping.click(options.keyAttack.key);
-        } else if (currentType == InteractionType.USE) {
-            KeyMapping.click(options.keyUse.key);
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) {
+            return;
+        }
+
+        if (!started) {
+            mc.missTime = 0;
+            mc.startAttack();
+            started = true;
+        } else {
+            mc.continueAttack(true);
         }
     }
 
@@ -54,14 +55,13 @@ public class BlockInteractor {
         if (!interacting) {
             return;
         }
-        Options options = Minecraft.getInstance().options;
-        if (currentType == InteractionType.ATTACK) {
-            options.keyAttack.setDown(false);
-        } else if (currentType == InteractionType.USE) {
-            options.keyUse.setDown(false);
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.gameMode != null) {
+            mc.gameMode.stopDestroyBlock();
         }
         interacting = false;
         currentType = null;
+        started = false;
     }
 
     public static boolean isInteracting() {
