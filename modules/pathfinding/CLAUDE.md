@@ -72,6 +72,12 @@ Decision paths in priority order:
 - **Direction-aware collision-edge**: Only shrinks AABB in the gap axis direction, preventing false triggers from perpendicular drift on single-block platforms
 - **Skip-retreat threshold**: 0.14 — below this speed, the player retreats; above, they sprint straight through. Prevents players from attempting collision-edge jumps without enough speed
 
+### Timing model
+
+All PathWalker logic is **tick-based** — no wall-clock time dependencies. This means behavior is identical regardless of tick rate (e.g. during accelerated tests at 200 TPS). The only `System.currentTimeMillis()` usage is for debug output throttling (cosmetic, not functional).
+
+- **Alignment hold** (`alignmentHoldTicks`, default 5): After camera aligns with the target direction, holds forward movement enabled for this many ticks even if angle drifts slightly. Prevents stop-start jitter on turns. Configurable via `/path walkconfig alignhold <ticks>`.
+
 ### Config system
 
 - Stored in `pathwalker.json`, loaded/saved via `PathWalker.loadConfig()`/`saveConfig()`

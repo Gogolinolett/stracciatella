@@ -319,11 +319,11 @@ public class PathCommands {
                                             return 1;
                                         })))
                         .then(literal("alignhold")
-                                .then(argument("ms", IntegerArgumentType.integer(0))
+                                .then(argument("ticks", IntegerArgumentType.integer(0))
                                         .executes(context -> {
-                                            int ms = IntegerArgumentType.getInteger(context, "ms");
-                                            PathWalker.setAlignmentHoldMs(ms);
-                                            context.getSource().sendFeedback(Component.literal("Alignment hold set to " + ms + " ms"));
+                                            int ticks = IntegerArgumentType.getInteger(context, "ticks");
+                                            PathWalker.setAlignmentHoldTicks(ticks);
+                                            context.getSource().sendFeedback(Component.literal("Alignment hold set to " + ticks + " ticks"));
                                             return 1;
                                         })))
                         .then(literal("jumpcooldown")
@@ -427,7 +427,7 @@ public class PathCommands {
         sendMenuLine(player, valueLine("edgejumpholdedge", PathWalker.CONFIG.edgeJumpHoldEdge, 0.01, "/path walkconfig edgejumpholdedge", 0.0, 0.5));
         sendMenuLine(player, valueLine("edgejumptrigger", PathWalker.CONFIG.edgeJumpTriggerDistance, 0.1, "/path walkconfig edgejumptrigger", 0.0, Double.POSITIVE_INFINITY));
         sendMenuLine(player, valueLine("edgejumptriggeredge", PathWalker.CONFIG.edgeJumpTriggerEdge, 0.01, "/path walkconfig edgejumptriggeredge", 0.0, 0.5));
-        sendMenuLine(player, valueLineInt("alignhold", PathWalker.CONFIG.alignmentHoldMs, 50, "/path walkconfig alignhold", 0));
+        sendMenuLine(player, valueLineInt("alignhold", PathWalker.CONFIG.alignmentHoldTicks, 1, "/path walkconfig alignhold", 0));
         sendMenuLine(player, valueLineInt("jumpcooldown", PathWalker.CONFIG.jumpCooldownTicks, 1, "/path walkconfig jumpcooldown", 0));
         sendMenuLine(player, valueLineInt("jumpsimticks", PathWalker.CONFIG.jumpSimTicks, 1, "/path walkconfig jumpsimticks", 5));
         sendMenuLine(player, valueLine("jumplanding", PathWalker.CONFIG.jumpLandingMargin, 0.05, "/path walkconfig jumplanding", 0.0, Double.POSITIVE_INFINITY));

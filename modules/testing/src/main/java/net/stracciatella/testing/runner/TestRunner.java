@@ -22,6 +22,7 @@ public class TestRunner {
     private volatile boolean running;
     private volatile boolean autoRunTriggered;
     private TestContext activeContext;
+    private static volatile int tickMultiplier = 1;
 
     private TestRunner() {
     }
@@ -140,40 +141,48 @@ public class TestRunner {
         // Release mouse grab so cursor is free during tests
         ctx.runOnClient(mc -> mc.mouseHandler.releaseMouse());
 
+        tickMultiplier = 7;
+        ctx.runCommand("tick rate 140");
+
         LOGGER.info("Starting {} tests", tests.size());
 
-        for (RegisteredTest test : tests) {
-            LOGGER.info("Running: [{}] {}", test.suiteName(), test.displayName());
+        try {
+            for (RegisteredTest test : tests) {
+                LOGGER.info("Running: [{}] {}", test.suiteName(), test.displayName());
 
-            int timeoutTicks = test.annotation().timeoutTicks();
-            ctx.setTimeoutTicks(timeoutTicks);
+                int timeoutTicks = test.annotation().timeoutTicks();
+                ctx.setTimeoutTicks(timeoutTicks);
 
-            long startTime = System.currentTimeMillis();
-            try {
-                test.method().invoke(test.suiteInstance(), ctx);
-                long elapsed = System.currentTimeMillis() - startTime;
-                results.add(new TestResult(test.suiteName(), test.displayName(),
-                        TestResult.Status.PASSED, "", elapsed));
-            } catch (Exception e) {
-                long elapsed = System.currentTimeMillis() - startTime;
-                Throwable cause = e.getCause() != null ? e.getCause() : e;
-                String message = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+                long startTime = System.currentTimeMillis();
+                try {
+                    test.method().invoke(test.suiteInstance(), ctx);
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    results.add(new TestResult(test.suiteName(), test.displayName(),
+                            TestResult.Status.PASSED, "", elapsed));
+                } catch (Exception e) {
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    String message = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
 
-                TestResult.Status status;
-                if (message.contains("Timed out") || message.contains("timed out")) {
-                    status = TestResult.Status.TIMED_OUT;
-                } else if (cause instanceof AssertionError) {
-                    status = TestResult.Status.FAILED;
-                } else {
-                    status = TestResult.Status.ERROR;
+                    TestResult.Status status;
+                    if (message.contains("Timed out") || message.contains("timed out")) {
+                        status = TestResult.Status.TIMED_OUT;
+                    } else if (cause instanceof AssertionError) {
+                        status = TestResult.Status.FAILED;
+                    } else {
+                        status = TestResult.Status.ERROR;
+                    }
+
+                    results.add(new TestResult(test.suiteName(), test.displayName(),
+                            status, message, elapsed));
                 }
-
-                results.add(new TestResult(test.suiteName(), test.displayName(),
-                        status, message, elapsed));
             }
-        }
 
-        printReport();
+            printReport();
+        } finally {
+            tickMultiplier = 1;
+            ctx.runCommand("tick rate 20");
+        }
     }
 
     private void printReport() {
@@ -202,6 +211,10 @@ public class TestRunner {
         LOGGER.info("==================================");
         LOGGER.info("Total: {} | Passed: {} | Failed: {}", passed + failed, passed, failed);
         LOGGER.info("==================================");
+    }
+
+    public static int getTickMultiplier() {
+        return tickMultiplier;
     }
 
     public boolean isRunning() {

@@ -42,6 +42,15 @@ net.stracciatella.testing
 7. Timeout is managed per-test via `@MinecraftTest.timeoutTicks` and `ctx.waitFor()` auto-timeout
 8. ClientTickMixin signals the test thread each tick via `TestContext.onClientTick()`
 
+## Tick rate acceleration
+
+During automated test runs, `TestRunner` accelerates both client and server ticks:
+- **Client**: `ClientTickMixin` forces extra `Minecraft.tick()` calls per frame via a tick multiplier (default 7x, so ~140 effective client TPS). A recursion guard (`inExtraTick` flag) prevents the mixin from re-triggering itself.
+- **Server**: `/tick rate 140` speeds up the integrated server to match the client.
+- **TestContext**: Uses `Semaphore` (not `CountDownLatch`) so extra ticks within a single frame are never lost. `waitFor()` evaluates predicates directly on the tick thread to avoid frame-rate bottlenecks.
+
+Note: `/tick rate` alone does NOT speed up `Minecraft.tick()` on the client — only the server. The mixin-based extra ticks are required for actual client speedup.
+
 ## Key conventions
 
 - Test methods must have signature `void methodName(TestContext ctx)`

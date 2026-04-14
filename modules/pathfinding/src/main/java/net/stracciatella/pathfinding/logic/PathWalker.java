@@ -51,7 +51,7 @@ public class PathWalker {
     private static boolean debug = false;
     private static long lastDebugMs = 0;
     private static DebugState lastDebug = new DebugState();
-    private static long alignedUntilMs = 0;
+    private static int alignmentHoldRemaining = 0;
     private static boolean learningEnabled = false;
     private static boolean lastLearnOnGround = false;
     private static double lastLearnX = 0.0;
@@ -98,7 +98,7 @@ public class PathWalker {
         jumpCooldownTicks = 0;
         edgeThresholdInitialized = false;
         jumpAimOffsetInitialized = false;
-        alignedUntilMs = 0;
+        alignmentHoldRemaining = 0;
         lastDistance = -1.0;
         offCourseTicks = 0;
         maxJumpPhase = 0;
@@ -179,6 +179,9 @@ public class PathWalker {
         updateCalibration(client, player);
         if (jumpCooldownTicks > 0) {
             jumpCooldownTicks--;
+        }
+        if (alignmentHoldRemaining > 0) {
+            alignmentHoldRemaining--;
         }
         if (index >= currentPath.size()) {
             stop();
@@ -454,11 +457,10 @@ public class PathWalker {
             jumpCooldownTicks = CONFIG.jumpCooldownTicks;
         }
         float moveThreshold = sharpTurn ? CameraController.TURN_STOP_THRESHOLD_DEG : CameraController.WALK_TURN_THRESHOLD_DEG;
-        long nowMs = System.currentTimeMillis();
         if (angleDeltaAfter <= moveThreshold) {
-            alignedUntilMs = nowMs + CONFIG.alignmentHoldMs;
+            alignmentHoldRemaining = CONFIG.alignmentHoldTicks;
         }
-        boolean canMoveForward = angleDeltaAfter <= moveThreshold || nowMs < alignedUntilMs;
+        boolean canMoveForward = angleDeltaAfter <= moveThreshold || alignmentHoldRemaining > 0;
         if (angleDeltaAfter >= CameraController.WALK_TURN_MAX_DEG) {
             canMoveForward = false;
         }
@@ -1795,8 +1797,8 @@ public class PathWalker {
         saveConfig();
     }
 
-    public static void setAlignmentHoldMs(int ms) {
-        CONFIG.alignmentHoldMs = ms;
+    public static void setAlignmentHoldTicks(int ticks) {
+        CONFIG.alignmentHoldTicks = ticks;
         saveConfig();
     }
 
@@ -1827,7 +1829,7 @@ public class PathWalker {
         public int jumpCooldownTicks = 4;
         public int jumpSimTicks = 40;
         public double jumpLandingMargin = 0.3;
-        public int alignmentHoldMs = 250;
+        public int alignmentHoldTicks = 5;
         public double offCourseDistance = 3.5;
         public int offCourseTicks = 10;
         public double stepUpJumpDistance = 2.0;
@@ -1864,7 +1866,7 @@ public class PathWalker {
             jumpCooldownTicks = other.jumpCooldownTicks;
             jumpSimTicks = other.jumpSimTicks;
             jumpLandingMargin = other.jumpLandingMargin;
-            alignmentHoldMs = other.alignmentHoldMs;
+            alignmentHoldTicks = other.alignmentHoldTicks;
             offCourseDistance = other.offCourseDistance;
             offCourseTicks = other.offCourseTicks;
             stepUpJumpDistance = other.stepUpJumpDistance;
@@ -1894,8 +1896,8 @@ public class PathWalker {
             if (edgeJumpForwardAirBias < 0.0) {
                 edgeJumpForwardAirBias = 0.0;
             }
-            if (alignmentHoldMs < 0) {
-                alignmentHoldMs = 0;
+            if (alignmentHoldTicks < 0) {
+                alignmentHoldTicks = 0;
             }
             if (offCourseDistance <= 0.0) {
                 offCourseDistance = 3.5;

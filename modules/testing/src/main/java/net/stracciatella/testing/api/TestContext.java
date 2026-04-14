@@ -8,6 +8,7 @@ import net.minecraft.world.phys.Vec3;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -18,8 +19,16 @@ import java.util.function.Predicate;
  * to synchronize with the render thread.
  */
 public class TestContext {
-    private final CountDownLatch[] tickLatch = {new CountDownLatch(1)};
+    private final Semaphore tickSemaphore = new Semaphore(0);
     private int remainingTicks;
+
+    // State for tick-thread predicate evaluation (used by waitFor)
+    private volatile Predicate<Minecraft> activePredicate;
+    private volatile int predicateTimeout;
+    private volatile int predicateTicksElapsed;
+    private volatile Throwable predicateError;
+    private volatile boolean predicateMatched;
+    private volatile CountDownLatch predicateDone;
 
     public TestContext() {
         this.remainingTicks = Integer.MAX_VALUE;
@@ -35,22 +44,45 @@ public class TestContext {
     /**
      * Called by the tick mixin on the render thread each client tick.
      * Signals the test thread that a tick has completed.
+     * <p>
+     * When a waitFor predicate is active, evaluates it directly on the tick thread
+     * to avoid frame-rate bottlenecks. Otherwise, releases a semaphore permit
+     * so that waitTick() can consume it.
      */
     public void onClientTick() {
-        tickLatch[0].countDown();
+        Predicate<Minecraft> pred = activePredicate;
+        if (pred != null) {
+            predicateTicksElapsed++;
+            try {
+                if (pred.test(Minecraft.getInstance())) {
+                    predicateMatched = true;
+                    activePredicate = null;
+                    predicateDone.countDown();
+                } else if (predicateTicksElapsed >= predicateTimeout) {
+                    activePredicate = null;
+                    predicateDone.countDown();
+                }
+            } catch (Throwable t) {
+                predicateError = t;
+                activePredicate = null;
+                predicateDone.countDown();
+            }
+            return;
+        }
+        tickSemaphore.release();
     }
 
     /**
      * Wait one client tick. Blocks the test thread until the next tick completes.
+     * Uses a semaphore so ticks are never lost when tick rate exceeds frame rate.
      */
     public void waitTick() {
         try {
-            tickLatch[0].await();
+            tickSemaphore.acquire();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Test thread interrupted", e);
         }
-        tickLatch[0] = new CountDownLatch(1);
         remainingTicks--;
     }
 
@@ -75,20 +107,43 @@ public class TestContext {
 
     /**
      * Wait until the predicate returns true, with a specific timeout.
-     * The predicate runs on the render thread.
+     * The predicate is evaluated directly on the tick thread for maximum throughput
+     * at high tick rates.
      *
      * @return the number of ticks waited
      */
     public int waitFor(Predicate<Minecraft> predicate, int timeout) {
-        for (int i = 0; i < timeout; i++) {
-            waitTick();
-            boolean result = computeOnClient(predicate::test);
-            if (result) {
-                remainingTicks -= i + 1;
-                return i + 1;
-            }
+        predicateError = null;
+        predicateMatched = false;
+        predicateTicksElapsed = 0;
+        predicateTimeout = timeout;
+        predicateDone = new CountDownLatch(1);
+        activePredicate = predicate;
+
+        try {
+            predicateDone.await();
+        } catch (InterruptedException e) {
+            activePredicate = null;
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Test thread interrupted", e);
         }
-        throw new AssertionError("Timed out after " + timeout + " ticks");
+
+        int elapsed = predicateTicksElapsed;
+        remainingTicks -= elapsed;
+
+        if (predicateError != null) {
+            Throwable t = predicateError;
+            if (t instanceof AssertionError ae) throw ae;
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new RuntimeException(t);
+        }
+
+        if (!predicateMatched) {
+            throw new AssertionError("Timed out after " + timeout + " ticks");
+        }
+
+        return elapsed;
     }
 
     /**
