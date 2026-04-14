@@ -31,6 +31,7 @@ includeModule("anonymous-modlist")
 includeModule("camera")
 includeModule("pathfinding")
 includeModule("testing")
+includeModule("bot")
 
 fun includeModule(path: String) {
     include("modules:$path")
