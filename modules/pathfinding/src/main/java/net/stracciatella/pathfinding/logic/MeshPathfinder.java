@@ -30,14 +30,17 @@ public class MeshPathfinder {
         // Initialize start node
         gScore.put(start, 0.0);
 
-        // Optimization: Keep track of items in PQ to avoid O(n) 'contains' check
-        Set<MeshNode> openSetTracker = new HashSet<>();
-        openSetTracker.add(start);
+        Set<MeshNode> closedSet = new HashSet<>();
 
         while (!openSet.isEmpty()) {
             // Get node with lowest F score
             MeshNode current = openSet.poll().node;
-            openSetTracker.remove(current);
+
+            // Lazy deletion: skip nodes that were re-added with a better cost
+            if (closedSet.contains(current)) {
+                continue;
+            }
+            closedSet.add(current);
 
             // Reached destination?
             if (current.equals(end)) {
@@ -45,28 +48,21 @@ public class MeshPathfinder {
             }
 
             // Process neighbors
-            // Note: Ensure MeshNode has a getter like getNeighbors()
             if (current.getNeighbors() != null) {
                 for (Neighbor neighborObj : current.getNeighbors()) {
                     MeshNode neighborNode = neighborObj.getNode();
+                    if (closedSet.contains(neighborNode)) {
+                        continue;
+                    }
 
-                    // --- KEY CHANGE: Use Neighbor class cost as distance ---
                     int edgeWeight = neighborObj.getCost();
-                    // -----------------------------------------------------
-
                     double tentativeG = gScore.getOrDefault(current, Double.MAX_VALUE) + edgeWeight;
 
                     if (tentativeG < gScore.getOrDefault(neighborNode, Double.MAX_VALUE)) {
-                        // Found a better path to this neighbor
                         cameFrom.put(neighborNode, current);
                         gScore.put(neighborNode, tentativeG);
-
                         double f = tentativeG + heuristic(neighborNode, end);
-
-                        if (!openSetTracker.contains(neighborNode)) {
-                            openSet.add(new NodeRecord(neighborNode, tentativeG, f));
-                            openSetTracker.add(neighborNode);
-                        }
+                        openSet.add(new NodeRecord(neighborNode, tentativeG, f));
                     }
                 }
             }
@@ -87,13 +83,15 @@ public class MeshPathfinder {
         return path;
     }
 
-    // Euclidean distance heuristic scaled to match movement costs (10 per block).
-    // Must remain admissible: cheapest move is gap=1 flat = cost 10, so scale=10 is safe.
+    // Euclidean distance heuristic scaled to stay admissible.
+    // Cheapest diagonal move: gap=1 diagonal = cost 13 (base 10 + diagonal 3).
+    // Euclidean distance for diagonal: sqrt(2) ≈ 1.414.
+    // Scale must satisfy: scale * sqrt(2) <= 13, so scale <= 9.19. Use 9.0.
     private double heuristic(MeshNode a, MeshNode b) {
         double dx = a.getX() - b.getX();
         double dy = a.getY() - b.getY();
         double dz = a.getZ() - b.getZ();
-        return 10.0 * Math.sqrt(dx * dx + dy * dy + dz * dz);
+        return 9.0 * Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
     // Helper class for the PriorityQueue

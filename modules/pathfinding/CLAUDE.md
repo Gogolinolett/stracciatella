@@ -16,10 +16,10 @@ net.stracciatella.pathfinding
 │   ├── PathWalker.java               # Core autonomous movement controller (static, tick-driven)
 │   ├── ChunkMeshBuilder.java         # Converts chunks into walkable node graphs
 │   ├── MeshManager.java              # Stores meshes per entity per chunk, handles cross-chunk linking
-│   ├── MeshPathfinder.java           # A* algorithm with Euclidean heuristic
+│   ├── MeshPathfinder.java           # A* algorithm with admissible Euclidean heuristic (scale=9), closed set
 │   └── mesh/
 │       ├── Mesh.java                 # HashMap<BlockPos, MeshNode> container for one chunk
-│       ├── MeshNode.java             # Graph vertex: x, y, z + List<Neighbor>
+│       ├── MeshNode.java             # Graph vertex: x, y, z + List<Neighbor>. Has equals/hashCode on (x,y,z)
 │       ├── Neighbor.java             # Weighted edge: target node + cost
 │       └── IMeshProvider.java        # Interface for mesh sources
 ├── mixin/

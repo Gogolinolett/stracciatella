@@ -2,10 +2,9 @@ package net.stracciatella.pathfinding.logic.mesh;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
-import net.minecraft.commands.arguments.coordinates.WorldCoordinate;
 import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.levelgen.DensityFunctions;
 
 public class MeshNode {
     List<Neighbor> neighbors = new ArrayList<>();
@@ -41,5 +40,17 @@ public class MeshNode {
 
     public BlockPos getBlockPos() {
         return new BlockPos(x, y, z);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof MeshNode other)) return false;
+        return x == other.x && y == other.y && z == other.z;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(x, y, z);
     }
 }

@@ -14,6 +14,9 @@ public class MeshManager {
     static ChunkMeshBuilder meshBuilder = new ChunkMeshBuilder();
 
     public static void invalidateMesh(ChunkCoordinate chunkCoordinate) {
+        if (Minecraft.getInstance().level == null) {
+            return;
+        }
         meshes.forEach((entity, meshes) -> {
             Mesh mesh = meshBuilder.generatePathfindingMesh(Minecraft.getInstance().level.getChunk(chunkCoordinate.x(), chunkCoordinate.z()), entity);
             meshes.put(chunkCoordinate, mesh);

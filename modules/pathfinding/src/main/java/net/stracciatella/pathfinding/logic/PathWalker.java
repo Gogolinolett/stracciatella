@@ -171,7 +171,7 @@ public class PathWalker {
             }
             return;
         }
-        LocalPlayer player = client.getInstance().player;
+        LocalPlayer player = client.player;
         if (player == null) {
             return;
         }
@@ -292,7 +292,7 @@ public class PathWalker {
         // (0.153 b/t post-drag) + the sprint-jump boost (+0.2). Starting from block
         // center only gives 0.5 blocks of runway — not enough to reach terminal speed.
         // Walking backward to the far edge provides ~1.0 block of runway.
-        if (nodeGap >= 5 && player.onGround() && maxJumpPhase < 2) {
+        if (nodeGap >= 5 && player.onGround() && maxJumpPhase < 2 && distance > 1e-6) {
             float desiredYaw = (float) (Math.toDegrees(Math.atan2(-dx, dz)));
             float newYaw = camera.updateYaw(desiredYaw);
             player.setYRot(newYaw);

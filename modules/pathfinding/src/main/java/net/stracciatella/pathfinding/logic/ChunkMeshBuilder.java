@@ -55,7 +55,7 @@ public class ChunkMeshBuilder {
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
                 // Wir iterieren von oben nach unten oder unten nach oben
-                for (int y = minY; y < maxY - 2; y++) {
+                for (int y = minY; y <= maxY - 2; y++) {
                     baseBlock.set(minX + x, y, minZ + z);
                     oneAbove.set(minX + x, y + 1, minZ + z);
                     twoAbove.set(minX + x, y + 2, minZ + z);
@@ -201,13 +201,13 @@ public class ChunkMeshBuilder {
         if (dx > 0 && dz > 0) {
             double horizontalDistance = Math.sqrt(dx * dx + dz * dz);
 
-            // For same level or step up, max diagonal distance is ~4.0 blocks (sprint jump)
-            if (dy >= -1 && horizontalDistance > 4.0) {
+            // For drops, allow slightly more horizontal distance
+            if (dy > 0 && horizontalDistance > 4.5) {
                 return false;
             }
 
-            // For drops, allow slightly more horizontal distance but still limited
-            if (dy > 0 && horizontalDistance > 4.5) {
+            // For same level or step up, max diagonal distance is ~4.0 blocks (sprint jump)
+            if (dy >= -1 && horizontalDistance > 4.0) {
                 return false;
             }
         }
