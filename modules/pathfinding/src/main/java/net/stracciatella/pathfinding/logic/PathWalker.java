@@ -242,7 +242,7 @@ public class PathWalker {
                 // block platform — residual sprint momentum from the landing can
                 // carry the player off the block before the next jump fires.
                 boolean needsBrake = (prevSegGap >= 2 && currSegGap < prevSegGap && currSegGap > 0)
-                        || (prevSegGap >= 3 && currSegGap == prevSegGap);
+                        || (prevSegGap >= 3 && currSegGap > 0);
                 if (needsBrake) {
                     landingBrakeActive = true;
                     // Smaller gaps need lower velocity to avoid overshoot.
@@ -470,16 +470,17 @@ public class PathWalker {
         if (isMovingAway(player, targetX, targetZ)) {
             canMoveForward = false;
         }
-        // For straight gap=2 jumps, hold position to time the simulation precisely.
-        // For long-diagonal gap=2 (both axes >= 2), skip the hold — the simulation
-        // needs the player to build velocity by walking forward, and the hold would
-        // deadlock the player at zero speed in the block center.
+        // For gap=2 jumps, hold position to time the simulation precisely.
+        // Exception: any diagonal gap=2 skips the hold — the simulation can't
+        // predict diagonal sprint-jump landings (air acceleration model is too
+        // low), so its hold signal would deadlock the player at zero velocity.
+        // The edge-distance fallback handles diagonal timing instead.
         if (jumpDecision.holdBeforeJump && jumpDecision.gap <= 2) {
             MeshNode holdPrev = index > 0 ? currentPath.get(index - 1) : null;
-            boolean holdLongDiag = holdPrev != null
-                    && Math.abs(target.getX() - holdPrev.getX()) >= 2
-                    && Math.abs(target.getZ() - holdPrev.getZ()) >= 2;
-            if (!holdLongDiag) {
+            boolean holdDiag = holdPrev != null
+                    && target.getX() != holdPrev.getX()
+                    && target.getZ() != holdPrev.getZ();
+            if (!holdDiag) {
                 canMoveForward = false;
             }
         }
@@ -629,17 +630,13 @@ public class PathWalker {
         }
 
         // Pre-landing air deceleration: when airborne approaching an intermediate
-        // single-block platform that's followed by a smaller gap, release forward
-        // key early to reduce air acceleration. Without this, the sprint-jump arc
-        // overshoots the 1-block platform — the player flies over it (onGround
-        // flickers true briefly), the node advances mid-flight, and they fall in
-        // the next gap. Releasing forward within 1.5 blocks lets air drag slow the
-        // player enough to actually land on the platform.
+        // platform after a sprint jump with a sharp turn ahead, release forward
+        // key early to reduce landing speed. This helps the player stop on the
+        // platform for the direction change instead of sliding off.
         if (!player.onGround() && !jump && index + 1 < currentPath.size() && index >= 1) {
-            int currSegGap = computeNodeGap();
             MeshNode prev = currentPath.get(index - 1);
-            int prevSegGap = Math.max(Math.abs(target.getX() - prev.getX()), Math.abs(target.getZ() - prev.getZ()));
-            if (prevSegGap >= 3 && currSegGap > 0 && currSegGap < prevSegGap && distance < 1.5) {
+            int incomingGap = Math.max(Math.abs(target.getX() - prev.getX()), Math.abs(target.getZ() - prev.getZ()));
+            if (incomingGap >= 3 && isSharpTurnAhead() && distance < 1.0) {
                 canMoveForward = false;
                 sprint = false;
             }
@@ -675,15 +672,14 @@ public class PathWalker {
                 // platforms. Regular jump covers ~1.8 blocks, plenty for gap=2.
                 // Sprint-jump covers ~2.6 blocks, causing the player to land past
                 // the far edge and slide off.
-                // Exception: diagonal gap=2 jumps where both axes span >= 2 blocks
-                // (euclidean ~2.83 for (2,2)) need sprint to cover the distance.
-                // Asymmetric diagonals like (1,2) have euclidean ~2.24, close enough
-                // to straight gap=2 that sprint still overshoots.
+                // Exception: any diagonal gap=2 jump needs sprint because the
+                // euclidean distance (>= sqrt(5) ~= 2.24 for (1,2)) exceeds
+                // non-sprint jump range (~1.8 blocks).
                 MeshNode prev = index > 0 ? currentPath.get(index - 1) : null;
-                boolean longDiagonal = prev != null
-                        && Math.abs(target.getX() - prev.getX()) >= 2
-                        && Math.abs(target.getZ() - prev.getZ()) >= 2;
-                sprint = longDiagonal;
+                boolean isDiagonal = prev != null
+                        && target.getX() != prev.getX()
+                        && target.getZ() != prev.getZ();
+                sprint = isDiagonal;
                 if (justBraked) {
                     postBrakeAirRelease = true;
                 }
@@ -977,12 +973,6 @@ public class PathWalker {
             int effectiveGap = Math.max(gap, nodeGap);
             decidedGap = effectiveGap;
             boolean longRangeJump = effectiveGap >= 5;
-            // After a landing brake, the player's speed is very low (~0.04 b/t).
-            // The simulation predicts with sprint boost (+0.2) and fires immediately,
-            // but gap=2 jumps suppress sprint on the jump tick. The actual non-sprint
-            // jump from 0.04 only travels ~0.75 blocks — way too short. Gate the
-            // simulation until speed recovers to near-terminal sprint so the actual
-            // no-boost trajectory can reach the target.
             if (!longRangeJump) {
                 JumpDecision simDecision = decideJumpBySimulation(player, target, sprint, gap);
                 if (simDecision != null) {
