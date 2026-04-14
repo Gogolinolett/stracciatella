@@ -11,6 +11,7 @@ stracciatella {
     id = "bot"
     name = "Bot"
     group = "net.stracciatella"
+    accessWidener("bot.accesswidener")
 }
 
 dependencies {

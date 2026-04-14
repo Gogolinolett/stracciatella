@@ -284,9 +284,11 @@ public class BotController {
             player.setXRot(pitch);
         }
 
-        // Start mining if not already
+        // Start mining if not already, and tick the interaction each frame
         if (!BlockInteractor.isInteracting()) {
             BlockInteractor.startInteraction(currentTask.interactionType());
+        } else {
+            BlockInteractor.tickInteraction();
         }
 
         // Check if block is broken
