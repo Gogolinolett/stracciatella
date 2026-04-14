@@ -141,8 +141,14 @@ public class TestRunner {
         // Release mouse grab so cursor is free during tests
         ctx.runOnClient(mc -> mc.mouseHandler.releaseMouse());
 
-        tickMultiplier = 7;
-        ctx.runCommand("tick rate 140");
+        int speed = 7;
+        try {
+            speed = Integer.parseInt(System.getProperty("stracciatella.testing.tickMultiplier", "10"));
+            if (speed < 1) speed = 1;
+        } catch (NumberFormatException ignored) {
+        }
+        tickMultiplier = speed;
+        ctx.runCommand("tick rate " + (speed * 20));
 
         LOGGER.info("Starting {} tests", tests.size());
 
@@ -150,7 +156,7 @@ public class TestRunner {
             for (RegisteredTest test : tests) {
                 LOGGER.info("Running: [{}] {}", test.suiteName(), test.displayName());
 
-                int timeoutTicks = test.annotation().timeoutTicks();
+                int timeoutTicks = test.annotation().timeoutTicks() * tickMultiplier;
                 ctx.setTimeoutTicks(timeoutTicks);
 
                 long startTime = System.currentTimeMillis();

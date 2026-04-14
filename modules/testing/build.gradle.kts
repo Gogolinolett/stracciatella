@@ -38,14 +38,16 @@ dependencies {
 // Usage: ./gradlew runMinecraftTests
 gradle.taskGraph.whenReady {
     if (allTasks.any { it.name == "runMinecraftTests" }) {
+        val tickSpeed = providers.gradleProperty("tickSpeed").getOrElse("10")
         allTasks.filterIsInstance<JavaExec>().filter { it.name == "runStracciatellaLight" }.forEach {
             it.jvmArgs("-Dstracciatella.testing.autorun=true")
+            it.jvmArgs("-Dstracciatella.testing.tickMultiplier=$tickSpeed")
         }
     }
 }
 
 tasks.register("runMinecraftTests") {
     group = "verification"
-    description = "Launches the Minecraft client with auto-test mode enabled"
+    description = "Launches the Minecraft client with auto-test mode enabled. Use -PtickSpeed=N to set tick multiplier (default 7)."
     dependsOn(":runStracciatellaLight")
 }

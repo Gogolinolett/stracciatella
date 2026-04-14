@@ -45,9 +45,12 @@ net.stracciatella.testing
 ## Tick rate acceleration
 
 During automated test runs, `TestRunner` accelerates both client and server ticks:
-- **Client**: `ClientTickMixin` forces extra `Minecraft.tick()` calls per frame via a tick multiplier (default 7x, so ~140 effective client TPS). A recursion guard (`inExtraTick` flag) prevents the mixin from re-triggering itself.
-- **Server**: `/tick rate 140` speeds up the integrated server to match the client.
+- **Client**: `ClientTickMixin` forces extra `Minecraft.tick()` calls per frame via a tick multiplier (default 10x, so ~200 effective client TPS). A recursion guard (`inExtraTick` flag) prevents the mixin from re-triggering itself.
+- **Server**: `/tick rate <N*20>` speeds up the integrated server to match the client.
 - **TestContext**: Uses `Semaphore` (not `CountDownLatch`) so extra ticks within a single frame are never lost. `waitFor()` evaluates predicates directly on the tick thread to avoid frame-rate bottlenecks.
+- **Timeout scaling**: Test timeouts are multiplied by the tick multiplier so real-time budgets remain constant (e.g. 80 ticks × 10 = 800 ticks at 200 TPS = same 4 seconds).
+
+Configurable via Gradle: `./gradlew runMinecraftTests -PtickSpeed=N` (default 10). The value is passed as `-Dstracciatella.testing.tickMultiplier=N`.
 
 Note: `/tick rate` alone does NOT speed up `Minecraft.tick()` on the client — only the server. The mixin-based extra ticks are required for actual client speedup.
 
