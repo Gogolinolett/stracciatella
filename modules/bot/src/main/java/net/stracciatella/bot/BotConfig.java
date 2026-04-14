@@ -56,12 +56,12 @@ public class BotConfig {
     public double reachDistance = 4.0;
 
     // Maximum ticks to wait for a block to break before giving up
-    public int maxBreakTicks = 600;
+    public int maxBreakTicks = 100;
 
     // Phase timeouts
-    public int navigateTimeout = 600;
-    public int positionTimeout = 100;
-    public int lookTimeout = 60;
+    public int navigateTimeout = 200;
+    public int positionTimeout = 60;
+    public int lookTimeout = 40;
 
     // Debug logging
     public boolean debugEnabled = false;

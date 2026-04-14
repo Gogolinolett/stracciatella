@@ -22,19 +22,14 @@ public class BotTests {
     // ================================================================
     // Test 1: Single block mine — place stone, mine it, verify it's air
     // ================================================================
-    @MinecraftTest(name = "Bot mine single block", timeoutTicks = 200, order = -200)
+    @MinecraftTest(name = "Bot mine single block", timeoutTicks = 60, order = -200)
     public void mineSingleBlock(TestContext ctx) {
         final BlockPos origin = new BlockPos(1000, 30, 1000);
         final BlockPos blockPos = origin;
         final BlockPos standPos = origin.offset(0, 0, 2);
 
-        ctx.runOnClient(mc -> BotController.stop());
-        ctx.runCommand("gamemode survival");
+        setupTest(ctx, origin);
 
-        // Teleport near the area first and wait for chunks
-        teleportAndWaitForChunks(ctx, origin);
-
-        // Build environment
         clearArea(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("fill " + (standPos.getX() - 1) + " " + (origin.getY() - 1) + " " + (standPos.getZ() - 1)
                 + " " + (standPos.getX() + 1) + " " + (origin.getY() - 1) + " " + (standPos.getZ() + 1) + " stone");
@@ -42,14 +37,10 @@ public class BotTests {
         ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " stone");
         ctx.runCommand("give @s diamond_pickaxe");
 
-        // Teleport to stand position and wait for ground
         ctx.runCommand("tp @s " + (standPos.getX() + 0.5) + " " + origin.getY() + " " + (standPos.getZ() + 0.5));
         ctx.waitFor(mc -> mc.player.onGround());
 
-        // Enqueue mine task
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
-
-        // Wait for block to become air
         ctx.waitFor(mc -> mc.level.getBlockState(blockPos).isAir());
         ctx.runOnClient(mc -> BotController.stop());
 
@@ -59,23 +50,19 @@ public class BotTests {
     // ================================================================
     // Test 2: Tool selection — verify best tool is selected
     // ================================================================
-    @MinecraftTest(name = "Bot tool selection", timeoutTicks = 200, order = -199)
+    @MinecraftTest(name = "Bot tool selection", timeoutTicks = 60, order = -199)
     public void toolSelection(TestContext ctx) {
         final BlockPos origin = new BlockPos(1050, 30, 1000);
         final BlockPos blockPos = origin;
         final BlockPos standPos = origin.offset(0, 0, 2);
 
-        ctx.runOnClient(mc -> BotController.stop());
-        ctx.runCommand("gamemode survival");
-
-        teleportAndWaitForChunks(ctx, origin);
+        setupTest(ctx, origin);
 
         clearArea(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("fill " + (standPos.getX() - 1) + " " + (origin.getY() - 1) + " " + (standPos.getZ() - 1)
                 + " " + (standPos.getX() + 1) + " " + (origin.getY() - 1) + " " + (standPos.getZ() + 1) + " stone");
         ctx.runCommand("setblock " + blockPos.getX() + " " + (blockPos.getY() - 1) + " " + blockPos.getZ() + " stone");
         ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " iron_ore");
-        ctx.runCommand("clear @s");
         ctx.runCommand("give @s wooden_pickaxe");
         ctx.runCommand("give @s iron_pickaxe");
 
@@ -83,7 +70,6 @@ public class BotTests {
         ctx.waitFor(mc -> mc.player.onGround());
 
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
-
         ctx.waitFor(mc -> mc.level.getBlockState(blockPos).isAir());
 
         int selectedSlot = ctx.computeOnClient(mc -> mc.player.getInventory().getSelectedSlot());
@@ -98,16 +84,13 @@ public class BotTests {
     // ================================================================
     // Test 3: Tree chop — build a small tree, chop it top-to-bottom
     // ================================================================
-    @MinecraftTest(name = "Bot chop tree", timeoutTicks = 400, order = -198)
+    @MinecraftTest(name = "Bot chop tree", timeoutTicks = 120, order = -198)
     public void chopTree(TestContext ctx) {
         final BlockPos origin = new BlockPos(1100, 30, 1000);
         final BlockPos treeBase = origin;
         final BlockPos standPos = origin.offset(2, 0, 0);
 
-        ctx.runOnClient(mc -> BotController.stop());
-        ctx.runCommand("gamemode survival");
-
-        teleportAndWaitForChunks(ctx, origin);
+        setupTest(ctx, origin);
 
         clearArea(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("fill " + (origin.getX() - 3) + " " + (origin.getY() - 1) + " " + (origin.getZ() - 3)
@@ -150,16 +133,13 @@ public class BotTests {
     // ================================================================
     // Test 4: Camera smoothness — verify no instant snapping
     // ================================================================
-    @MinecraftTest(name = "Bot camera smoothness", timeoutTicks = 200, order = -197)
+    @MinecraftTest(name = "Bot camera smoothness", timeoutTicks = 80, order = -197)
     public void cameraSmoothness(TestContext ctx) {
         final BlockPos origin = new BlockPos(1150, 30, 1000);
         final BlockPos blockPos = origin;
         final BlockPos standPos = origin.offset(0, 0, 3);
 
-        ctx.runOnClient(mc -> BotController.stop());
-        ctx.runCommand("gamemode survival");
-
-        teleportAndWaitForChunks(ctx, origin);
+        setupTest(ctx, origin);
 
         clearArea(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("fill " + (standPos.getX() - 1) + " " + (origin.getY() - 1) + " " + (standPos.getZ() - 1)
@@ -172,13 +152,11 @@ public class BotTests {
         ctx.runCommand("tp @s " + (standPos.getX() + 0.5) + " " + origin.getY() + " " + (standPos.getZ() + 0.5) + " 180 0");
         ctx.waitFor(mc -> mc.player.onGround());
 
-        // Track yaw changes per tick
         float[] lastYaw = {180.0f};
         float[] maxDelta = {0.0f};
 
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
 
-        // Monitor for a few ticks while the camera is turning
         for (int i = 0; i < 30; i++) {
             ctx.waitTick();
             float currentYaw = ctx.computeOnClient(mc -> mc.player.getYRot());
@@ -206,12 +184,13 @@ public class BotTests {
     // ================================================================
     // Test 5: Out-of-reach failure — block with no walkable path fails gracefully
     // ================================================================
-    @MinecraftTest(name = "Bot out-of-reach failure", timeoutTicks = 200, order = -196)
+    @MinecraftTest(name = "Bot out-of-reach failure", timeoutTicks = 60, order = -196)
     public void outOfReachFailure(TestContext ctx) {
         final BlockPos origin = new BlockPos(1200, 30, 1000);
         final BlockPos farBlock = new BlockPos(1200, 50, 1000);
 
         ctx.runOnClient(mc -> BotController.stop());
+        ctx.runCommand("clear @s");
         // Restore creative mode — this test doesn't mine, and ensures
         // subsequent test suites (PathWalker) run in creative
         ctx.runCommand("gamemode creative");
@@ -226,7 +205,6 @@ public class BotTests {
         ctx.waitFor(mc -> mc.player.onGround());
 
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(farBlock)));
-
         ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.IDLE);
 
         boolean stillExists = ctx.computeOnClient(mc -> !mc.level.getBlockState(farBlock).isAir());
@@ -237,12 +215,19 @@ public class BotTests {
         LOGGER.info("Out-of-reach failure test passed");
     }
 
-    // --- Utility ---
+    // --- Shared setup ---
 
     /**
-     * Teleport to the area and wait for chunks to load before building.
-     * Follows the same pattern as PathWalkerTests.
+     * Common setup for survival-mode bot tests: stop bot, clear inventory,
+     * set survival mode, teleport and wait for chunks.
      */
+    private void setupTest(TestContext ctx, BlockPos origin) {
+        ctx.runOnClient(mc -> BotController.stop());
+        ctx.runCommand("clear @s");
+        ctx.runCommand("gamemode survival");
+        teleportAndWaitForChunks(ctx, origin);
+    }
+
     private void teleportAndWaitForChunks(TestContext ctx, BlockPos origin) {
         ctx.runCommand("tp @s " + (origin.getX() + 0.5) + " " + (origin.getY() + 5) + " " + (origin.getZ() + 0.5));
         ctx.waitFor(mc -> {
