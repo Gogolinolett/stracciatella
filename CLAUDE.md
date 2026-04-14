@@ -84,8 +84,8 @@ modules/<name>/
 # Run Minecraft client (light mod set)
 ./gradlew runClient
 
-# Run automated in-game tests
-./gradlew runMinecraftTests
+# Run automated in-game tests (default 10x speed, use 20x for fastest runs)
+./gradlew runMinecraftTests -PtickSpeed=20
 
 # Build a single module
 ./gradlew :modules:<name>:build
