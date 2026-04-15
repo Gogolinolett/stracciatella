@@ -36,20 +36,32 @@ net.stracciatella.bot
 BotController is **static** and **tick-driven** via `ClientTickEvents.END_CLIENT_TICK`, same pattern as PathWalker.
 
 ```
-IDLE → NAVIGATING → POSITIONING → LOOKING → INTERACTING → COLLECTING → COOLDOWN → IDLE
+IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING → (decision)
+                                                                         ↓
+                                                next sub-target? → LOOKING
+                                                next in reach?   → LOOKING (no pause)
+                                                next needs walk? → COLLECTING → SCANNING → NAVIGATING
+                                                nothing left?    → COLLECTING → IDLE
 ```
 
 ### Phases
 
 | Phase | Behavior | Timeout |
 |-------|----------|---------|
-| **IDLE** | Poll next task, compute standoff node, start PathWalker | — |
+| **IDLE** | No active task, poll queue when new task enqueued | — |
+| **SCANNING** | Smoothly look toward distant target before walking (CameraController) | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
 | **LOOKING** | CameraController smoothly rotates to target block face + settle delay | `lookTimeout` |
-| **INTERACTING** | Hold `keyAttack`, poll `isAir()`, maintain camera aim | `maxBreakTicks` |
-| **COLLECTING** | Random pause for item drops | configurable |
-| **COOLDOWN** | Random inter-task delay | configurable |
+| **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera | `maxBreakTicks` |
+| **COLLECTING** | Brief wait for item drops before walking away or going idle | `collectWaitMin/Max` |
+
+### Smart transitions after block break
+
+- **More sub-targets** (tree logs): straight to LOOKING, no pause
+- **Next task within reach**: straight to LOOKING with new task, no pause
+- **Next task needs walking**: COLLECTING → SCANNING → NAVIGATING
+- **No more tasks**: COLLECTING → IDLE
 
 ### Key integration points
 
@@ -90,8 +102,9 @@ Persisted to `stracciatella/bot.json`. Key parameters:
 
 - `aimOffsetMin/Max` — block face aim jitter
 - `settleDelayMin/Max` — ticks after aim converges
-- `interTaskDelayMin/Max` — cooldown between tasks
-- `longPauseChance` / `longPauseMin/Max` — occasional long pauses
+- `collectWaitMin/Max` — ticks to wait for item drops before walking away
+- `scanTimeout` — max ticks to look toward next target before walking (30)
+- `scanFacingTolerance` — degrees tolerance for scan convergence (15.0)
 - `scanRadius` — block scan radius
 - `reachDistance` — max mining reach (4.0)
 - `maxBreakTicks` — interaction timeout

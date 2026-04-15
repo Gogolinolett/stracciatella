@@ -53,17 +53,19 @@ public class BotController {
     private static int settleRemaining = 0;
     private static boolean toolSelected = false;
 
-    // Cooldown/collection timer
+    // Collection timer
     private static int waitRemaining = 0;
+    // Whether the next task needs walking (used after COLLECTING to decide SCANNING vs IDLE)
+    private static boolean walkAfterCollect = false;
 
     public enum Phase {
         IDLE,
+        SCANNING,
         NAVIGATING,
         POSITIONING,
         LOOKING,
         INTERACTING,
-        COLLECTING,
-        COOLDOWN
+        COLLECTING
     }
 
     // --- Public API ---
@@ -151,12 +153,12 @@ public class BotController {
         taskTotalTicks++;
 
         switch (phase) {
+            case SCANNING -> tickScanning(client, player);
             case NAVIGATING -> tickNavigating(client, player);
             case POSITIONING -> tickPositioning(client, player);
             case LOOKING -> tickLooking(client, player);
             case INTERACTING -> tickInteracting(client, player);
             case COLLECTING -> tickCollecting();
-            case COOLDOWN -> tickCooldown();
             default -> { }
         }
     }
@@ -305,14 +307,23 @@ public class BotController {
                 LOGGER.info("Block broken at {} in {} ticks", target, phaseTicks);
             }
 
-            // Check if task has more sub-targets (e.g. tree chopping)
+            // Sub-targets remaining in same task (e.g. tree logs) — mine next immediately
             if (currentTask.advanceToNextTarget()) {
-                // More sub-targets — re-enter LOOKING for next block
+                transitionTo(Phase.LOOKING);
+                return;
+            }
+
+            // Task fully done — decide what to do next based on the queue
+            BotTask nextTask = taskQueue.peek();
+            if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
+                // Next target is within reach — mine it immediately, no pause
+                currentTask = taskQueue.poll();
+                taskTotalTicks = 0;
                 transitionTo(Phase.LOOKING);
             } else {
-                // Task fully done
-                int waitTicks = HumanBehavior.randomPostBreakDelay(CONFIG);
-                waitRemaining = waitTicks;
+                // Need to walk (or nothing left) — collect drops first
+                walkAfterCollect = nextTask != null;
+                waitRemaining = HumanBehavior.randomCollectWait(CONFIG);
                 transitionTo(Phase.COLLECTING);
             }
         }
@@ -321,17 +332,91 @@ public class BotController {
     private static void tickCollecting() {
         waitRemaining--;
         if (waitRemaining <= 0) {
-            int cooldown = HumanBehavior.randomInterTaskDelay(CONFIG);
-            waitRemaining = cooldown;
-            transitionTo(Phase.COOLDOWN);
+            currentTask = null;
+            if (walkAfterCollect && !taskQueue.isEmpty() && !paused) {
+                // Start next task — will enter SCANNING if it needs walking
+                currentTask = taskQueue.poll();
+                taskTotalTicks = 0;
+                transitionTo(Phase.SCANNING);
+            } else {
+                phase = Phase.IDLE;
+                phaseTicks = 0;
+                // Check if new tasks were added while collecting
+                if (!taskQueue.isEmpty() && !paused) {
+                    startNextTask();
+                }
+            }
         }
     }
 
-    private static void tickCooldown() {
-        waitRemaining--;
-        if (waitRemaining <= 0) {
-            completeCurrentTask();
+    private static void tickScanning(Minecraft client, LocalPlayer player) {
+        if (phaseTicks > CONFIG.scanTimeout) {
+            // Timeout — start navigation now
+            beginNavigation(player);
+            return;
         }
+
+        if (phaseTicks == 1) {
+            // Initialize camera from current rotation
+            camera = new CameraController();
+            camera.initialize(player.getYRot(), player.getXRot());
+        }
+
+        // Smoothly look toward the next target
+        BlockPos target = currentTask.targetPos();
+        double dx = (target.getX() + 0.5) - player.getX();
+        double dy = (target.getY() + 0.5) - player.getEyeY();
+        double dz = (target.getZ() + 0.5) - player.getZ();
+        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+
+        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
+        float targetPitch = (float) (-Math.atan2(dy, horizontalDist) * (180.0 / Math.PI));
+
+        float yaw = camera.updateYaw(targetYaw);
+        float pitch = camera.updatePitch(targetPitch);
+        player.setYRot(yaw);
+        player.setXRot(pitch);
+
+        // Once roughly facing the target, start walking
+        boolean facing = AngleUtil.isFacingTarget(yaw, targetYaw, (float) CONFIG.scanFacingTolerance)
+                && Math.abs(pitch - targetPitch) < CONFIG.scanFacingTolerance;
+        if (facing) {
+            beginNavigation(player);
+        }
+    }
+
+    /**
+     * Start PathWalker navigation for the current task, or fall back to POSITIONING.
+     */
+    private static void beginNavigation(LocalPlayer player) {
+        BlockPos target = currentTask.targetPos();
+
+        if (isWithinReach(player, target)) {
+            transitionTo(Phase.LOOKING);
+            return;
+        }
+
+        MeshNode standoff = findStandoffNode(player, target);
+        if (standoff == null) {
+            transitionTo(Phase.POSITIONING);
+            return;
+        }
+
+        MeshNode startNode = findNearestNode(player, player.blockPosition());
+        if (startNode == null) {
+            transitionTo(Phase.POSITIONING);
+            return;
+        }
+
+        MeshPathfinder pathfinder = new MeshPathfinder();
+        List<MeshNode> path = pathfinder.findPath(startNode, standoff);
+        if (path.isEmpty()) {
+            transitionTo(Phase.POSITIONING);
+            return;
+        }
+
+        PathWalker.start(path);
+        transitionTo(Phase.NAVIGATING);
     }
 
     // --- State transitions ---
@@ -365,38 +450,14 @@ public class BotController {
 
         BlockPos target = currentTask.targetPos();
 
-        // Check if we're already within reach — skip navigation
+        // Already within reach — skip navigation
         if (isWithinReach(player, target)) {
             transitionTo(Phase.LOOKING);
             return;
         }
 
-        // Find path to a standoff position near the target
-        MeshNode standoff = findStandoffNode(player, target);
-        if (standoff == null) {
-            // No mesh node found — try to proceed to POSITIONING phase directly
-            LOGGER.warn("No standoff node found for target {}, attempting direct positioning", target);
-            transitionTo(Phase.POSITIONING);
-            return;
-        }
-
-        MeshNode startNode = findNearestNode(player, player.blockPosition());
-        if (startNode == null) {
-            LOGGER.warn("No start node found, attempting direct positioning");
-            transitionTo(Phase.POSITIONING);
-            return;
-        }
-
-        MeshPathfinder pathfinder = new MeshPathfinder();
-        List<MeshNode> path = pathfinder.findPath(startNode, standoff);
-        if (path.isEmpty()) {
-            LOGGER.warn("No path found to standoff node, attempting direct positioning");
-            transitionTo(Phase.POSITIONING);
-            return;
-        }
-
-        PathWalker.start(path);
-        transitionTo(Phase.NAVIGATING);
+        // Needs walking — look toward it first, then navigate
+        transitionTo(Phase.SCANNING);
     }
 
     private static void completeCurrentTask() {

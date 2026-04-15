@@ -29,22 +29,13 @@ public class BotConfig {
     public int settleDelayMin = 2;
     public int settleDelayMax = 5;
 
-    // Inter-task cooldown (ticks)
-    public int interTaskDelayMin = 2;
-    public int interTaskDelayMax = 30;
-
-    // Chance of a long pause between tasks
-    public double longPauseChance = 0.10;
-    public int longPauseMin = 40;
-    public int longPauseMax = 100;
-
-    // Post-break delay before collecting (ticks)
-    public int postBreakDelayMin = 1;
-    public int postBreakDelayMax = 5;
-
-    // Item collection wait time (ticks)
+    // Item collection wait before walking away (ticks)
     public int collectWaitMin = 5;
     public int collectWaitMax = 20;
+
+    // Scanning: look toward distant target before walking
+    public int scanTimeout = 30;
+    public double scanFacingTolerance = 15.0;
 
     // Block scan radius
     public int scanRadius = 32;
@@ -73,15 +64,10 @@ public class BotConfig {
         this.lookSpeedMax = other.lookSpeedMax;
         this.settleDelayMin = other.settleDelayMin;
         this.settleDelayMax = other.settleDelayMax;
-        this.interTaskDelayMin = other.interTaskDelayMin;
-        this.interTaskDelayMax = other.interTaskDelayMax;
-        this.longPauseChance = other.longPauseChance;
-        this.longPauseMin = other.longPauseMin;
-        this.longPauseMax = other.longPauseMax;
-        this.postBreakDelayMin = other.postBreakDelayMin;
-        this.postBreakDelayMax = other.postBreakDelayMax;
         this.collectWaitMin = other.collectWaitMin;
         this.collectWaitMax = other.collectWaitMax;
+        this.scanTimeout = other.scanTimeout;
+        this.scanFacingTolerance = other.scanFacingTolerance;
         this.scanRadius = other.scanRadius;
         this.facingTolerance = other.facingTolerance;
         this.reachDistance = other.reachDistance;

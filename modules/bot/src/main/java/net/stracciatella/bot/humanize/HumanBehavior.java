@@ -27,24 +27,6 @@ public class HumanBehavior {
     }
 
     /**
-     * Generate a random inter-task cooldown in ticks.
-     * Has a configurable chance of being a long pause.
-     */
-    public static int randomInterTaskDelay(BotConfig config) {
-        if (ThreadLocalRandom.current().nextDouble() < config.longPauseChance) {
-            return randomIntInRange(config.longPauseMin, config.longPauseMax);
-        }
-        return randomIntInRange(config.interTaskDelayMin, config.interTaskDelayMax);
-    }
-
-    /**
-     * Generate a random post-break delay in ticks.
-     */
-    public static int randomPostBreakDelay(BotConfig config) {
-        return randomIntInRange(config.postBreakDelayMin, config.postBreakDelayMax);
-    }
-
-    /**
      * Generate a random collection wait time in ticks.
      */
     public static int randomCollectWait(BotConfig config) {
