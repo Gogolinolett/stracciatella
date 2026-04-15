@@ -14,10 +14,15 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import net.stracciatella.module.Module;
+import net.stracciatella.pathfinding.commands.NavigateCommands;
 import net.stracciatella.pathfinding.commands.PathCommands;
 import net.stracciatella.pathfinding.display.PathDisplay;
 import net.stracciatella.pathfinding.logic.PathWalker;
 import net.stracciatella.pathfinding.test.PathWalkerTests;
+import net.stracciatella.pathfinding.travel.CommandTeleportTravelMethod;
+import net.stracciatella.pathfinding.travel.EnderPearlTravelMethod;
+import net.stracciatella.pathfinding.travel.Navigator;
+import net.stracciatella.pathfinding.travel.WalkTravelMethod;
 import net.stracciatella.testing.runner.TestRunner;
 import org.joml.Matrix4f;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -33,6 +38,12 @@ public class PathfindingModule implements Module {
         commands.register();
         ClientTickEvents.END_CLIENT_TICK.register(PathWalker::tick);
         TestRunner.instance().registerSuite(PathWalkerTests.class);
+
+        Navigator.register(new CommandTeleportTravelMethod());
+        Navigator.register(new EnderPearlTravelMethod());
+        Navigator.register(new WalkTravelMethod());
+        ClientTickEvents.END_CLIENT_TICK.register(Navigator::tick);
+        new NavigateCommands().register();
     }
 
 

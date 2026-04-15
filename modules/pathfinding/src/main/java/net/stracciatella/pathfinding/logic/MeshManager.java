@@ -3,10 +3,13 @@ package net.stracciatella.pathfinding.logic;
 import java.util.HashMap;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.stracciatella.pathfinding.ChunkCoordinate;
 import net.stracciatella.pathfinding.logic.mesh.Mesh;
+import net.stracciatella.pathfinding.logic.mesh.MeshNode;
 
 public class MeshManager {
 
@@ -35,6 +38,35 @@ public class MeshManager {
         meshes.get(entity).put(chunkCoordinate, mesh);
         connectAdjacentMeshes(entity, chunkCoordinate);
 
+    }
+
+    public static MeshNode findOrBuildNearestNode(Level level, Entity entity, BlockPos pos) {
+        ChunkCoordinate chunkCoordinate = new ChunkCoordinate(pos.getX() >> 4, pos.getZ() >> 4);
+        var meshesForEntity = meshes.get(entity);
+        if (meshesForEntity == null || !meshesForEntity.containsKey(chunkCoordinate)) {
+            generateMesh(level.getChunk(pos), entity);
+        }
+        var mesh = meshes.get(entity).get(chunkCoordinate);
+        if (mesh == null) {
+            return null;
+        }
+        MeshNode exact = mesh.getNodes().get(pos);
+        if (exact != null) {
+            return exact;
+        }
+        MeshNode nearest = null;
+        double bestDist = Double.MAX_VALUE;
+        for (MeshNode node : mesh.getNodes().values()) {
+            double dx = node.getX() - pos.getX();
+            double dy = node.getY() - pos.getY();
+            double dz = node.getZ() - pos.getZ();
+            double dist = dx * dx + dy * dy + dz * dz;
+            if (dist < bestDist) {
+                bestDist = dist;
+                nearest = node;
+            }
+        }
+        return nearest;
     }
 
     private static void connectAdjacentMeshes(Entity entity, ChunkCoordinate chunkCoordinate) {

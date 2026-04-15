@@ -6,22 +6,30 @@ Autonomous player movement and pathfinding for Minecraft. Generates navigation m
 
 ```
 net.stracciatella.pathfinding
-├── PathfindingModule.java            # Entry point. Loads configs, registers commands/ticks/tests
+├── PathfindingModule.java            # Entry point. Loads configs, registers commands/ticks/tests/travel methods
 ├── ChunkCoordinate.java              # 2D chunk coordinate wrapper (x, z)
 ├── commands/
-│   └── PathCommands.java             # All /path subcommands (find, walk, config, calibrate, etc.)
+│   ├── PathCommands.java             # All /path subcommands (find, walk, config, calibrate, etc.)
+│   └── NavigateCommands.java         # /navigate commands (to, stop, methods)
 ├── display/
 │   └── PathDisplay.java              # In-game mesh/path rendering (custom no-depth-test lines)
 ├── logic/
 │   ├── PathWalker.java               # Core autonomous movement controller (static, tick-driven)
 │   ├── ChunkMeshBuilder.java         # Converts chunks into walkable node graphs
-│   ├── MeshManager.java              # Stores meshes per entity per chunk, handles cross-chunk linking
+│   ├── MeshManager.java              # Stores meshes per entity per chunk, handles cross-chunk linking, node lookup
 │   ├── MeshPathfinder.java           # A* algorithm with admissible Euclidean heuristic (scale=9), closed set
 │   └── mesh/
 │       ├── Mesh.java                 # HashMap<BlockPos, MeshNode> container for one chunk
 │       ├── MeshNode.java             # Graph vertex: x, y, z + List<Neighbor>. Has equals/hashCode on (x,y,z)
 │       ├── Neighbor.java             # Weighted edge: target node + cost
 │       └── IMeshProvider.java        # Interface for mesh sources
+├── travel/
+│   ├── TravelMethod.java             # Interface: pluggable movement method (id, canUse, cost, start, tick, abort)
+│   ├── TravelStatus.java             # Enum: IN_PROGRESS, SUCCEEDED, FAILED
+│   ├── Navigator.java                # Static coordinator: auto-selects best method, manages fallback chain
+│   ├── WalkTravelMethod.java         # Wraps PathWalker for mesh-based walking
+│   ├── EnderPearlTravelMethod.java   # Ender pearl throw with trajectory simulation
+│   └── CommandTeleportTravelMethod.java # /tp command teleportation
 ├── mixin/
 │   └── LevelChunkMixin.java          # Triggers mesh generation on chunk load
 └── test/
@@ -33,6 +41,7 @@ net.stracciatella.pathfinding
 1. **Mesh generation**: Chunk loads → `LevelChunkMixin` → `MeshManager.generateMesh()` → `ChunkMeshBuilder` scans blocks, creates MeshNodes where player can stand (solid block + 2 air above), connects neighbors via reachability checks → stores in `MeshManager.meshes` → reconnects border nodes with adjacent chunks
 2. **Pathfinding**: `/path find` → `MeshPathfinder.findPath(start, end)` → A* search → returns `List<MeshNode>`
 3. **Path walking**: `PathWalker.start(path)` → each tick: get target node, calculate jump decision, update aim/rotation, apply movement keys → when node reached, advance index → when path done, `stop()`
+4. **Navigation**: `/navigate to <x> <y> <z>` → `Navigator.navigate(target)` → evaluates all registered `TravelMethod`s via `canUse()`/`cost()` → picks cheapest → `start()` → ticks until `SUCCEEDED`/`FAILED` → on failure, tries next fallback method
 
 ## PathWalker — the core component
 
@@ -125,6 +134,53 @@ PathWalker has extensive debug logging. **Always read the logs when editing Path
 | `generateMesh` | Generate mesh for current chunk |
 | `displayConnections` | Toggle mesh visualization |
 | `path connections all\|path\|none` | Connection display mode |
+
+## Travel Framework
+
+Extensible system for navigating between locations using different movement methods. The `Navigator` auto-selects the cheapest usable method and falls back to alternatives on failure.
+
+### TravelMethod interface
+
+```java
+public interface TravelMethod {
+    String id();
+    boolean canUse(Minecraft client, BlockPos from, BlockPos to);
+    double cost(Minecraft client, BlockPos from, BlockPos to);  // lower = preferred, roughly in ticks
+    void start(Minecraft client, BlockPos from, BlockPos to);
+    TravelStatus tick(Minecraft client);                        // returns IN_PROGRESS, SUCCEEDED, or FAILED
+    void abort();
+}
+```
+
+### Adding a new travel method
+
+1. Create a class implementing `TravelMethod` in the `travel/` package
+2. Register it in `PathfindingModule.init()`: `Navigator.register(new MyTravelMethod())`
+3. The Navigator's auto-selector will consider it based on `canUse()` and `cost()`
+
+### Built-in methods
+
+| Method | id | Cost model | Requirements |
+|--------|----|-----------|-------------|
+| CommandTeleport | `tp` | 1.0 (instant) | /tp permissions (optimistic, fails gracefully) |
+| EnderPearl | `ender_pearl` | ~60 ticks | Pearl in hotbar, distance 5-40 blocks |
+| Walk | `walk` | distance/0.215 | Mesh available, A* path exists |
+
+### Navigator
+
+Static coordinator (like PathWalker). Registered on `ClientTickEvents.END_CLIENT_TICK`. Supports single target or waypoint lists. On each leg:
+1. Evaluates all methods via `canUse()` + `cost()`
+2. Sorts by cost, starts cheapest
+3. On failure, tries next fallback
+4. Sends chat messages on method transitions
+
+### Commands (`/navigate`)
+
+| Command | Description |
+|---------|-------------|
+| `navigate to <x> <y> <z>` | Navigate to coordinates using best method |
+| `navigate stop` | Stop navigation |
+| `navigate methods` | List registered methods and availability |
 
 ## PathDisplay — rendering
 

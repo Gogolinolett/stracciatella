@@ -382,32 +382,7 @@ public class PathCommands {
     }
 
     private static MeshNode findOrBuildNearestNode(net.minecraft.world.level.Level level, LocalPlayer player, BlockPos pos) {
-        ChunkCoordinate chunkCoordinate = new ChunkCoordinate(pos.getX() >> 4, pos.getZ() >> 4);
-        var meshesForPlayer = MeshManager.meshes.get(player);
-        if (meshesForPlayer == null || !meshesForPlayer.containsKey(chunkCoordinate)) {
-            MeshManager.generateMesh(level.getChunk(pos), player);
-        }
-        var mesh = MeshManager.meshes.get(player).get(chunkCoordinate);
-        if (mesh == null) {
-            return null;
-        }
-        MeshNode exact = mesh.getNodes().get(pos);
-        if (exact != null) {
-            return exact;
-        }
-        MeshNode nearest = null;
-        double bestDist = Double.MAX_VALUE;
-        for (MeshNode node : mesh.getNodes().values()) {
-            double dx = node.getX() - pos.getX();
-            double dy = node.getY() - pos.getY();
-            double dz = node.getZ() - pos.getZ();
-            double dist = dx * dx + dy * dy + dz * dz;
-            if (dist < bestDist) {
-                bestDist = dist;
-                nearest = node;
-            }
-        }
-        return nearest;
+        return MeshManager.findOrBuildNearestNode(level, player, pos);
     }
 
     private static void sendWalkConfigMenu(LocalPlayer player) {
