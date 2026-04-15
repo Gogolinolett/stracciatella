@@ -30,8 +30,12 @@ public class BotConfig {
     public int settleDelayMax = 5;
 
     // Item collection wait before walking away (ticks)
-    public int collectWaitMin = 5;
-    public int collectWaitMax = 20;
+    // Must be long enough to walk to drops, wait for the 10-tick pickup delay,
+    // and actually pick them up
+    // collectWaitMin is unused now — collection ends when items are gone.
+    // collectWaitMax is the hard timeout to prevent infinite collecting.
+    public int collectWaitMin = 20;
+    public int collectWaitMax = 400;
 
     // Scanning: look toward distant target before walking
     public int scanTimeout = 30;

@@ -53,10 +53,11 @@ public class BotController {
     private static int settleRemaining = 0;
     private static boolean toolSelected = false;
 
-    // Collection timer
+    // Collection state
     private static int waitRemaining = 0;
-    // Whether the next task needs walking (used after COLLECTING to decide SCANNING vs IDLE)
     private static boolean walkAfterCollect = false;
+    // Position of the last mined block — COLLECTING walks toward this to pick up drops
+    private static BlockPos lastMinedPos = null;
 
     public enum Phase {
         IDLE,
@@ -314,6 +315,7 @@ public class BotController {
             }
 
             // Task fully done — decide what to do next based on the queue
+            lastMinedPos = target;
             BotTask nextTask = taskQueue.peek();
             if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
                 // Next target is within reach — mine it immediately, no pause
@@ -330,18 +332,72 @@ public class BotController {
     }
 
     private static void tickCollecting() {
-        waitRemaining--;
-        if (waitRemaining <= 0) {
+        Minecraft client = Minecraft.getInstance();
+        LocalPlayer player = client.player;
+        boolean itemsNearby = false;
+
+        if (player != null && client.level != null) {
+            if (phaseTicks == 1 && camera == null) {
+                camera = new CameraController();
+                camera.initialize(player.getYRot(), player.getXRot());
+            }
+
+            // Find nearby item entities within 8 blocks
+            net.minecraft.world.phys.AABB searchBox = player.getBoundingBox().inflate(8.0);
+            var items = client.level.getEntities(
+                    net.minecraft.world.entity.EntityType.ITEM, searchBox, e -> true);
+            itemsNearby = !items.isEmpty();
+
+            // Walk toward the nearest item (using horizontal distance only)
+            net.minecraft.world.entity.item.ItemEntity nearest = null;
+            double nearestHorizDistSq = Double.MAX_VALUE;
+            for (var item : items) {
+                double dx = item.getX() - player.getX();
+                double dz = item.getZ() - player.getZ();
+                double horizDistSq = dx * dx + dz * dz;
+                if (horizDistSq < nearestHorizDistSq) {
+                    nearestHorizDistSq = horizDistSq;
+                    nearest = item;
+                }
+            }
+
+            // Pickup radius is ~1.5 blocks; stop walking when within 1.0 to avoid overshooting
+            if (nearest != null && nearestHorizDistSq > 1.0) {
+                double dx = nearest.getX() - player.getX();
+                double dz = nearest.getZ() - player.getZ();
+                float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
+                // Smooth camera turn to avoid erratic spinning
+                if (camera != null) {
+                    player.setYRot(camera.updateYaw(targetYaw));
+                } else {
+                    player.setYRot(targetYaw);
+                }
+                client.options.keyUp.setDown(true);
+                client.options.keySprint.setDown(nearestHorizDistSq > 4.0);
+            } else {
+                client.options.keyUp.setDown(false);
+                client.options.keySprint.setDown(false);
+            }
+        }
+
+        // Stay in COLLECTING until:
+        // - All nearby items are picked up (after spawn delay of ~15 ticks), OR
+        // - Hard timeout reached
+        // Wait at least 40 ticks before concluding no items exist —
+        // item entities need time to spawn and become visible in the entity list
+        boolean doneCollecting = !itemsNearby && phaseTicks > 40;
+        boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
+        if (doneCollecting || timedOut) {
+            releaseMovementKeys();
+            lastMinedPos = null;
             currentTask = null;
             if (walkAfterCollect && !taskQueue.isEmpty() && !paused) {
-                // Start next task — will enter SCANNING if it needs walking
                 currentTask = taskQueue.poll();
                 taskTotalTicks = 0;
                 transitionTo(Phase.SCANNING);
             } else {
                 phase = Phase.IDLE;
                 phaseTicks = 0;
-                // Check if new tasks were added while collecting
                 if (!taskQueue.isEmpty() && !paused) {
                     startNextTask();
                 }

@@ -3,6 +3,8 @@ package net.stracciatella.bot.test;
 import java.util.List;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
@@ -20,40 +22,38 @@ public class BotTests {
     private static final int CLEAR_RADIUS = 8;
 
     // ================================================================
-    // Test 1: Single block mine
+    // Test 1: Single block mine — collect cobblestone
     // ================================================================
-    @MinecraftTest(name = "Bot mine single block", timeoutTicks = 60, order = -200)
+    @MinecraftTest(name = "Bot mine single block", timeoutTicks = 120, order = -200)
     public void mineSingleBlock(TestContext ctx) {
         final BlockPos origin = new BlockPos(1000, 30, 1000);
         final BlockPos blockPos = origin;
         final BlockPos standPos = origin.offset(0, 0, 2);
 
         setupTest(ctx, origin);
-        clearArea(ctx, origin, CLEAR_RADIUS);
-        buildStandPlatform(ctx, standPos, origin.getY());
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("setblock " + blockPos.getX() + " " + (blockPos.getY() - 1) + " " + blockPos.getZ() + " stone");
         ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " stone");
         ctx.runCommand("give @s diamond_pickaxe");
         switchToSurvivalAt(ctx, standPos, origin.getY());
 
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
-        ctx.waitFor(mc -> mc.level.getBlockState(blockPos).isAir());
-        ctx.runOnClient(mc -> BotController.stop());
+        waitForBotIdle(ctx);
+        waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
         LOGGER.info("Single block mine test passed");
     }
 
     // ================================================================
-    // Test 2: Tool selection
+    // Test 2: Tool selection — collect raw iron
     // ================================================================
-    @MinecraftTest(name = "Bot tool selection", timeoutTicks = 60, order = -199)
+    @MinecraftTest(name = "Bot tool selection", timeoutTicks = 120, order = -199)
     public void toolSelection(TestContext ctx) {
         final BlockPos origin = new BlockPos(1050, 30, 1000);
         final BlockPos blockPos = origin;
         final BlockPos standPos = origin.offset(0, 0, 2);
 
         setupTest(ctx, origin);
-        clearArea(ctx, origin, CLEAR_RADIUS);
-        buildStandPlatform(ctx, standPos, origin.getY());
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("setblock " + blockPos.getX() + " " + (blockPos.getY() - 1) + " " + blockPos.getZ() + " stone");
         ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " iron_ore");
         ctx.runCommand("give @s wooden_pickaxe");
@@ -61,29 +61,22 @@ public class BotTests {
         switchToSurvivalAt(ctx, standPos, origin.getY());
 
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
-        ctx.waitFor(mc -> mc.level.getBlockState(blockPos).isAir());
-
-        int selectedSlot = ctx.computeOnClient(mc -> mc.player.getInventory().getSelectedSlot());
-        if (selectedSlot != 1) {
-            LOGGER.warn("Expected slot 1 (iron pickaxe), got slot {}", selectedSlot);
-        }
-
-        ctx.runOnClient(mc -> BotController.stop());
+        waitForBotIdle(ctx);
+        waitForItem(ctx, Items.RAW_IRON, 1, "raw iron");
         LOGGER.info("Tool selection test passed");
     }
 
     // ================================================================
-    // Test 3: Tree chop
+    // Test 3: Tree chop — all logs mined, collect at least some
     // ================================================================
-    @MinecraftTest(name = "Bot chop tree", timeoutTicks = 120, order = -198)
+    @MinecraftTest(name = "Bot chop tree", timeoutTicks = 140, order = -198)
     public void chopTree(TestContext ctx) {
         final BlockPos origin = new BlockPos(1100, 30, 1000);
         final BlockPos treeBase = origin;
         final BlockPos standPos = origin.offset(2, 0, 0);
 
         setupTest(ctx, origin);
-        clearArea(ctx, origin, CLEAR_RADIUS);
-        buildPlatform(ctx, origin, 5);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
         for (int i = 0; i < 4; i++) {
             ctx.runCommand("setblock " + treeBase.getX() + " " + (treeBase.getY() + i) + " " + treeBase.getZ() + " oak_log");
         }
@@ -103,6 +96,7 @@ public class BotTests {
             BotController.enqueueTask(new ChopTreeTask(tree));
         });
 
+        // Wait for all blocks to be mined
         ctx.waitFor(mc -> {
             for (int i = 0; i < 4; i++) {
                 if (!mc.level.getBlockState(treeBase.offset(0, i, 0)).isAir()) {
@@ -111,9 +105,10 @@ public class BotTests {
             }
             return true;
         });
-
-        ctx.runOnClient(mc -> BotController.stop());
-        LOGGER.info("Tree chop test passed");
+        waitForBotIdle(ctx);
+        // Logs drop right at the player's feet — collect at least 1
+        waitForItem(ctx, Items.OAK_LOG, 1, "oak logs");
+        LOGGER.info("Tree chop test passed (collected {} oak logs)", countItem(ctx, Items.OAK_LOG));
     }
 
     // ================================================================
@@ -126,16 +121,17 @@ public class BotTests {
         final BlockPos standPos = origin.offset(0, 0, 3);
 
         setupTest(ctx, origin);
-        clearArea(ctx, origin, CLEAR_RADIUS);
-        buildStandPlatform(ctx, standPos, origin.getY());
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("setblock " + blockPos.getX() + " " + (blockPos.getY() - 1) + " " + blockPos.getZ() + " stone");
         ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " stone");
         ctx.runCommand("give @s diamond_pickaxe");
 
-        // Face away from the block initially
-        ctx.runCommand("tp @s " + (standPos.getX() + 0.5) + " " + (origin.getY()) + " " + (standPos.getZ() + 0.5) + " 180 0");
-        ctx.waitFor(mc -> mc.player.onGround());
-        ctx.runCommand("gamemode survival");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+        // Face away from the block
+        ctx.runOnClient(mc -> {
+            mc.player.setYRot(180.0f);
+            mc.player.setXRot(0.0f);
+        });
 
         float[] lastYaw = {180.0f};
         float[] maxDelta = {0.0f};
@@ -160,15 +156,14 @@ public class BotTests {
                     + " degrees in a single tick (expected < 50)");
         }
 
-        ctx.waitFor(mc -> mc.level.getBlockState(blockPos).isAir());
-        ctx.runOnClient(mc -> BotController.stop());
+        waitForBotIdle(ctx);
         LOGGER.info("Camera smoothness test passed (max delta: {})", String.format("%.1f", maxDelta[0]));
     }
 
     // ================================================================
-    // Test 5: Walk to distant block and mine it
+    // Test 5: Walk to distant block, mine it, collect cobblestone
     // ================================================================
-    @MinecraftTest(name = "Bot walk and mine", timeoutTicks = 120, order = -196)
+    @MinecraftTest(name = "Bot walk and mine", timeoutTicks = 200, order = -196)
     public void walkAndMine(TestContext ctx) {
         final BlockPos origin = new BlockPos(1300, 30, 1000);
         final BlockPos standPos = origin;
@@ -183,19 +178,16 @@ public class BotTests {
         generateMesh(ctx, origin);
 
         ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
-
-        // Verify the bot actually walks (enters NAVIGATING or beyond)
         ctx.waitFor(mc -> BotController.getPhase() != BotController.Phase.IDLE);
-
-        ctx.waitFor(mc -> mc.level.getBlockState(blockPos).isAir());
-        ctx.runOnClient(mc -> BotController.stop());
+        waitForBotIdle(ctx);
+        waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
         LOGGER.info("Walk and mine test passed");
     }
 
     // ================================================================
-    // Test 6: Task queue — mine two blocks at different locations
+    // Test 6: Task queue — mine two blocks, verify blocks mined + items
     // ================================================================
-    @MinecraftTest(name = "Bot mine queue", timeoutTicks = 150, order = -195)
+    @MinecraftTest(name = "Bot mine queue", timeoutTicks = 250, order = -195)
     public void mineQueue(TestContext ctx) {
         final BlockPos origin = new BlockPos(1350, 30, 1000);
         final BlockPos block1 = origin.offset(3, 0, 0);
@@ -215,18 +207,19 @@ public class BotTests {
             BotController.enqueueTask(new MineBlockTask(block2));
         });
 
-        ctx.waitFor(mc -> mc.level.getBlockState(block1).isAir());
-        LOGGER.info("First block mined");
-        ctx.waitFor(mc -> mc.level.getBlockState(block2).isAir());
-
-        ctx.runOnClient(mc -> BotController.stop());
+        // Wait for both blocks to be mined
+        ctx.waitFor(mc -> mc.level.getBlockState(block1).isAir()
+                && mc.level.getBlockState(block2).isAir());
+        waitForBotIdle(ctx);
+        waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
+        waitForItem(ctx, Items.RAW_IRON, 1, "raw iron");
         LOGGER.info("Mine queue test passed");
     }
 
     // ================================================================
-    // Test 7: Walk → mine stone → walk → chop tree (full sequence)
+    // Test 7: Walk → mine stone → walk → chop tree, verify all mined
     // ================================================================
-    @MinecraftTest(name = "Bot walk mine walk chop", timeoutTicks = 200, order = -194)
+    @MinecraftTest(name = "Bot walk mine walk chop", timeoutTicks = 280, order = -194)
     public void walkMineWalkChop(TestContext ctx) {
         final BlockPos origin = new BlockPos(1400, 30, 1000);
         final BlockPos stonePos = origin.offset(4, 0, 0);
@@ -253,10 +246,11 @@ public class BotTests {
             BotController.enqueueTask(new ChopTreeTask(trees.get(0)));
         });
 
-        ctx.waitFor(mc -> mc.level.getBlockState(stonePos).isAir());
-        LOGGER.info("Stone mined, now chopping tree");
-
+        // Wait for stone + all logs to be mined
         ctx.waitFor(mc -> {
+            if (!mc.level.getBlockState(stonePos).isAir()) {
+                return false;
+            }
             for (int i = 0; i < 3; i++) {
                 if (!mc.level.getBlockState(treeBase.offset(0, i, 0)).isAir()) {
                     return false;
@@ -264,15 +258,16 @@ public class BotTests {
             }
             return true;
         });
-
-        ctx.runOnClient(mc -> BotController.stop());
+        waitForBotIdle(ctx);
+        waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
+        waitForItem(ctx, Items.OAK_LOG, 1, "oak logs");
         LOGGER.info("Walk mine walk chop test passed");
     }
 
     // ================================================================
     // Test 8: Mine ore vein — 3 adjacent ore blocks
     // ================================================================
-    @MinecraftTest(name = "Bot mine ore vein", timeoutTicks = 120, order = -193)
+    @MinecraftTest(name = "Bot mine ore vein", timeoutTicks = 250, order = -193)
     public void mineOreVein(TestContext ctx) {
         final BlockPos origin = new BlockPos(1450, 30, 1000);
         final BlockPos ore1 = origin.offset(2, 0, 0);
@@ -293,12 +288,12 @@ public class BotTests {
             BotController.enqueueTask(new MineBlockTask(ore3));
         });
 
-        ctx.waitFor(mc ->
-                mc.level.getBlockState(ore1).isAir()
-                        && mc.level.getBlockState(ore2).isAir()
-                        && mc.level.getBlockState(ore3).isAir());
-
-        ctx.runOnClient(mc -> BotController.stop());
+        ctx.waitFor(mc -> mc.level.getBlockState(ore1).isAir()
+                && mc.level.getBlockState(ore2).isAir()
+                && mc.level.getBlockState(ore3).isAir());
+        waitForBotIdle(ctx);
+        // All 3 ores mined from same spot — items drop right at the player
+        waitForItem(ctx, Items.RAW_IRON, 3, "raw iron");
         LOGGER.info("Mine ore vein test passed");
     }
 
@@ -312,14 +307,11 @@ public class BotTests {
 
         ctx.runOnClient(mc -> BotController.stop());
         ctx.runCommand("clear @s");
-        // Restore creative mode — this test doesn't mine, and ensures
-        // subsequent test suites (PathWalker) run in creative
         ctx.runCommand("gamemode creative");
 
         teleportAndWaitForChunks(ctx, origin);
 
-        clearArea(ctx, origin, CLEAR_RADIUS);
-        ctx.runCommand("setblock " + origin.getX() + " " + (origin.getY() - 1) + " " + origin.getZ() + " stone");
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("setblock " + farBlock.getX() + " " + farBlock.getY() + " " + farBlock.getZ() + " stone");
 
         ctx.runCommand("tp @s " + (origin.getX() + 0.5) + " " + origin.getY() + " " + (origin.getZ() + 0.5));
@@ -338,29 +330,54 @@ public class BotTests {
 
     // --- Shared helpers ---
 
-    /**
-     * Common setup: stop bot, clear inventory, switch to creative,
-     * teleport and wait for chunks. Does NOT switch to survival yet —
-     * call switchToSurvivalAt() after building terrain.
-     */
     private void setupTest(TestContext ctx, BlockPos origin) {
         ctx.runOnClient(mc -> BotController.stop());
         ctx.runCommand("clear @s");
+        ctx.runCommand("kill @e[type=item]");
         ctx.runCommand("gamemode creative");
         teleportAndWaitForChunks(ctx, origin);
     }
 
-    /**
-     * Switch to survival and teleport to the stand position on the built ground.
-     */
     private void switchToSurvivalAt(TestContext ctx, BlockPos standPos, int groundY) {
         ctx.runCommand("tp @s " + (standPos.getX() + 0.5) + " " + (groundY) + " " + (standPos.getZ() + 0.5));
-        ctx.waitFor(mc -> mc.player.onGround());
+        ctx.waitFor(mc -> mc.player.onGround()
+                && Math.abs(mc.player.getX() - (standPos.getX() + 0.5)) < 1.0
+                && Math.abs(mc.player.getZ() - (standPos.getZ() + 0.5)) < 1.0);
         ctx.runCommand("gamemode survival");
     }
 
+    private void waitForBotIdle(TestContext ctx) {
+        ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.IDLE);
+        ctx.runOnClient(mc -> BotController.stop());
+    }
+
+    /**
+     * Wait until the player has at least {@code minCount} of the given item.
+     * Uses the test's timeout as the hard deadline.
+     */
+    private void waitForItem(TestContext ctx, Item item, int minCount, String itemName) {
+        ctx.waitFor(mc -> countItems(mc.player.getInventory(), item) >= minCount);
+        LOGGER.info("Collected {} {}", countItem(ctx, item), itemName);
+    }
+
+    private int countItem(TestContext ctx, Item item) {
+        return ctx.computeOnClient(mc -> countItems(mc.player.getInventory(), item));
+    }
+
+    private static int countItems(net.minecraft.world.entity.player.Inventory inv, Item item) {
+        int count = 0;
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            var stack = inv.getItem(i);
+            if (stack.is(item)) {
+                count += stack.getCount();
+            }
+        }
+        return count;
+    }
+
     private void teleportAndWaitForChunks(TestContext ctx, BlockPos origin) {
-        ctx.runCommand("tp @s " + (origin.getX() + 0.5) + " " + (origin.getY() + 5) + " " + (origin.getZ() + 0.5));
+        // Teleport to load the chunk
+        ctx.runCommand("tp @s " + (origin.getX() + 0.5) + " " + (origin.getY()) + " " + (origin.getZ() + 0.5));
         ctx.waitFor(mc -> {
             if (mc.player == null || mc.level == null) {
                 return false;
@@ -369,29 +386,24 @@ public class BotTests {
                     && Math.abs(mc.player.position().x - (origin.getX() + 0.5)) < 20
                     && Math.abs(mc.player.position().z - (origin.getZ() + 0.5)) < 20;
         });
+        // Place safety block and re-teleport so the player lands on it
+        // instead of floating/falling in air
+        ctx.runCommand("setblock " + origin.getX() + " " + (origin.getY() - 1) + " " + origin.getZ() + " stone");
+        ctx.runCommand("tp @s " + (origin.getX() + 0.5) + " " + (origin.getY()) + " " + (origin.getZ() + 0.5));
+        ctx.waitFor(mc -> mc.player.onGround());
     }
 
-    private void clearArea(TestContext ctx, BlockPos center, int radius) {
+    private void buildPlatform(TestContext ctx, BlockPos center, int radius) {
+        // Build 2-block-thick platform so items don't fall through
         ctx.runCommand("fill "
-                + (center.getX() - radius) + " " + (center.getY() - radius) + " " + (center.getZ() - radius) + " "
+                + (center.getX() - radius) + " " + (center.getY() - 2) + " " + (center.getZ() - radius) + " "
+                + (center.getX() + radius) + " " + (center.getY() - 1) + " " + (center.getZ() + radius) + " stone");
+        // Clear air above
+        ctx.runCommand("fill "
+                + (center.getX() - radius) + " " + center.getY() + " " + (center.getZ() - radius) + " "
                 + (center.getX() + radius) + " " + (center.getY() + radius) + " " + (center.getZ() + radius) + " air");
     }
 
-    /** Build a 3x3 stone stand platform at groundY-1. */
-    private void buildStandPlatform(TestContext ctx, BlockPos standPos, int groundY) {
-        ctx.runCommand("fill " + (standPos.getX() - 1) + " " + (groundY - 1) + " " + (standPos.getZ() - 1)
-                + " " + (standPos.getX() + 1) + " " + (groundY - 1) + " " + (standPos.getZ() + 1) + " stone");
-    }
-
-    /** Build a flat stone platform and clear air above it. */
-    private void buildPlatform(TestContext ctx, BlockPos center, int radius) {
-        clearArea(ctx, center, radius);
-        ctx.runCommand("fill "
-                + (center.getX() - radius) + " " + (center.getY() - 1) + " " + (center.getZ() - radius) + " "
-                + (center.getX() + radius) + " " + (center.getY() - 1) + " " + (center.getZ() + radius) + " stone");
-    }
-
-    /** Generate pathfinding mesh for chunks around the position. */
     private void generateMesh(TestContext ctx, BlockPos center) {
         ctx.runOnClient(mc -> {
             if (mc.player == null || mc.level == null) {
