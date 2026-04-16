@@ -28,12 +28,12 @@ net.stracciatella.pathfinding
 │   ├── TravelStatus.java             # Enum: IN_PROGRESS, SUCCEEDED, FAILED
 │   ├── Navigator.java                # Static coordinator: auto-selects best method, manages fallback chain
 │   ├── WalkTravelMethod.java         # Wraps PathWalker for mesh-based walking
-│   ├── EnderPearlTravelMethod.java   # Ender pearl throw with trajectory simulation
-│   └── CommandTeleportTravelMethod.java # /tp command teleportation
+│   └── EnderPearlTravelMethod.java   # Ender pearl throw with trajectory simulation
 ├── mixin/
 │   └── LevelChunkMixin.java          # Triggers mesh generation on chunk load
 └── test/
-    └── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
+    ├── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
+    └── EnderPearlTests.java          # In-game tests: ender pearl throwing at various distances/elevations
 ```
 
 ## Key data flow
@@ -162,7 +162,6 @@ public interface TravelMethod {
 
 | Method | id | Cost model | Requirements |
 |--------|----|-----------|-------------|
-| CommandTeleport | `tp` | 1.0 (instant) | /tp permissions (optimistic, fails gracefully) |
 | EnderPearl | `ender_pearl` | ~60 ticks | Pearl in hotbar, distance 5-40 blocks |
 | Walk | `walk` | distance/0.215 | Mesh available, A* path exists |
 
@@ -209,5 +208,6 @@ Static coordinator (like PathWalker). Registered on `ClientTickEvents.END_CLIENT
 ## Testing
 
 - In-game tests in `test/PathWalkerTests.java` (registered by PathfindingModule)
+- In-game tests in `test/EnderPearlTests.java` (registered by PathfindingModule) — tests EnderPearlTravelMethod at 10/20/30 block flat, uphill, and downhill distances
 - JUnit tests in `src/test/.../MeshPathfinderTest.java` (A* algorithm verification)
 - Run in-game tests: `/stracciatella-test` after joining a world

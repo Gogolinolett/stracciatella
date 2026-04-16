@@ -3,6 +3,7 @@ package net.stracciatella.pathfinding.travel;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.ItemStack;
@@ -13,7 +14,7 @@ public class EnderPearlTravelMethod implements TravelMethod {
 
     private static final double MAX_RANGE = 40.0;
     private static final double MIN_RANGE = 5.0;
-    private static final double SUCCESS_RADIUS_SQ = 9.0; // 3 blocks
+    private static final double SUCCESS_RADIUS_SQ = 49.0; // 7 blocks
     private static final int WAITING_TIMEOUT_TICKS = 100;
     private static final float FACING_TOLERANCE = 5.0f;
     private static final double EYE_HEIGHT = 1.62;
@@ -65,10 +66,13 @@ public class EnderPearlTravelMethod implements TravelMethod {
         this.target = to;
         this.active = true;
 
-        // Select the ender pearl slot
+        // Select the ender pearl slot. setSelectedSlot only updates client state —
+        // the server needs ServerboundSetCarriedItemPacket to know which slot is held,
+        // otherwise the use-item packet resolves against a stale server-side slot.
         int slot = findPearlSlot(player);
         if (slot >= 0) {
             player.getInventory().setSelectedSlot(slot);
+            player.connection.send(new ServerboundSetCarriedItemPacket(slot));
         }
 
         // Compute aim angles
@@ -137,7 +141,9 @@ public class EnderPearlTravelMethod implements TravelMethod {
     private TravelStatus tickThrowing(Minecraft client, LocalPlayer player) {
         if (ticksInPhase == 1) {
             client.options.keyUse.setDown(true);
-        } else if (ticksInPhase == 2) {
+        } else if (ticksInPhase >= 6) {
+            // Hold for several ticks so handleKeybinds processes the use action
+            // even if rightClickDelay is still counting down from a previous use.
             client.options.keyUse.setDown(false);
             phase = Phase.WAITING;
             ticksInPhase = 0;
@@ -146,7 +152,9 @@ public class EnderPearlTravelMethod implements TravelMethod {
     }
 
     private TravelStatus tickWaiting(Minecraft client, LocalPlayer player) {
-        if (player.blockPosition().distSqr(target) <= SUCCESS_RADIUS_SQ) {
+        // Compare against target.above(): the player's blockPosition() returns the block
+        // at their feet, which is 1 above the surface block they stand on.
+        if (player.blockPosition().distSqr(target.above()) <= SUCCESS_RADIUS_SQ) {
             return TravelStatus.SUCCEEDED;
         }
         if (ticksInPhase >= WAITING_TIMEOUT_TICKS) {
