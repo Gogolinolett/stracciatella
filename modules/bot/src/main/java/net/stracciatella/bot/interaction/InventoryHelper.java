@@ -1,6 +1,7 @@
 package net.stracciatella.bot.interaction;
 
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
@@ -13,6 +14,12 @@ public class InventoryHelper {
     /**
      * Select the hotbar slot with the fastest tool for the given block.
      * Returns the slot index that was selected, or -1 if bare hand is best.
+     * <p>
+     * {@link Inventory#setSelectedSlot} only updates client state — the server
+     * needs {@link ServerboundSetCarriedItemPacket} to know which slot is held,
+     * otherwise break/use actions are resolved against a stale server-side slot
+     * and drops may be computed with the wrong tool (e.g. iron_ore mined with
+     * server-side bare hand drops nothing).
      */
     public static int selectBestTool(LocalPlayer player, BlockState targetBlock) {
         Inventory inv = player.getInventory();
@@ -33,6 +40,11 @@ public class InventoryHelper {
 
         if (bestSlot >= 0) {
             inv.setSelectedSlot(bestSlot);
+            // Always send — even if client-side selectedSlot matches bestSlot,
+            // the server's copy may disagree under accelerated ticks or after
+            // a prior test's state bled through. The packet is small and
+            // idempotent.
+            player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
         }
         return bestSlot;
     }

@@ -211,3 +211,9 @@ Static coordinator (like PathWalker). Registered on `ClientTickEvents.END_CLIENT
 - In-game tests in `test/EnderPearlTests.java` (registered by PathfindingModule) — tests EnderPearlTravelMethod at 10/20/30 block flat, uphill, and downhill distances
 - JUnit tests in `src/test/.../MeshPathfinderTest.java` (A* algorithm verification)
 - Run in-game tests: `/stracciatella-test` after joining a world
+
+### EnderPearl cooldown gating in tests
+
+`EnderPearlTests.runPearlTest` polls `!mc.player.getCooldowns().isOnCooldown(new ItemStack(Items.ENDER_PEARL))` after giving pearls but before calling `EnderPearlTravelMethod.start()`. Vanilla applies a 20-tick per-throw cooldown. Under accelerated ticks, the inter-test interval can be shorter than this cooldown, and a throw during an active cooldown is silently discarded by the server (key press ignored). The client `ItemCooldowns` mirrors the server via `ClientboundCooldownPacket`, so this poll is authoritative.
+
+`EnderPearlTravelMethod` itself does not check the cooldown — callers are expected to throw only when a throw is possible. Adding cooldown handling inside the method would be a compensating wrapper around a test-harness ordering issue.

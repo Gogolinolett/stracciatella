@@ -29,13 +29,16 @@ public class BotConfig {
     public int settleDelayMin = 2;
     public int settleDelayMax = 5;
 
-    // Item collection wait before walking away (ticks)
-    // Must be long enough to walk to drops, wait for the 10-tick pickup delay,
-    // and actually pick them up
-    // collectWaitMin is unused now — collection ends when items are gone.
-    // collectWaitMax is the hard timeout to prevent infinite collecting.
-    public int collectWaitMin = 20;
+    // Hard timeout for COLLECTING if drops never become reachable.
     public int collectWaitMax = 400;
+
+    // Consecutive ticks the target block must be observed as air before the
+    // break is considered server-confirmed (see design.md).
+    public int airConfirmTicks = 8;
+
+    // Ticks items must be absent from the search AABB after at least one
+    // sighting before COLLECTING exits (see design.md).
+    public int itemAbsenceTicks = 60;
 
     // Scanning: look toward distant target before walking
     public int scanTimeout = 30;
@@ -68,8 +71,9 @@ public class BotConfig {
         this.lookSpeedMax = other.lookSpeedMax;
         this.settleDelayMin = other.settleDelayMin;
         this.settleDelayMax = other.settleDelayMax;
-        this.collectWaitMin = other.collectWaitMin;
         this.collectWaitMax = other.collectWaitMax;
+        this.airConfirmTicks = other.airConfirmTicks;
+        this.itemAbsenceTicks = other.itemAbsenceTicks;
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;
         this.scanRadius = other.scanRadius;

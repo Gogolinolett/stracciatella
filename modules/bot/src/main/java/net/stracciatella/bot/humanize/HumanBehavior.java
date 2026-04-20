@@ -27,13 +27,6 @@ public class HumanBehavior {
     }
 
     /**
-     * Generate a random collection wait time in ticks.
-     */
-    public static int randomCollectWait(BotConfig config) {
-        return randomIntInRange(config.collectWaitMin, config.collectWaitMax);
-    }
-
-    /**
      * Generate a random look speed multiplier for this target.
      */
     public static double randomLookSpeedMultiplier(BotConfig config) {

@@ -21,6 +21,11 @@ public class EnderPearlTravelMethod implements TravelMethod {
     private static final double PEARL_SPEED = 1.5;
     private static final double PEARL_GRAVITY = 0.03;
     private static final double PEARL_DRAG = 0.99;
+    // Hold keyUse long enough that even under accelerated test ticks, handleKeybinds
+    // reliably processes the use action. Each successful client-side use sets
+    // rightClickDelay=4, so holding for ~20 ticks guarantees 4–5 retry attempts that
+    // can get past any transient server cooldown that outlasted the client-side wait.
+    private static final int USE_HOLD_TICKS = 20;
 
     private enum Phase { AIMING, THROWING, WAITING }
 
@@ -141,9 +146,7 @@ public class EnderPearlTravelMethod implements TravelMethod {
     private TravelStatus tickThrowing(Minecraft client, LocalPlayer player) {
         if (ticksInPhase == 1) {
             client.options.keyUse.setDown(true);
-        } else if (ticksInPhase >= 6) {
-            // Hold for several ticks so handleKeybinds processes the use action
-            // even if rightClickDelay is still counting down from a previous use.
+        } else if (ticksInPhase >= USE_HOLD_TICKS) {
             client.options.keyUse.setDown(false);
             phase = Phase.WAITING;
             ticksInPhase = 0;

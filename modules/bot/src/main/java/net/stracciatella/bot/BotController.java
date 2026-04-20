@@ -54,10 +54,22 @@ public class BotController {
     private static boolean toolSelected = false;
 
     // Collection state
-    private static int waitRemaining = 0;
     private static boolean walkAfterCollect = false;
     // Position of the last mined block — COLLECTING walks toward this to pick up drops
     private static BlockPos lastMinedPos = null;
+    // True once items have been observed in the 8-block AABB this COLLECTING
+    // session. Prevents exit during the server→client sync delay after a block
+    // breaks but before the drop entity syncs to the client.
+    private static boolean itemsSeenThisCollect = false;
+    // Last phaseTick on which items were visible in the AABB. COLLECTING only
+    // exits once items have been absent for a sustained window (not just a
+    // single transient tick between pickup and next spawn/sync).
+    private static int lastItemSeenTick = 0;
+    // Interaction state — how many consecutive ticks the current target block
+    // has been observed as air. We require a sustained window to ensure the
+    // server confirmed the break (not just client-side prediction, which gets
+    // reverted if the server rejects the break under accelerated ticks).
+    private static int airConfirmTicks = 0;
 
     public enum Phase {
         IDLE,
@@ -91,6 +103,11 @@ public class BotController {
         phaseTicks = 0;
         taskTotalTicks = 0;
         taskQueue.clear();
+        lastMinedPos = null;
+        itemsSeenThisCollect = false;
+        lastItemSeenTick = 0;
+        airConfirmTicks = 0;
+        walkAfterCollect = false;
         releaseMovementKeys();
         LOGGER.info("Bot stopped");
     }
@@ -273,6 +290,7 @@ public class BotController {
         if (!toolSelected) {
             toolSelected = true;
             InventoryHelper.selectBestTool(player, level.getBlockState(target));
+            airConfirmTicks = 0;
         }
 
         // Keep aiming at the target (maintain camera position)
@@ -300,13 +318,26 @@ public class BotController {
             BlockInteractor.startInteraction(currentTask.interactionType());
         }
 
-        // Check if block is broken
-        if (currentTask.isCurrentTargetComplete(level)) {
+        // Check if block is broken. Under accelerated ticks the client can
+        // predict a break faster than the server processes it; the server then
+        // reverts the block and no drop spawns. Require the block to remain air
+        // for a sustained window so we know the server confirmed the break.
+        boolean isAir = currentTask.isCurrentTargetComplete(level);
+        if (isAir) {
+            airConfirmTicks++;
+        } else {
+            // Observed the block restored (or never broken) — reset the counter
+            // so the client prediction doesn't stick as "broken".
+            airConfirmTicks = 0;
+        }
+        if (airConfirmTicks >= CONFIG.airConfirmTicks) {
             BlockInteractor.stopInteraction();
 
             if (CONFIG.debugEnabled) {
                 LOGGER.info("Block broken at {} in {} ticks", target, phaseTicks);
             }
+
+            // airConfirmTicks resets on re-entry via the toolSelect branch above.
 
             // Sub-targets remaining in same task (e.g. tree logs) — mine next immediately
             if (currentTask.advanceToNextTarget()) {
@@ -325,7 +356,8 @@ public class BotController {
             } else {
                 // Need to walk (or nothing left) — collect drops first
                 walkAfterCollect = nextTask != null;
-                waitRemaining = HumanBehavior.randomCollectWait(CONFIG);
+                itemsSeenThisCollect = false;
+                lastItemSeenTick = 0;
                 transitionTo(Phase.COLLECTING);
             }
         }
@@ -347,6 +379,10 @@ public class BotController {
             var items = client.level.getEntities(
                     net.minecraft.world.entity.EntityType.ITEM, searchBox, e -> true);
             itemsNearby = !items.isEmpty();
+            if (itemsNearby) {
+                itemsSeenThisCollect = true;
+                lastItemSeenTick = phaseTicks;
+            }
 
             // Walk toward the nearest item (using horizontal distance only)
             net.minecraft.world.entity.item.ItemEntity nearest = null;
@@ -361,35 +397,45 @@ public class BotController {
                 }
             }
 
-            // Pickup radius is ~1.5 blocks; stop walking when within 1.0 to avoid overshooting
             if (nearest != null && nearestHorizDistSq > 1.0) {
-                double dx = nearest.getX() - player.getX();
-                double dz = nearest.getZ() - player.getZ();
-                float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
-                // Smooth camera turn to avoid erratic spinning
-                if (camera != null) {
-                    player.setYRot(camera.updateYaw(targetYaw));
+                // Pickup radius ~1.5 blocks; stop at 1.0 to avoid overshoot
+                walkToward(client, player, nearest.getX(), nearest.getZ(), nearestHorizDistSq);
+            } else if (!itemsSeenThisCollect && lastMinedPos != null) {
+                // No items visible yet, but we expect a drop at lastMinedPos.
+                // Walk there so the entity enters the AABB as soon as the server
+                // syncs its spawn.
+                double tx = lastMinedPos.getX() + 0.5;
+                double tz = lastMinedPos.getZ() + 0.5;
+                double dx = tx - player.getX();
+                double dz = tz - player.getZ();
+                double horizDistSq = dx * dx + dz * dz;
+                if (horizDistSq > 1.0) {
+                    walkToward(client, player, tx, tz, horizDistSq);
                 } else {
-                    player.setYRot(targetYaw);
+                    client.options.keyUp.setDown(false);
+                    client.options.keySprint.setDown(false);
                 }
-                client.options.keyUp.setDown(true);
-                client.options.keySprint.setDown(nearestHorizDistSq > 4.0);
             } else {
                 client.options.keyUp.setDown(false);
                 client.options.keySprint.setDown(false);
             }
         }
 
-        // Stay in COLLECTING until:
-        // - All nearby items are picked up (after spawn delay of ~15 ticks), OR
-        // - Hard timeout reached
-        // Wait at least 40 ticks before concluding no items exist —
-        // item entities need time to spawn and become visible in the entity list
-        boolean doneCollecting = !itemsNearby && phaseTicks > 40;
+        // Exit COLLECTING once items have been observed and then absent for a
+        // sustained window (`itemAbsenceTicks` since last sighting). This closes both:
+        //   - the server→client spawn-sync race after a block break, and
+        //   - the transient absence between picking up one drop and the next
+        //     drop becoming the current nearest (especially when multiple
+        //     blocks are mined back-to-back).
+        // Fall back to a hard timeout if drops never become reachable.
+        boolean doneCollecting = itemsSeenThisCollect && !itemsNearby
+                && phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks;
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
         if (doneCollecting || timedOut) {
             releaseMovementKeys();
             lastMinedPos = null;
+            itemsSeenThisCollect = false;
+            lastItemSeenTick = 0;
             currentTask = null;
             if (walkAfterCollect && !taskQueue.isEmpty() && !paused) {
                 currentTask = taskQueue.poll();
@@ -403,6 +449,21 @@ public class BotController {
                 }
             }
         }
+    }
+
+    private static void walkToward(Minecraft client, LocalPlayer player,
+                                   double targetX, double targetZ, double horizDistSq) {
+        double dx = targetX - player.getX();
+        double dz = targetZ - player.getZ();
+        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
+        // Smooth camera turn to avoid erratic spinning
+        if (camera != null) {
+            player.setYRot(camera.updateYaw(targetYaw));
+        } else {
+            player.setYRot(targetYaw);
+        }
+        client.options.keyUp.setDown(true);
+        client.options.keySprint.setDown(horizDistSq > 4.0);
     }
 
     private static void tickScanning(Minecraft client, LocalPlayer player) {

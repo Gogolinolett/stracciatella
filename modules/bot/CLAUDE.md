@@ -54,7 +54,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
 | **LOOKING** | CameraController smoothly rotates to target block face + settle delay | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera | `maxBreakTicks` |
-| **COLLECTING** | Brief wait for item drops before walking away or going idle | `collectWaitMin/Max` |
+| **COLLECTING** | Walk toward visible drops or `lastMinedPos`; exit once items have been observed and are all picked up | `collectWaitMax` |
 
 ### Smart transitions after block break
 
@@ -62,6 +62,16 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 - **Next task within reach**: straight to LOOKING with new task, no pause
 - **Next task needs walking**: COLLECTING → SCANNING → NAVIGATING
 - **No more tasks**: COLLECTING → IDLE
+
+### COLLECTING exit conditions
+
+Three conditions must all hold to exit COLLECTING cleanly:
+
+1. `itemsSeenThisCollect` — at least one tick observed items in the 8-block AABB. Closes the server→client spawn-sync race where the block has broken but the drop entity hasn't synced.
+2. `!itemsNearby` — currently no visible drops.
+3. `phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — items have been absent for a sustained window. Avoids exiting on a transient absence tick between sequentially picking up multiple drops.
+
+While no items are visible yet, the bot walks toward `lastMinedPos` so the drop enters the AABB query as soon as the server syncs it. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
 
 ### Key integration points
 
@@ -71,15 +81,17 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 
 ## Block Interaction
 
-Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls. Break detection via `level.getBlockState(pos).isAir()`.
+Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls.
+
+Break detection polls `level.getBlockState(pos).isAir()` but **requires the block to remain air for `CONFIG.airConfirmTicks` consecutive ticks** (default 8) before considering the task complete. Under accelerated ticks (`-PtickSpeed>1`), the client ticks faster than the server and can predict a break that the server later rejects and reverts. The sustained-air window ensures the server confirmed the break and dropped items. `airConfirmTicks` resets to 0 whenever the block is observed non-air, which handles server reverts by continuing the mining. The counter is re-reset on each re-entry into INTERACTING via the tool-select branch, so `transitionTo` doesn't need to clear it explicitly.
+
+`InventoryHelper.selectBestTool` sends `ServerboundSetCarriedItemPacket` after `setSelectedSlot` so the server's held-item state matches the client's. Without the packet sync, server-side drops are computed with the wrong tool (e.g. iron_ore mined with server-side bare hand drops nothing).
 
 ## Human-Like Behavior
 
 - Spring-damper camera smoothing (5-15 ticks to converge)
 - Random aim offset within block face (not dead center)
 - Settle delay after aim convergence (2-5 ticks)
-- Random inter-task cooldowns (2-30 ticks, occasional long pauses)
-- Post-break delays (1-5 ticks)
 - Tool selection before mining starts
 
 ## Commands (`/bot`)
@@ -102,7 +114,9 @@ Persisted to `stracciatella/bot.json`. Key parameters:
 
 - `aimOffsetMin/Max` — block face aim jitter
 - `settleDelayMin/Max` — ticks after aim converges
-- `collectWaitMin/Max` — ticks to wait for item drops before walking away
+- `collectWaitMax` — hard timeout for COLLECTING if drops never become reachable
+- `airConfirmTicks` — consecutive air-observation ticks required to confirm a break (default 8)
+- `itemAbsenceTicks` — ticks items must be absent after a sighting before COLLECTING exits (default 60)
 - `scanTimeout` — max ticks to look toward next target before walking (30)
 - `scanFacingTolerance` — degrees tolerance for scan convergence (15.0)
 - `scanRadius` — block scan radius
@@ -121,4 +135,4 @@ Persisted to `stracciatella/bot.json`. Key parameters:
 Tests in `test/BotTests.java`, registered via `TestRunner.instance().registerSuite(BotTests.class)`.
 Run via `./gradlew runMinecraftTests`. Each test builds its environment with `/fill` + `/setblock`.
 
-Test cases: single block mine, tool selection, tree chop, camera smoothness, out-of-reach failure.
+Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure.

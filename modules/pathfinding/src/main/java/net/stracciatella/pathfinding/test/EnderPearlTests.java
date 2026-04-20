@@ -1,6 +1,8 @@
 package net.stracciatella.pathfinding.test;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.stracciatella.pathfinding.logic.PathWalker;
 import net.stracciatella.pathfinding.travel.EnderPearlTravelMethod;
 import net.stracciatella.pathfinding.travel.Navigator;
@@ -22,6 +24,11 @@ import org.slf4j.LoggerFactory;
 @TestSuite(name = "EnderPearl Tests")
 public class EnderPearlTests {
     private static final Logger LOGGER = LoggerFactory.getLogger("EnderPearlTests");
+
+    // Extra ticks after the client cooldown clears, to let the server's
+    // ItemCooldowns catch up under accelerated `/tick rate` where client and
+    // server cooldown counters can drift.
+    private static final int COOLDOWN_SAFETY_TICKS = 30;
 
     @MinecraftTest(name = "EnderPearl flat 10", timeoutTicks = 300, order = -50, repeat = 3)
     public void flat_10(TestContext ctx) {
@@ -94,6 +101,17 @@ public class EnderPearlTests {
             ctx.runCommand("give @s minecraft:ender_pearl 16");
             ctx.waitTicks(2);
             ctx.runOnClient(mc -> {});
+
+            // Wait for server-side pearl cooldown from any previous test to clear.
+            // Vanilla applies a 20-tick cooldown per throw. Client and server tick
+            // independently under the test tick-multiplier, and the client can
+            // finish its cooldown countdown while the server's ItemCooldowns still
+            // holds the cooldown — a client use-press in that window is silently
+            // rejected by the server. Poll the client cooldown, then wait a safety
+            // margin to let the server catch up.
+            ctx.waitFor(mc -> !mc.player.getCooldowns()
+                    .isOnCooldown(new ItemStack(Items.ENDER_PEARL)));
+            ctx.waitTicks(COOLDOWN_SAFETY_TICKS);
 
             // Phase 5: Run EnderPearlTravelMethod
             EnderPearlTravelMethod pearl = new EnderPearlTravelMethod();

@@ -49,3 +49,29 @@ Chose coordinate equality because MeshNode is used as a HashMap key in MeshPathf
 | Check `dy > 0` first (chosen) | Both limits apply correctly: 4.5 for drops, 4.0 for flat/step-up | Slightly less obvious order |
 
 Chose drops-first because it matches the original intent (drops should allow 4.5 diagonal distance). The more specific condition must be checked before the more general one.
+
+## EnderPearl test cooldown gating
+
+**Decision**: `EnderPearlTests` waits on the client-side `ItemCooldowns` (synced from the server via `ClientboundCooldownPacket`) and then adds a 30-tick safety margin before calling `EnderPearlTravelMethod.start()`; the travel method itself does not check or clear the cooldown.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Fixed `waitTicks(N)` larger than 20 only | Simple | Non-deterministic under accelerated ticks; different `-PtickSpeed` values need different N. |
+| Poll `!player.getCooldowns().isOnCooldown(stack)` in test setup + 30-tick safety margin (chosen) | Deterministic on the client side, authoritative (server-synced via packet), scales with any tick rate. Safety margin absorbs client/server tick-rate drift under accelerated ticks. | Tests must know to poll — couples test to cooldown mechanic |
+| Check cooldown inside `EnderPearlTravelMethod.tickThrowing` | Encapsulated | Compensating wrapper around a test-harness ordering issue; the method should not silently delay callers who asked for a throw |
+
+Chose the test-level poll because the travel method correctly fails when a throw is ignored; the test's setup phase is the right place to establish preconditions. The 30-tick safety margin handles client/server-tick drift: client's `ItemCooldowns` can clear ahead of the server's under `-PtickSpeed>1` when the frame rate outpaces `/tick rate`, and a client-side use press during that gap is silently rejected by the server.
+
+## EnderPearlTravelMethod THROWING hold window
+
+**Decision**: Hold `keyUse` for 20 accelerated ticks before releasing in `tickThrowing`.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Hold for 2 ticks (original) | Minimal | A single use is rejected if `rightClickDelay>0` from a prior use. |
+| Hold for 6 ticks | Allows one retry after `rightClickDelay` expires | Still fails under accelerated ticks where client/server drift puts the first two attempts inside a lingering server-side cooldown window. |
+| Hold for 20 ticks (chosen) | Gives 4–5 retry attempts, covers server-side cooldown expiring mid-hold under accelerated ticks | Very slightly wastes ticks when the throw succeeds on the first attempt |
+
+Chose 20 because the server-side cooldown is 20 ticks and the client-side cooldown can clear up to that window before the server's at high `-PtickSpeed` values. Holding for 20 ticks guarantees at least one attempt hits a cooldown-clear server state. In practice only the first successful attempt throws a pearl (subsequent presses are silently absorbed by the server's fresh cooldown), so the hold doesn't multiply pearls.
