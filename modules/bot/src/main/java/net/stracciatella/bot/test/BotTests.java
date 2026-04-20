@@ -187,7 +187,7 @@ public class BotTests {
     // ================================================================
     // Test 6: Task queue — mine two blocks, verify blocks mined + items
     // ================================================================
-    @MinecraftTest(name = "Bot mine queue", timeoutTicks = 250, order = -195)
+    @MinecraftTest(name = "Bot mine queue", timeoutTicks = 250, order = -195, repeat = 5)
     public void mineQueue(TestContext ctx) {
         final BlockPos origin = new BlockPos(1350, 30, 1000);
         final BlockPos block1 = origin.offset(3, 0, 0);
@@ -267,7 +267,7 @@ public class BotTests {
     // ================================================================
     // Test 8: Mine ore vein — 3 adjacent ore blocks
     // ================================================================
-    @MinecraftTest(name = "Bot mine ore vein", timeoutTicks = 250, order = -193)
+    @MinecraftTest(name = "Bot mine ore vein", timeoutTicks = 250, order = -193, repeat = 5)
     public void mineOreVein(TestContext ctx) {
         final BlockPos origin = new BlockPos(1450, 30, 1000);
         final BlockPos ore1 = origin.offset(2, 0, 0);
