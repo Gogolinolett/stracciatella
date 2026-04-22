@@ -29,12 +29,20 @@ public class BotConfig {
     public int settleDelayMin = 2;
     public int settleDelayMax = 5;
 
-    // Hard timeout for COLLECTING if drops never become reachable.
-    public int collectWaitMax = 400;
+    // Hard timeout for COLLECTING if drops never become reachable. Needs to
+    // be large enough for the server→client item-entity sync under heavy load
+    // (accelerated ticks amplify packet-queue backup).
+    public int collectWaitMax = 1200;
 
     // Consecutive ticks the target block must be observed as air before the
     // break is considered server-confirmed (see design.md).
     public int airConfirmTicks = 8;
+
+    // Ticks to wait after selecting a tool before starting the first attack,
+    // so the server can process the ServerboundSetCarriedItemPacket. Without
+    // this, under accelerated ticks the break can resolve against a stale
+    // server-side held slot and the drop is computed with the wrong tool.
+    public int toolSettleTicks = 8;
 
     // Ticks items must be absent from the search AABB after at least one
     // sighting before COLLECTING exits (see design.md).
@@ -53,8 +61,10 @@ public class BotConfig {
     // Maximum reach distance for mining
     public double reachDistance = 4.0;
 
-    // Maximum ticks to wait for a block to break before giving up
-    public int maxBreakTicks = 100;
+    // Maximum ticks INTERACTING runs before giving up (mine + settle + wait
+    // for drop entity). Must cover the slowest legitimate break on the server
+    // plus item-entity spawn sync under load.
+    public int maxBreakTicks = 400;
 
     // Phase timeouts
     public int navigateTimeout = 200;
@@ -73,6 +83,7 @@ public class BotConfig {
         this.settleDelayMax = other.settleDelayMax;
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
+        this.toolSettleTicks = other.toolSettleTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;

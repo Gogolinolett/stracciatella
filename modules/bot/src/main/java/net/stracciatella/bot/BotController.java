@@ -293,6 +293,19 @@ public class BotController {
             airConfirmTicks = 0;
         }
 
+        // Hold off on the first attack for a few ticks so the server has time
+        // to process the ServerboundSetCarriedItemPacket sent in selectBestTool.
+        // Under accelerated ticks the next block can break within ~20 ticks
+        // (~100ms wall), which beats packet round-trip — without this settle
+        // the server resolves the break against a stale held slot and the drop
+        // is computed with the wrong tool (e.g. iron_ore with bare hand → no drop).
+        // Re-send the carried-item packet each settle tick so a dropped or
+        // reordered packet doesn't leave the server on a stale held slot.
+        if (phaseTicks <= CONFIG.toolSettleTicks) {
+            InventoryHelper.resendCarriedItem(player);
+            return;
+        }
+
         // Keep aiming at the target (maintain camera position)
         if (camera != null) {
             double targetX = target.getX() + 0.5 + aimOffsetX;
@@ -313,24 +326,41 @@ public class BotController {
             player.setXRot(pitch);
         }
 
-        // Start mining if not already
+        // Start mining if not already. Pass the explicit target so the
+        // destroy packet always lands on the intended block — bypasses the
+        // stale-hitResult race on the first tick of INTERACTING.
         if (!BlockInteractor.isInteracting()) {
-            BlockInteractor.startInteraction(currentTask.interactionType());
+            BlockInteractor.startInteraction(currentTask.interactionType(), target);
         }
 
         // Check if block is broken. Under accelerated ticks the client can
-        // predict a break faster than the server processes it; the server then
-        // reverts the block and no drop spawns. Require the block to remain air
-        // for a sustained window so we know the server confirmed the break.
+        // predict a break faster than the server processes it; the server
+        // then reverts the block and no drop spawns.
+        //
+        // Client-side sequenced-transaction prediction means getBlockState()
+        // can return air BEFORE the server has actually broken the block. To
+        // avoid exiting INTERACTING on a prediction that the server later
+        // reverts, we require two things:
+        //   1. The block must remain air for `airConfirmTicks` consecutive
+        //      ticks (sustained-air window).
+        //   2. A drop entity must have spawned nearby — an authoritative
+        //      signal that the server actually completed the break.
+        // If the server reverts, either check fails and we keep mining.
         boolean isAir = currentTask.isCurrentTargetComplete(level);
         if (isAir) {
             airConfirmTicks++;
         } else {
-            // Observed the block restored (or never broken) — reset the counter
-            // so the client prediction doesn't stick as "broken".
             airConfirmTicks = 0;
         }
+        boolean dropNearby = false;
         if (airConfirmTicks >= CONFIG.airConfirmTicks) {
+            net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+                    target.getX() - 2, target.getY() - 2, target.getZ() - 2,
+                    target.getX() + 3, target.getY() + 3, target.getZ() + 3);
+            dropNearby = !client.level.getEntities(
+                    net.minecraft.world.entity.EntityType.ITEM, box, e -> true).isEmpty();
+        }
+        if (airConfirmTicks >= CONFIG.airConfirmTicks && dropNearby) {
             BlockInteractor.stopInteraction();
 
             if (CONFIG.debugEnabled) {
@@ -432,6 +462,19 @@ public class BotController {
                 && phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks;
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
         if (doneCollecting || timedOut) {
+            // Failure-only telemetry: if COLLECTING is exiting with no items
+            // ever seen, log the last mined block state + surrounding area.
+            // Fires once per exit; no timing impact on the happy path.
+            if (!itemsSeenThisCollect && lastMinedPos != null
+                    && player != null && client.level != null) {
+                var state = client.level.getBlockState(lastMinedPos);
+                int around = client.level.getEntities(
+                        net.minecraft.world.entity.EntityType.ITEM,
+                        player.getBoundingBox().inflate(20.0), e -> true).size();
+                boolean creative = player.getAbilities().instabuild;
+                LOGGER.warn("COLLECTING exit WITH NO DROP: lastMinedPos={} state={} timedOut={} phaseTicks={} itemsIn20b={} creative={}",
+                        lastMinedPos, state.getBlock(), timedOut, phaseTicks, around, creative);
+            }
             releaseMovementKeys();
             lastMinedPos = null;
             itemsSeenThisCollect = false;

@@ -14,19 +14,22 @@
 
 Chose the items-seen + sustained-absence gate because it closes three races deterministically: (1) the server→client spawn-sync delay after a block break, (2) the transient absence between sequentially picking up drops, and (3) missed drops when the bot is far from the mined block. No per-task metadata, all tick constants in accelerated units, exit self-contained. The earlier `phaseTicks > 40` floor was dropped: `itemsSeenThisCollect` already gates entry, so `lastItemSeenTick + itemAbsenceTicks >= 60 > 40` makes the floor unreachable.
 
-## INTERACTING break confirmation window
+## INTERACTING break confirmation: sustained air + drop-entity proof
 
-**Decision**: INTERACTING requires the target block to be observed as air for `CONFIG.airConfirmTicks` consecutive ticks (default 8) before transitioning out. Non-air observations reset the counter.
+**Decision**: INTERACTING requires two authoritative signals before transitioning out:
+1. Sustained-air window of `CONFIG.airConfirmTicks` consecutive ticks (default 8).
+2. A drop entity exists within a 5×5×5 AABB around the target.
 
 ### Alternatives
 | Approach | Pros | Cons |
 |----------|------|------|
-| Single-tick check `isCurrentTargetComplete(level)` (original) | Minimal | Under accelerated ticks the client's break prediction can race ahead of the server's. Client shows air, bot transitions, but server rejects the break and restores the block — no drop spawns. Failed `mineQueue` consistently. |
-| 8-tick sustained-air window (chosen) | Ensures the server confirmed the break (if the server had rejected, the block would have been restored within 8 ticks and the counter would reset) | Adds ~40ms of real time per block break at 10x |
-| Inspect server confirmation explicitly (listen for `ClientboundBlockUpdatePacket`) | Authoritative | Requires hooking into the packet pipeline — larger mixin surface area |
+| Single-tick check `isCurrentTargetComplete(level)` (original) | Minimal | Under accelerated ticks the client's break prediction races ahead of the server's. Client shows air, bot transitions, but server rejects and restores the block — no drop spawns. |
+| Sustained-air window only | Zero new infrastructure | Client-side sequenced-transaction prediction can keep the predicted-air state for a long time before the server's revert ack arrives. Under `tickSpeed=20`, observed `lastMinedPos state=iron_ore` at COLLECTING exit: the block had reverted on the client, proving the server never broke it — yet airConfirmTicks had fired. No fixed window size is safe. |
+| Air + drop-entity (chosen) | The drop entity is authoritative: the server only spawns it after actually completing the break. If the client's air is a mere prediction the server later reverts, no drop entity ever appears and the bot keeps mining until `maxBreakTicks`. Works independently of tick-rate jitter. | Adds a per-tick AABB query once `airConfirmTicks` is satisfied (cheap, 5×5×5 region). For blocks that break with no drop (wrong-tool breaks), INTERACTING runs to `maxBreakTicks` and fails the task — correct behavior since no drop is useless anyway. |
+| Listen for `ClientboundBlockUpdatePacket` via mixin | Authoritative | Requires packet-pipeline mixin. The drop-entity check uses an existing entity query and is equivalent signal-quality for our purposes. |
 | Higher `/tick rate` on server to outpace client | Eliminates the race at the source | Can starve other server work; not all dev machines support it |
 
-Chose the 8-tick window because it fixes the race with zero new infrastructure and the 40ms wait is negligible compared to the block-break time itself. 8 was chosen empirically: 3 was insufficient (mineQueue still failed), 15 was too long (other tests timed out). The counter reset on revert is load-bearing — it makes the bot automatically retry if the server rejects the break.
+Chose "air + drop-entity" because it's the first approach that's **load-independent**. All the earlier attempts at tuning windows (3 → 8 → 16 → 32 → 48 ticks for `airConfirmTicks` or `toolSettleTicks`) passed in some runs and flaked in others depending on system load. The drop-entity check relies on an actual server-side artifact, not a timing assumption — the block broke iff the drop exists.
 
 ## Server-side held-item sync in tool selection
 
@@ -40,6 +43,34 @@ Chose the 8-tick window because it fixes the race with zero new infrastructure a
 | Send packet always (chosen) | Cheap, idempotent, guarantees server agreement | One extra packet per interaction start (negligible) |
 
 Chose to always send because the packet is tiny, idempotent, and a stale server-side slot is a silent-failure mode (drops computed with wrong tool). Worth the trivial cost.
+
+## First-attack settle after tool select
+
+**Decision**: In INTERACTING, after `InventoryHelper.selectBestTool` runs, hold off on the first attack for `CONFIG.toolSettleTicks` ticks (default 4) before letting `BlockInteractor` start.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No delay (original) | Minimal | Under accelerated ticks, a fast block can break within ~20 ticks of entering INTERACTING. That's ~100ms wall time at 10x — less than packet round-trip. The server's held-slot may still be the previous value when the break resolves, producing the wrong drop (or none at all). Reproduced in `mineQueue` at 2/5 failure rate. |
+| Fixed `toolSettleTicks` wait + per-tick packet re-send (chosen) | Deterministic. 8 ticks at 10x ≈ 40ms wall + per-tick carried-item re-send defends against the server processing the attack before the carried-item packet. Applies only to the first attack per target. Cheap and robust. | Adds a small constant delay per block and ~8 tiny packets per settle |
+| Wait on observed server ack (e.g. hook `ClientboundSetCarriedItemPacket`) | Authoritative — no guessing | Extra mixin surface; the echo from a `ServerboundSetCarriedItemPacket` isn't always re-sent to the client |
+| Retry if the drop doesn't appear | Lazy | Requires per-task expected-drop metadata, which `BotTask` doesn't carry |
+
+Chose the fixed settle because it's a one-line change gated on the existing `toolSelected` first-tick branch, costs a negligible amount of wall time, and matches the same pattern used by `airConfirmTicks` for the other end of the break.
+
+## Gamemode-sync wait in test setup
+
+**Decision**: `BotTests.switchToSurvivalAt` blocks on `!mc.player.getAbilities().instabuild` after issuing `/gamemode survival`, before the test enqueues its mining task.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No wait (original) | Simple | Racy under load. When the server hasn't processed `/gamemode survival` yet, the player is still creative server-side. Block breaks are instant and drop nothing client-receives an air update and our `airConfirmTicks` fires, bot moves on, no drop ever appeared. Presented as "tool-select race" for hours — misdiagnosed. |
+| Large `toolSettleTicks` + `airConfirmTicks` (tried) | Brute-forces timing margins | Doesn't fix the root cause. Every time system load changed, the minimum safe value changed with it — 8 → 16 → 24 → 48 all flaked eventually. |
+| Wait on ability-sync flag (chosen) | Directly observes the server→client state we actually need. No timing constants. Failure class eliminated, not masked. | Adds a small wait (usually < 1 tick wall) only in test setup. |
+| Hook `ClientboundPlayerAbilitiesPacket` via mixin | Equivalent authoritative signal | Adds mixin surface for a check the existing `Abilities` field already exposes. |
+
+Chose the ability-flag wait because it's the minimal, direct sync on the actual condition we care about. Added after confirming the block-break-with-no-drop pattern fired in `walkMineWalkChop`'s first mined position too, ruling out the tool-race as the sole cause.
 
 ## Item-entity search radius (8 blocks)
 

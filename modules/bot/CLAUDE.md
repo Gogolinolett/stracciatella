@@ -83,9 +83,22 @@ While no items are visible yet, the bot walks toward `lastMinedPos` so the drop 
 
 Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls.
 
-Break detection polls `level.getBlockState(pos).isAir()` but **requires the block to remain air for `CONFIG.airConfirmTicks` consecutive ticks** (default 8) before considering the task complete. Under accelerated ticks (`-PtickSpeed>1`), the client ticks faster than the server and can predict a break that the server later rejects and reverts. The sustained-air window ensures the server confirmed the break and dropped items. `airConfirmTicks` resets to 0 whenever the block is observed non-air, which handles server reverts by continuing the mining. The counter is re-reset on each re-entry into INTERACTING via the tool-select branch, so `transitionTo` doesn't need to clear it explicitly.
+Break detection requires TWO authoritative signals before considering the block broken:
+
+1. **Sustained-air window**: `level.getBlockState(pos).isAir()` for `CONFIG.airConfirmTicks` consecutive ticks (default 8). `getBlockState` returns the client's view which can be a sequenced-transaction prediction; the sustained window tolerates normal server-confirmation delay.
+2. **Drop-entity proof**: at least one item entity must have spawned within a 5×5×5 AABB around the target block. This is the authoritative server-side signal — a drop entity only exists if the server completed the break.
+
+**Why the drop-entity check is necessary**: the client's block prediction can remain "air" long enough to pass the sustained-air window even when the server ultimately never broke the block (it reverts the client's prediction later). We observed `lastMinedPos state=iron_ore` at COLLECTING exit — the block had reverted to iron_ore on the client, proving the server never actually broke it. Without the drop check, the bot falsely "confirms" breaks on predictions the server rejects, resulting in missing drops.
+
+`airConfirmTicks` resets to 0 whenever the block is observed non-air. `maxBreakTicks` (default 400) caps INTERACTING — covers the slowest legit break + drop-spawn sync under load.
 
 `InventoryHelper.selectBestTool` sends `ServerboundSetCarriedItemPacket` after `setSelectedSlot` so the server's held-item state matches the client's. Without the packet sync, server-side drops are computed with the wrong tool (e.g. iron_ore mined with server-side bare hand drops nothing).
+
+After selecting the tool, INTERACTING holds off on the first attack for `CONFIG.toolSettleTicks` ticks (default 8), re-sending the carried-item packet each tick via `InventoryHelper.resendCarriedItem`. This closes a fast-break race where the attack beats the carried-item packet to the server.
+
+## Test setup: waiting on gamemode sync
+
+A separate race used to produce the same "block broken, no drop" symptom: the test runs `/gamemode survival` and then immediately enqueues a mining task on the client. On the heavily-loaded accelerated-tick server, `/gamemode` can be queued behind other command packets. When the bot starts attacking, the server still has the player in creative — block breaks are instant client-side and drop nothing. `BotTests.switchToSurvivalAt` now waits on `!mc.player.getAbilities().instabuild` (the server→client ack of the mode change) before starting the bot, which eliminates the whole class of failure without any timing tuning. Under accelerated ticks (`-PtickSpeed>1`) a fast block can break within ~20 ticks of entering INTERACTING — less wall time than the packet round-trip — so the break resolves against a stale server-side held slot. The settle delay lets the server apply the carried-item packet before any attack packets arrive. This affects only the first attack per target; subsequent ticks call `continueAttack` normally.
 
 ## Human-Like Behavior
 
@@ -114,14 +127,15 @@ Persisted to `stracciatella/bot.json`. Key parameters:
 
 - `aimOffsetMin/Max` — block face aim jitter
 - `settleDelayMin/Max` — ticks after aim converges
-- `collectWaitMax` — hard timeout for COLLECTING if drops never become reachable
+- `collectWaitMax` — hard timeout for COLLECTING if drops never become reachable (default 1200, covers delayed item-entity sync at 20x tickSpeed)
 - `airConfirmTicks` — consecutive air-observation ticks required to confirm a break (default 8)
+- `toolSettleTicks` — ticks to wait after tool select before first attack (default 8). Carried-item packet is re-sent each tick during the window.
 - `itemAbsenceTicks` — ticks items must be absent after a sighting before COLLECTING exits (default 60)
 - `scanTimeout` — max ticks to look toward next target before walking (30)
 - `scanFacingTolerance` — degrees tolerance for scan convergence (15.0)
 - `scanRadius` — block scan radius
 - `reachDistance` — max mining reach (4.0)
-- `maxBreakTicks` — interaction timeout
+- `maxBreakTicks` — interaction timeout (default 400, must cover settle + mine + drop-spawn wait)
 
 ## Dependencies
 

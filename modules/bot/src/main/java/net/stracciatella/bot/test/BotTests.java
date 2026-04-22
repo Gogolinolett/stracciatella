@@ -344,6 +344,10 @@ public class BotTests {
                 && Math.abs(mc.player.getX() - (standPos.getX() + 0.5)) < 1.0
                 && Math.abs(mc.player.getZ() - (standPos.getZ() + 0.5)) < 1.0);
         ctx.runCommand("gamemode survival");
+        // Wait for the server→client ability sync to land. Without this, the
+        // bot can start attacking while the player is still in creative
+        // server-side — which instant-breaks the block with no drop.
+        ctx.waitFor(mc -> !mc.player.getAbilities().instabuild);
     }
 
     private void waitForBotIdle(TestContext ctx) {
@@ -353,10 +357,16 @@ public class BotTests {
 
     /**
      * Wait until the player has at least {@code minCount} of the given item.
-     * Uses the test's timeout as the hard deadline.
+     * Uses a short explicit timeout so a missing-drop failure is visible
+     * within ~3 seconds instead of burning the full 14s test budget.
      */
     private void waitForItem(TestContext ctx, Item item, int minCount, String itemName) {
-        ctx.waitFor(mc -> countItems(mc.player.getInventory(), item) >= minCount);
+        // ~6s wall at 10x, ~3s at 20x (120 × tickMultiplier) — must be larger
+        // than CONFIG.collectWaitMax so a legitimate late-spawning drop (heavy
+        // server load can delay item-entity sync by several seconds) has time
+        // to land before the test gives up.
+        int timeout = 120 * net.stracciatella.testing.runner.TestRunner.getTickMultiplier();
+        ctx.waitFor(mc -> countItems(mc.player.getInventory(), item) >= minCount, timeout);
         LOGGER.info("Collected {} {}", countItem(ctx, item), itemName);
     }
 

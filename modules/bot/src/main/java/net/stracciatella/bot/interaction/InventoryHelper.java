@@ -48,4 +48,15 @@ public class InventoryHelper {
         }
         return bestSlot;
     }
+
+    /**
+     * Re-send the ServerboundSetCarriedItemPacket for the player's current
+     * client-side selected slot. Used during the tool-settle window so a
+     * dropped or reordered packet doesn't leave the server on a stale held
+     * slot when the first attack arrives.
+     */
+    public static void resendCarriedItem(LocalPlayer player) {
+        int slot = player.getInventory().getSelectedSlot();
+        player.connection.send(new ServerboundSetCarriedItemPacket(slot));
+    }
 }
