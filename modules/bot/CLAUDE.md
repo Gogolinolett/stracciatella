@@ -49,11 +49,11 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | Phase | Behavior | Timeout |
 |-------|----------|---------|
 | **IDLE** | No active task, poll queue when new task enqueued | — |
-| **SCANNING** | Smoothly look toward distant target before walking (CameraController) | `scanTimeout` |
+| **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
-| **LOOKING** | CameraController smoothly rotates to target block face + settle delay | `lookTimeout` |
-| **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera | `maxBreakTicks` |
+| **LOOKING** | `CameraController.aimAt` toward target block face + offset, exit when `isAimedAt(facingTolerance)` and settle delay elapses | `lookTimeout` |
+| **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`; exit once items have been observed and are all picked up | `collectWaitMax` |
 
 ### Smart transitions after block break
@@ -75,7 +75,7 @@ While no items are visible yet, the bot walks toward `lastMinedPos` so the drop 
 
 ### Key integration points
 
-- **PathWalker**: Bot calls `PathWalker.start(path)` for navigation, monitors `PathWalker.isActive()`. Creates its own `CameraController` instance for aiming (separate from PathWalker's camera).
+- **PathWalker**: Bot calls `PathWalker.start(path)` for navigation, monitors `PathWalker.isActive()`. Creates its own `CameraController` instance for aiming (separate from PathWalker's camera), and drives it via the high-level `aimAt` / `isAimedAt` APIs so no yaw/pitch math lives in the bot.
 - **MeshManager**: Bot queries `MeshManager.meshes` to find walkable standoff nodes near targets.
 - **MeshPathfinder**: Bot uses A* to find paths from player to standoff positions.
 

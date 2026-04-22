@@ -12,7 +12,6 @@ import net.stracciatella.bot.interaction.BlockInteractor;
 import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.task.BotTask;
 import net.stracciatella.bot.task.TaskQueue;
-import net.stracciatella.camera.AngleUtil;
 import net.stracciatella.camera.CameraController;
 import net.stracciatella.pathfinding.ChunkCoordinate;
 import net.stracciatella.pathfinding.logic.MeshManager;
@@ -245,27 +244,14 @@ public class BotController {
         }
 
         BlockPos target = currentTask.targetPos();
-        double targetX = target.getX() + 0.5 + aimOffsetX;
-        double targetY = target.getY() + 0.5 + aimOffsetY;
-        double targetZ = target.getZ() + 0.5 + aimOffsetZ;
+        double tx = target.getX() + 0.5;
+        double ty = target.getY() + 0.5;
+        double tz = target.getZ() + 0.5;
 
-        double dx = targetX - player.getX();
-        double dy = targetY - player.getEyeY();
-        double dz = targetZ - player.getZ();
-        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        camera.aimAt(player, tx, ty, tz, aimOffsetX, aimOffsetY, aimOffsetZ);
 
-        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
-        float targetPitch = (float) (-Math.atan2(dy, horizontalDist) * (180.0 / Math.PI));
-
-        float yaw = camera.updateYaw(targetYaw);
-        float pitch = camera.updatePitch(targetPitch);
-        player.setYRot(yaw);
-        player.setXRot(pitch);
-
-        boolean facingTarget = AngleUtil.isFacingTarget(yaw, targetYaw, (float) CONFIG.facingTolerance)
-                && Math.abs(pitch - targetPitch) < CONFIG.facingTolerance;
-
-        if (facingTarget) {
+        if (camera.isAimedAt(player, tx, ty, tz, aimOffsetX, aimOffsetY, aimOffsetZ,
+                (float) CONFIG.facingTolerance)) {
             if (settleRemaining < 0) {
                 settleRemaining = settleDelay;
             }
@@ -308,22 +294,9 @@ public class BotController {
 
         // Keep aiming at the target (maintain camera position)
         if (camera != null) {
-            double targetX = target.getX() + 0.5 + aimOffsetX;
-            double targetY = target.getY() + 0.5 + aimOffsetY;
-            double targetZ = target.getZ() + 0.5 + aimOffsetZ;
-
-            double dx = targetX - player.getX();
-            double dy = targetY - player.getEyeY();
-            double dz = targetZ - player.getZ();
-            double horizontalDist = Math.sqrt(dx * dx + dz * dz);
-
-            float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
-            float targetPitch = (float) (-Math.atan2(dy, horizontalDist) * (180.0 / Math.PI));
-
-            float yaw = camera.updateYaw(targetYaw);
-            float pitch = camera.updatePitch(targetPitch);
-            player.setYRot(yaw);
-            player.setXRot(pitch);
+            camera.aimAt(player,
+                    target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5,
+                    aimOffsetX, aimOffsetY, aimOffsetZ);
         }
 
         // Start mining if not already. Pass the explicit target so the
@@ -524,23 +497,13 @@ public class BotController {
 
         // Smoothly look toward the next target
         BlockPos target = currentTask.targetPos();
-        double dx = (target.getX() + 0.5) - player.getX();
-        double dy = (target.getY() + 0.5) - player.getEyeY();
-        double dz = (target.getZ() + 0.5) - player.getZ();
-        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        double tx = target.getX() + 0.5;
+        double ty = target.getY() + 0.5;
+        double tz = target.getZ() + 0.5;
 
-        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
-        float targetPitch = (float) (-Math.atan2(dy, horizontalDist) * (180.0 / Math.PI));
+        camera.aimAt(player, tx, ty, tz);
 
-        float yaw = camera.updateYaw(targetYaw);
-        float pitch = camera.updatePitch(targetPitch);
-        player.setYRot(yaw);
-        player.setXRot(pitch);
-
-        // Once roughly facing the target, start walking
-        boolean facing = AngleUtil.isFacingTarget(yaw, targetYaw, (float) CONFIG.scanFacingTolerance)
-                && Math.abs(pitch - targetPitch) < CONFIG.scanFacingTolerance;
-        if (facing) {
+        if (camera.isAimedAt(player, tx, ty, tz, (float) CONFIG.scanFacingTolerance)) {
             beginNavigation(player);
         }
     }

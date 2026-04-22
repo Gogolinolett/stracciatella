@@ -1,5 +1,7 @@
 package net.stracciatella.camera;
 
+import net.minecraft.client.player.LocalPlayer;
+
 /**
  * Controls camera yaw and pitch with human-like smoothing.
  *
@@ -95,5 +97,68 @@ public class CameraController {
 
     public float getYawVelocity() {
         return yawVelocity;
+    }
+
+    /**
+     * Smoothly aims the player's camera at the world-space point
+     * {@code (tx + offsetX, ty + offsetY, tz + offsetZ)}. Updates the camera's
+     * internal yaw/pitch state with one tick of smoothing and writes the result
+     * to the player's rotation.
+     *
+     * <p>The offsets let callers add per-target jitter (e.g. aiming at a random
+     * point inside a block face) without recomputing the base target.
+     */
+    public void aimAt(LocalPlayer player, double tx, double ty, double tz,
+                      double offsetX, double offsetY, double offsetZ) {
+        float[] angles = computeTargetAngles(player, tx, ty, tz, offsetX, offsetY, offsetZ);
+        float newYaw = updateYaw(angles[0]);
+        float newPitch = updatePitch(angles[1]);
+        player.setYRot(newYaw);
+        player.setXRot(newPitch);
+    }
+
+    /**
+     * Convenience overload for {@link #aimAt(LocalPlayer, double, double, double, double, double, double)}
+     * with zero offsets.
+     */
+    public void aimAt(LocalPlayer player, double tx, double ty, double tz) {
+        aimAt(player, tx, ty, tz, 0.0, 0.0, 0.0);
+    }
+
+    /**
+     * Returns true when the smoothed yaw and pitch are both within
+     * {@code toleranceDeg} of the angles required to look at the offset target.
+     * Uses the camera's current (smoothed) state, so callers typically call this
+     * after {@link #aimAt}.
+     */
+    public boolean isAimedAt(LocalPlayer player, double tx, double ty, double tz,
+                             double offsetX, double offsetY, double offsetZ,
+                             float toleranceDeg) {
+        float[] angles = computeTargetAngles(player, tx, ty, tz, offsetX, offsetY, offsetZ);
+        return AngleUtil.isFacingTarget(yaw, angles[0], toleranceDeg)
+                && Math.abs(pitch - angles[1]) < toleranceDeg;
+    }
+
+    /**
+     * Convenience overload for {@link #isAimedAt(LocalPlayer, double, double, double, double, double, double, float)}
+     * with zero offsets.
+     */
+    public boolean isAimedAt(LocalPlayer player, double tx, double ty, double tz, float toleranceDeg) {
+        return isAimedAt(player, tx, ty, tz, 0.0, 0.0, 0.0, toleranceDeg);
+    }
+
+    private static float[] computeTargetAngles(LocalPlayer player,
+                                               double tx, double ty, double tz,
+                                               double offsetX, double offsetY, double offsetZ) {
+        double ax = tx + offsetX;
+        double ay = ty + offsetY;
+        double az = tz + offsetZ;
+        double dx = ax - player.getX();
+        double dy = ay - player.getEyeY();
+        double dz = az - player.getZ();
+        double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
+        float targetPitch = (float) (-Math.atan2(dy, horizontalDist) * (180.0 / Math.PI));
+        return new float[]{targetYaw, targetPitch};
     }
 }
