@@ -52,7 +52,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
-| **LOOKING** | `CameraController.aimAt` toward target block face + offset, exit when both the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target, then settle delay elapses | `lookTimeout` |
+| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn). Exit the moment the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — no settle delay. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`; exit once items have been observed and are all picked up | `collectWaitMax` |
 
@@ -94,6 +94,8 @@ Two conditions must both hold before LOOKING transitions to INTERACTING:
 
 The angular check alone is insufficient: when an obstacle stands in the line of sight, the camera can be aimed within `facingTolerance` of the target vector while the raycast still hits the obstacle (visible to the player as the bot starting to attack the wrong block before correcting). Requiring both gates means the settle countdown only progresses once the bot can actually see the target. If line-of-sight is permanently blocked, `lookTimeout` fails the task cleanly.
 
+The aim point is the center of the face most directly visible from the bot's eye (via `BlockInteractor.faceTowardPlayer`), not the block center — otherwise a raycast aimed at the center of a block sitting in the middle of a stack (e.g. the top log of a tree) lands on the neighbor and the hit-result gate never satisfies. Human-aim jitter is applied only on the two axes perpendicular to the face normal; jitter along the face normal would push the aim point off the face plane and cause the ray to graze a neighbor block instead.
+
 ### Mining
 
 Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls.
@@ -111,7 +113,7 @@ Break detection requires TWO authoritative signals before considering the block 
 
 It then sends `ServerboundSetCarriedItemPacket` after `setSelectedSlot` so the server's held-item state matches the client's. Without the packet sync, server-side drops are computed with the wrong tool (e.g. iron_ore mined with server-side bare hand drops nothing).
 
-After selecting the tool, INTERACTING holds off on the first attack for `CONFIG.toolSettleTicks` ticks (default 8), re-sending the carried-item packet each tick via `InventoryHelper.resendCarriedItem`. This closes a fast-break race where the attack beats the carried-item packet to the server.
+Tool selection now happens in LOOKING (tick 1), not INTERACTING. The carried-item (and any B1 inventory-swap) packet travels to the server during the smooth camera turn — by the time the hit-result gate fires, the server has had the full LOOKING duration to apply the slot change. INTERACTING then attacks on its first tick after a single defensive `resendCarriedItem` call. This removes both the cosmetic settle delay (formerly 2–5 ticks at the end of LOOKING) and the tool-settle wait (formerly 8 ticks at the start of INTERACTING) — total ~10–13 saved ticks of visible "staring before mining". `LOOKING` re-resends the carried-item packet each subsequent tick as a dropped-packet safety net.
 
 ## Test setup: waiting on gamemode sync
 

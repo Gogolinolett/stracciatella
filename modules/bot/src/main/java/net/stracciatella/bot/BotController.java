@@ -50,8 +50,6 @@ public class BotController {
     private static double aimOffsetX = 0.0;
     private static double aimOffsetY = 0.0;
     private static double aimOffsetZ = 0.0;
-    private static int settleDelay = 0;
-    private static int settleRemaining = 0;
     private static boolean toolSelected = false;
 
     // Collection state
@@ -232,6 +230,8 @@ public class BotController {
             return;
         }
 
+        BlockPos target = currentTask.targetPos();
+
         if (phaseTicks == 1) {
             // Initialize camera and humanization on first tick
             camera = new CameraController();
@@ -239,13 +239,23 @@ public class BotController {
             aimOffsetX = HumanBehavior.randomAimOffset(CONFIG);
             aimOffsetY = HumanBehavior.randomAimOffset(CONFIG);
             aimOffsetZ = HumanBehavior.randomAimOffset(CONFIG);
-            settleDelay = HumanBehavior.randomSettleDelay(CONFIG);
-            settleRemaining = -1; // not converged yet
-            toolSelected = false;
+            // Select the tool now so the carried-item (and any inventory-swap)
+            // packets travel to the server *in parallel* with the smooth
+            // camera turn. By the time the hit-result gate fires, the server
+            // has had the entire LOOKING duration to apply them, and
+            // INTERACTING can attack on its first tick without a separate
+            // tool-settle pause.
+            if (client.level != null) {
+                InventoryHelper.selectBestTool(player, client.level.getBlockState(target));
+            }
+            toolSelected = true;
             releaseMovementKeys();
+        } else {
+            // Re-send carried-item each tick during LOOKING so a dropped or
+            // reordered packet doesn't leave the server on a stale slot when
+            // INTERACTING starts. Cheap, idempotent.
+            InventoryHelper.resendCarriedItem(player);
         }
-
-        BlockPos target = currentTask.targetPos();
         // Aim at the center of the face that's most directly visible from the
         // bot's eye, not the block center. The center of a block in the middle
         // of a stack (e.g. top log of a tree) sits behind the next block's
@@ -257,7 +267,16 @@ public class BotController {
         double ty = target.getY() + 0.5 + face.getStepY() * 0.5;
         double tz = target.getZ() + 0.5 + face.getStepZ() * 0.5;
 
-        camera.aimAt(player, tx, ty, tz, aimOffsetX, aimOffsetY, aimOffsetZ);
+        // Apply human-aim jitter only on the two axes perpendicular to the
+        // face normal. Adding offset *along* the face normal pushes the aim
+        // point off the face plane, which makes the raycast graze just past
+        // the block's edge and land on a neighbor (or the platform below) —
+        // the hit-result gate then never matches and the bot stares forever.
+        double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
+        double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
+        double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
+
+        camera.aimAt(player, tx, ty, tz, offX, offY, offZ);
 
         // Two gates before transitioning to INTERACTING:
         //   1. Angular: camera direction within facingTolerance of target vector.
@@ -269,16 +288,15 @@ public class BotController {
         // means the settle countdown only progresses once the bot can actually
         // see the target.
         boolean aimedAngular = camera.isAimedAt(player, tx, ty, tz,
-                aimOffsetX, aimOffsetY, aimOffsetZ, (float) CONFIG.facingTolerance);
+                offX, offY, offZ, (float) CONFIG.facingTolerance);
         boolean aimedHit = isHitResultOnTarget(client, target);
         if (aimedAngular && aimedHit) {
-            if (settleRemaining < 0) {
-                settleRemaining = settleDelay;
-            }
-            settleRemaining--;
-            if (settleRemaining <= 0) {
-                transitionTo(Phase.INTERACTING);
-            }
+            // No settle delay — the hit-result gate already proves the bot
+            // is genuinely aimed at the target. An additional cosmetic pause
+            // here was visible as the bot "staring before mining", which
+            // made the transition feel artificial. Start mining the moment
+            // both gates fire.
+            transitionTo(Phase.INTERACTING);
         }
     }
 
@@ -307,36 +325,32 @@ public class BotController {
         Level level = client.level;
         BlockPos target = currentTask.targetPos();
 
-        // Select tool on first tick
-        if (!toolSelected) {
-            toolSelected = true;
-            InventoryHelper.selectBestTool(player, level.getBlockState(target));
+        // Tool was selected in LOOKING — the carried-item packet has already
+        // had the entire camera-convergence window to be applied server-side,
+        // so no explicit tool-settle wait is needed here. Reset
+        // airConfirmTicks on the first tick (LOOKING may be re-entered for
+        // sub-targets like sequential tree logs).
+        if (phaseTicks == 1) {
             airConfirmTicks = 0;
-        }
-
-        // Hold off on the first attack for a few ticks so the server has time
-        // to process the ServerboundSetCarriedItemPacket sent in selectBestTool.
-        // Under accelerated ticks the next block can break within ~20 ticks
-        // (~100ms wall), which beats packet round-trip — without this settle
-        // the server resolves the break against a stale held slot and the drop
-        // is computed with the wrong tool (e.g. iron_ore with bare hand → no drop).
-        // Re-send the carried-item packet each settle tick so a dropped or
-        // reordered packet doesn't leave the server on a stale held slot.
-        if (phaseTicks <= CONFIG.toolSettleTicks) {
+            // Defensive re-send in case the packet was dropped while turning.
             InventoryHelper.resendCarriedItem(player);
-            return;
         }
 
         // Keep aiming at the target's exposed face (matches LOOKING's aim
         // point — without this the camera would snap back to block center on
         // entering INTERACTING and the raycast could land on a neighbor).
+        // Offsets along the face normal are zeroed for the same reason
+        // LOOKING does it (see comment there).
         if (camera != null) {
             net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, target);
+            double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
+            double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
+            double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
             camera.aimAt(player,
                     target.getX() + 0.5 + face.getStepX() * 0.5,
                     target.getY() + 0.5 + face.getStepY() * 0.5,
                     target.getZ() + 0.5 + face.getStepZ() * 0.5,
-                    aimOffsetX, aimOffsetY, aimOffsetZ);
+                    offX, offY, offZ);
         }
 
         // Start mining if not already. Pass the explicit target so the
