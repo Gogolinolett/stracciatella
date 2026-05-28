@@ -7,6 +7,8 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.stracciatella.bot.humanize.HumanBehavior;
 import net.stracciatella.bot.interaction.BlockInteractor;
 import net.stracciatella.bot.interaction.InventoryHelper;
@@ -244,14 +246,32 @@ public class BotController {
         }
 
         BlockPos target = currentTask.targetPos();
-        double tx = target.getX() + 0.5;
-        double ty = target.getY() + 0.5;
-        double tz = target.getZ() + 0.5;
+        // Aim at the center of the face that's most directly visible from the
+        // bot's eye, not the block center. The center of a block in the middle
+        // of a stack (e.g. top log of a tree) sits behind the next block's
+        // face, so a raycast aimed at the center actually lands on the
+        // neighbor. Aiming at the exposed face guarantees the raycast clears
+        // intermediate blocks and lands on the target.
+        net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, target);
+        double tx = target.getX() + 0.5 + face.getStepX() * 0.5;
+        double ty = target.getY() + 0.5 + face.getStepY() * 0.5;
+        double tz = target.getZ() + 0.5 + face.getStepZ() * 0.5;
 
         camera.aimAt(player, tx, ty, tz, aimOffsetX, aimOffsetY, aimOffsetZ);
 
-        if (camera.isAimedAt(player, tx, ty, tz, aimOffsetX, aimOffsetY, aimOffsetZ,
-                (float) CONFIG.facingTolerance)) {
+        // Two gates before transitioning to INTERACTING:
+        //   1. Angular: camera direction within facingTolerance of target vector.
+        //   2. HitResult: the client's raycast actually lands on the target block.
+        // The angular check alone isn't enough — when an obstacle stands in the
+        // line of sight, the camera can be aimed within tolerance while the
+        // raycast hits the obstacle. The bot would visibly start attacking the
+        // wrong block before the camera converged further. Requiring both gates
+        // means the settle countdown only progresses once the bot can actually
+        // see the target.
+        boolean aimedAngular = camera.isAimedAt(player, tx, ty, tz,
+                aimOffsetX, aimOffsetY, aimOffsetZ, (float) CONFIG.facingTolerance);
+        boolean aimedHit = isHitResultOnTarget(client, target);
+        if (aimedAngular && aimedHit) {
             if (settleRemaining < 0) {
                 settleRemaining = settleDelay;
             }
@@ -260,6 +280,21 @@ public class BotController {
                 transitionTo(Phase.INTERACTING);
             }
         }
+    }
+
+    /**
+     * Verify that the client-side raycast is currently pointing at the target
+     * block. Used as the second gate in LOOKING before transitioning to
+     * INTERACTING — prevents the bot from starting to attack a block the
+     * camera is only angularly close to (but not actually pointing at, e.g.
+     * because an obstacle sits in the line of sight).
+     */
+    private static boolean isHitResultOnTarget(Minecraft client, BlockPos target) {
+        HitResult hr = client.hitResult;
+        if (!(hr instanceof BlockHitResult bhr)) {
+            return false;
+        }
+        return bhr.getBlockPos().equals(target);
     }
 
     private static void tickInteracting(Minecraft client, LocalPlayer player) {
@@ -292,10 +327,15 @@ public class BotController {
             return;
         }
 
-        // Keep aiming at the target (maintain camera position)
+        // Keep aiming at the target's exposed face (matches LOOKING's aim
+        // point — without this the camera would snap back to block center on
+        // entering INTERACTING and the raycast could land on a neighbor).
         if (camera != null) {
+            net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, target);
             camera.aimAt(player,
-                    target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5,
+                    target.getX() + 0.5 + face.getStepX() * 0.5,
+                    target.getY() + 0.5 + face.getStepY() * 0.5,
+                    target.getZ() + 0.5 + face.getStepZ() * 0.5,
                     aimOffsetX, aimOffsetY, aimOffsetZ);
         }
 
@@ -387,21 +427,35 @@ public class BotController {
                 lastItemSeenTick = phaseTicks;
             }
 
-            // Walk toward the nearest item (using horizontal distance only)
+            // Pick the nearest item by 3D distance (not just horizontal).
+            // Items frequently bounce into the dug-out hole below the bot or
+            // onto a step above — a horizontal-only nearest skews toward an
+            // item that's actually further away in 3D, and the bot ends up
+            // walking past closer drops. Items more than 4 blocks above/below
+            // the player are skipped: the bot can't walk up walls or fall
+            // safely into deep voids, so chasing them wastes the collect window.
             net.minecraft.world.entity.item.ItemEntity nearest = null;
+            double nearestDistSq = Double.MAX_VALUE;
             double nearestHorizDistSq = Double.MAX_VALUE;
             for (var item : items) {
                 double dx = item.getX() - player.getX();
+                double dy = item.getY() - player.getY();
                 double dz = item.getZ() - player.getZ();
-                double horizDistSq = dx * dx + dz * dz;
-                if (horizDistSq < nearestHorizDistSq) {
-                    nearestHorizDistSq = horizDistSq;
+                if (Math.abs(dy) > 4.0) {
+                    continue;
+                }
+                double distSq = dx * dx + dy * dy + dz * dz;
+                if (distSq < nearestDistSq) {
+                    nearestDistSq = distSq;
+                    nearestHorizDistSq = dx * dx + dz * dz;
                     nearest = item;
                 }
             }
 
-            if (nearest != null && nearestHorizDistSq > 1.0) {
-                // Pickup radius ~1.5 blocks; stop at 1.0 to avoid overshoot
+            // Vanilla pickup radius is ~1.5 blocks (3D). Stop walking once
+            // we're inside that radius — any closer and we'd overshoot.
+            // 1.5² = 2.25.
+            if (nearest != null && nearestDistSq > 2.25) {
                 walkToward(client, player, nearest.getX(), nearest.getZ(), nearestHorizDistSq);
             } else if (!itemsSeenThisCollect && lastMinedPos != null) {
                 // No items visible yet, but we expect a drop at lastMinedPos.
@@ -425,14 +479,18 @@ public class BotController {
         }
 
         // Exit COLLECTING once items have been observed and then absent for a
-        // sustained window (`itemAbsenceTicks` since last sighting). This closes both:
-        //   - the server→client spawn-sync race after a block break, and
-        //   - the transient absence between picking up one drop and the next
-        //     drop becoming the current nearest (especially when multiple
-        //     blocks are mined back-to-back).
-        // Fall back to a hard timeout if drops never become reachable.
+        // sustained window (`itemAbsenceTicks` since last sighting). This closes
+        // both the server→client spawn-sync race after a block break and the
+        // transient absence between picking up one drop and the next.
+        //
+        // When a further task is queued that needs walking, exit as soon as
+        // items are absent — no absence-tick wait. The bot will then SCAN →
+        // NAVIGATE toward the next target, and any straggler drops along the
+        // walk path get picked up by the 1.5-block radius. This eliminates the
+        // visible "pause after pickup" that made multi-block flows feel choppy.
+        boolean awaitingWalk = walkAfterCollect && taskQueue.peek() != null;
         boolean doneCollecting = itemsSeenThisCollect && !itemsNearby
-                && phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks;
+                && (awaitingWalk || phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks);
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
         if (doneCollecting || timedOut) {
             // Failure-only telemetry: if COLLECTING is exiting with no items
@@ -456,7 +514,16 @@ public class BotController {
             if (walkAfterCollect && !taskQueue.isEmpty() && !paused) {
                 currentTask = taskQueue.poll();
                 taskTotalTicks = 0;
-                transitionTo(Phase.SCANNING);
+                // tickCollecting walks toward the next task while items
+                // settle, so by the time we exit we may already be in reach.
+                // Skip SCANNING in that case — the human-like "look at next
+                // target before moving" cue is unnecessary when we're
+                // already standing on it.
+                if (player != null && isWithinReach(player, currentTask.targetPos())) {
+                    transitionTo(Phase.LOOKING);
+                } else {
+                    transitionTo(Phase.SCANNING);
+                }
             } else {
                 phase = Phase.IDLE;
                 phaseTicks = 0;

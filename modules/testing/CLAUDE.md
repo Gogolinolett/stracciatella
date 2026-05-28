@@ -54,6 +54,15 @@ Configurable via Gradle: `./gradlew runMinecraftTests -PtickSpeed=N` (default 10
 
 Note: `/tick rate` alone does NOT speed up `Minecraft.tick()` on the client — only the server. The mixin-based extra ticks are required for actual client speedup.
 
+## Player death handling
+
+If the player dies mid-test (e.g. fall damage from a teleport gone wrong):
+
+- **Active `waitFor`**: `TestContext.onClientTick` detects `mc.player.isDeadOrDying()` and fails the predicate immediately with `AssertionError("Player died during test")`. The test is recorded as FAILED — not silently skipped.
+- **Between tests**: `TestRunner.respawnIfDead` runs after every test. If the player is dead it dismisses the death screen, sends `ServerboundClientCommandPacket(PERFORM_RESPAWN)`, and waits up to 200 accelerated ticks for the server to spawn the player. Subsequent tests then start with a live player.
+
+Without this, a death freezes tick advance on the death screen and any subsequent `waitFor` hangs until the parent process is killed externally.
+
 ## Key conventions
 
 - Test methods must have signature `void methodName(TestContext ctx)`

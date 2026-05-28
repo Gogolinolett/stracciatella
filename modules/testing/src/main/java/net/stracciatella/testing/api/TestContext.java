@@ -53,8 +53,20 @@ public class TestContext {
         Predicate<Minecraft> pred = activePredicate;
         if (pred != null) {
             predicateTicksElapsed++;
+            Minecraft mc = Minecraft.getInstance();
+            // Fail the current waitFor immediately if the player died. Otherwise
+            // the predicate keeps firing against a corpse (or the death screen
+            // freezes the tick advance entirely) and the test thread hangs until
+            // an external kill. The death is recorded as a regular test failure
+            // and TestRunner respawns the player before the next test.
+            if (mc.player != null && mc.player.isDeadOrDying()) {
+                predicateError = new AssertionError("Player died during test");
+                activePredicate = null;
+                predicateDone.countDown();
+                return;
+            }
             try {
-                if (pred.test(Minecraft.getInstance())) {
+                if (pred.test(mc)) {
                     predicateMatched = true;
                     activePredicate = null;
                     predicateDone.countDown();

@@ -298,6 +298,88 @@ public class BotTests {
     }
 
     // ================================================================
+    // Test: Tool in storage row — bot must swap it into hotbar
+    // ================================================================
+    @MinecraftTest(name = "Bot tool in inventory slot", timeoutTicks = 140, order = -190)
+    public void toolInInventorySlot(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1550, 30, 1000);
+        final BlockPos blockPos = origin;
+        final BlockPos standPos = origin.offset(0, 0, 2);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + blockPos.getX() + " " + (blockPos.getY() - 1) + " " + blockPos.getZ() + " stone");
+        ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " iron_ore");
+        // Place pickaxe in storage row (slot 18 = row 2, column 1) instead of
+        // the hotbar (slots 0-8). Pre-B1 selectBestTool only scanned the
+        // hotbar and silently fell back to bare hand, dropping nothing.
+        ctx.runCommand("item replace entity @s inventory.18 with minecraft:diamond_pickaxe");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
+        waitForBotIdle(ctx);
+        waitForItem(ctx, Items.RAW_IRON, 1, "raw iron");
+        LOGGER.info("Tool in inventory slot test passed");
+    }
+
+    // ================================================================
+    // Test: Block behind obstacle — bot must NOT enter INTERACTING
+    // ================================================================
+    @MinecraftTest(name = "Bot mine blocked by obstacle", timeoutTicks = 100, order = -191)
+    public void mineBlockBehindObstacle(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1500, 30, 1000);
+        final BlockPos target = origin.offset(2, 0, 0);
+        final BlockPos obstacleLower = origin.offset(1, 0, 0);
+        final BlockPos obstacleUpper = obstacleLower.above();
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " " + target.getZ() + " stone");
+        ctx.runCommand("setblock " + obstacleLower.getX() + " " + obstacleLower.getY() + " " + obstacleLower.getZ() + " stone");
+        ctx.runCommand("setblock " + obstacleUpper.getX() + " " + obstacleUpper.getY() + " " + obstacleUpper.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(target)));
+
+        // Poll for ~50 ticks: bot must never enter INTERACTING because the
+        // raycast hits the obstacle, never the target. Without the hit-result
+        // gate the bot would transition on angular tolerance alone and start
+        // attacking the explicit target — letting the server reject it. With
+        // the gate the bot stays in LOOKING until line of sight is clear, then
+        // times out (the obstacle blocks it permanently).
+        boolean sawInteracting = false;
+        for (int i = 0; i < 50; i++) {
+            ctx.waitTick();
+            BotController.Phase p = BotController.getPhase();
+            if (p == BotController.Phase.INTERACTING) {
+                sawInteracting = true;
+                break;
+            }
+            if (p == BotController.Phase.IDLE) {
+                break;
+            }
+        }
+
+        ctx.runOnClient(mc -> BotController.stop());
+
+        if (sawInteracting) {
+            throw new AssertionError("Bot transitioned to INTERACTING despite obstacle blocking line of sight");
+        }
+
+        boolean obstacleIntact = ctx.computeOnClient(mc -> !mc.level.getBlockState(obstacleLower).isAir()
+                && !mc.level.getBlockState(obstacleUpper).isAir());
+        boolean targetIntact = ctx.computeOnClient(mc -> !mc.level.getBlockState(target).isAir());
+        if (!obstacleIntact) {
+            throw new AssertionError("Bot attacked the obstacle block instead of waiting for line of sight");
+        }
+        if (!targetIntact) {
+            throw new AssertionError("Target was mined through obstacle");
+        }
+        LOGGER.info("Mine block behind obstacle test passed");
+    }
+
+    // ================================================================
     // Test 9: Out-of-reach failure
     // ================================================================
     @MinecraftTest(name = "Bot out-of-reach failure", timeoutTicks = 60, order = -192)

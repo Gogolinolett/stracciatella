@@ -314,6 +314,14 @@ public class PathWalkerTests {
         // Stop any residual PathWalker from a previous timed-out test
         ctx.runOnClient(mc -> PathWalker.stop());
 
+        // Run in creative — the course teleports the player above the build
+        // area before chunks load and lets them fall onto the platform.
+        // In survival, that fall takes damage; over many tests it kills the
+        // player and the test fails on the death-check before reaching the
+        // walk phase. Creative makes the setup gamemode-stable; pathwalking
+        // logic doesn't depend on gamemode.
+        ctx.runCommand("gamemode creative");
+
         BlockPos worldStart = origin.offset(relStart);
         BlockPos worldEnd = origin.offset(relEnd);
 

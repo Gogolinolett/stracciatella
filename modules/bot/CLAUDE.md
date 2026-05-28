@@ -52,7 +52,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
-| **LOOKING** | `CameraController.aimAt` toward target block face + offset, exit when `isAimedAt(facingTolerance)` and settle delay elapses | `lookTimeout` |
+| **LOOKING** | `CameraController.aimAt` toward target block face + offset, exit when both the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target, then settle delay elapses | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`; exit once items have been observed and are all picked up | `collectWaitMax` |
 
@@ -65,13 +65,17 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 
 ### COLLECTING exit conditions
 
-Three conditions must all hold to exit COLLECTING cleanly:
+Exit gates depend on whether another walked task is queued:
 
-1. `itemsSeenThisCollect` — at least one tick observed items in the 8-block AABB. Closes the server→client spawn-sync race where the block has broken but the drop entity hasn't synced.
-2. `!itemsNearby` — currently no visible drops.
-3. `phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — items have been absent for a sustained window. Avoids exiting on a transient absence tick between sequentially picking up multiple drops.
+- **Single task / nothing queued** — three conditions must all hold:
+  1. `itemsSeenThisCollect` — at least one tick observed items in the 8-block AABB. Closes the server→client spawn-sync race where the block has broken but the drop entity hasn't synced.
+  2. `!itemsNearby` — currently no visible drops.
+  3. `phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — sustained absence window. Avoids exiting on a transient absence tick between sequentially picking up multiple drops.
+- **Walked task queued** (`walkAfterCollect && taskQueue.peek() != null`) — only conditions 1 and 2 are required; the sustained-absence wait is skipped. Straggler drops are picked up via the 1.5-block vanilla radius during the `NAVIGATING` walk toward the next target. Eliminates the visible "pause after pickup" in multi-task flows.
 
 While no items are visible yet, the bot walks toward `lastMinedPos` so the drop enters the AABB query as soon as the server syncs it. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
+
+If COLLECTING exits while the queue has more work, and the bot has ended up within reach of the next target (e.g. the next ore in a vein), the controller transitions directly to `LOOKING` and skips `SCANNING` — there's no movement to cue.
 
 ### Key integration points
 
@@ -80,6 +84,17 @@ While no items are visible yet, the bot walks toward `lastMinedPos` so the drop 
 - **MeshPathfinder**: Bot uses A* to find paths from player to standoff positions.
 
 ## Block Interaction
+
+### LOOKING → INTERACTING gate
+
+Two conditions must both hold before LOOKING transitions to INTERACTING:
+
+1. **Angular**: `CameraController.isAimedAt(..., facingTolerance)` — camera vector within tolerance of target vector.
+2. **HitResult**: `mc.hitResult instanceof BlockHitResult` AND `bhr.getBlockPos().equals(target)` — the client's raycast actually lands on the target block.
+
+The angular check alone is insufficient: when an obstacle stands in the line of sight, the camera can be aimed within `facingTolerance` of the target vector while the raycast still hits the obstacle (visible to the player as the bot starting to attack the wrong block before correcting). Requiring both gates means the settle countdown only progresses once the bot can actually see the target. If line-of-sight is permanently blocked, `lookTimeout` fails the task cleanly.
+
+### Mining
 
 Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls.
 
@@ -92,7 +107,9 @@ Break detection requires TWO authoritative signals before considering the block 
 
 `airConfirmTicks` resets to 0 whenever the block is observed non-air. `maxBreakTicks` (default 400) caps INTERACTING — covers the slowest legit break + drop-spawn sync under load.
 
-`InventoryHelper.selectBestTool` sends `ServerboundSetCarriedItemPacket` after `setSelectedSlot` so the server's held-item state matches the client's. Without the packet sync, server-side drops are computed with the wrong tool (e.g. iron_ore mined with server-side bare hand drops nothing).
+`InventoryHelper.selectBestTool` scans the full main inventory (slots 0–35, i.e. hotbar + storage rows). If the best tool sits in storage (slot ≥ 9) it is swapped into the currently selected hotbar slot via a `ClickType.SWAP` container-click packet — a human player would do the same. A hotbar-only search would silently fall back to bare hand and drop nothing from ores.
+
+It then sends `ServerboundSetCarriedItemPacket` after `setSelectedSlot` so the server's held-item state matches the client's. Without the packet sync, server-side drops are computed with the wrong tool (e.g. iron_ore mined with server-side bare hand drops nothing).
 
 After selecting the tool, INTERACTING holds off on the first attack for `CONFIG.toolSettleTicks` ticks (default 8), re-sending the carried-item packet each tick via `InventoryHelper.resendCarriedItem`. This closes a fast-break race where the attack beats the carried-item packet to the server.
 

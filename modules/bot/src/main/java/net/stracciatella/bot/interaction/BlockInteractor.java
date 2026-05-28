@@ -87,10 +87,11 @@ public class BlockInteractor {
 
     /**
      * Pick the face of {@code target} that faces the player's eye. Used as the
-     * direction hint in the destroy-block packets; the server uses this for
-     * adjacency checks.
+     * direction hint in the destroy-block packets and as the aim point in
+     * LOOKING (a raycast at the block center is blocked by neighboring solids
+     * — aiming at the exposed face guarantees the raycast lands on the target).
      */
-    private static Direction faceTowardPlayer(Minecraft mc, BlockPos target) {
+    public static Direction faceTowardPlayer(Minecraft mc, BlockPos target) {
         double px = mc.player.getX();
         double py = mc.player.getEyeY();
         double pz = mc.player.getZ();

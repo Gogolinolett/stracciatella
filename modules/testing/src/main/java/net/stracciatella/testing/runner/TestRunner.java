@@ -1,6 +1,7 @@
 package net.stracciatella.testing.runner;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
 import net.stracciatella.testing.api.TestSuite;
@@ -182,12 +183,92 @@ public class TestRunner {
                     results.add(new TestResult(test.suiteName(), test.displayName(),
                             status, message, elapsed));
                 }
+
+                // Respawn the player if the test killed them. Without this, the
+                // death screen blocks tick advance and subsequent tests either
+                // hang on waitFor or run against a dead player. The packet is
+                // the same one the death screen's "Respawn" button sends.
+                respawnIfDead(ctx, test.displayName());
+
+                // Heal the player to full HP between tests. Fall damage and
+                // other survival-mode hits accumulate across tests that
+                // don't actively manage gamemode — without a reset, the 10th
+                // test in a chain dies before it even starts. Instant-health
+                // is gamemode-agnostic (no-op in creative, full heal in
+                // survival).
+                try {
+                    ctx.runCommand("effect give @s minecraft:instant_health 1 5 true");
+                } catch (Throwable ignored) {
+                    // Healing is best-effort: a failure here shouldn't block
+                    // subsequent tests from running.
+                }
             }
 
             printReport();
         } finally {
             tickMultiplier = 1;
             ctx.runCommand("tick rate 20");
+        }
+    }
+
+    /**
+     * If the player is currently dead (or in the death screen), send the
+     * respawn packet and wait for the server to put us back in a live state.
+     * Called after every test so a death-by-fall doesn't propagate to later
+     * tests as a hang.
+     */
+    private void respawnIfDead(TestContext ctx, String testName) {
+        boolean dead;
+        try {
+            dead = ctx.computeOnClient(mc -> mc.player != null && mc.player.isDeadOrDying());
+        } catch (Throwable e) {
+            LOGGER.warn("Could not check death state after '{}': {}", testName, e.getMessage());
+            return;
+        }
+        if (!dead) {
+            return;
+        }
+        LOGGER.warn("Player died during '{}', respawning before next test", testName);
+        try {
+            ctx.runOnClient(mc -> {
+                // Dismiss the death screen so the next test isn't fighting a UI overlay.
+                if (mc.screen != null) {
+                    mc.setScreen(null);
+                }
+                if (mc.player != null && mc.player.connection != null) {
+                    mc.player.connection.send(new ServerboundClientCommandPacket(
+                            ServerboundClientCommandPacket.Action.PERFORM_RESPAWN));
+                }
+            });
+            // Poll via waitTick — NOT waitFor — because waitFor evaluates its
+            // predicate via TestContext.onClientTick, which itself fails-fast
+            // when the player is dead. While the server is processing our
+            // respawn the player is still dead client-side, so a waitFor here
+            // would throw "Player died during test" against our own respawn.
+            // 200 accelerated ticks ≈ 2s wall @ 10x — plenty for the server
+            // roundtrip plus ability/position sync.
+            boolean respawned = false;
+            for (int i = 0; i < 200; i++) {
+                ctx.waitTick();
+                boolean stillDead;
+                try {
+                    stillDead = ctx.computeOnClient(mc -> mc.player != null && mc.player.isDeadOrDying());
+                } catch (Throwable inner) {
+                    stillDead = true;
+                }
+                if (!stillDead) {
+                    respawned = true;
+                    break;
+                }
+            }
+            if (!respawned) {
+                LOGGER.warn("Player did not respawn within timeout after '{}'", testName);
+            }
+        } catch (Throwable e) {
+            // Never let respawn failure crash the test runner — we'd rather
+            // continue and let subsequent tests' setup either work around the
+            // dead state or fail cleanly themselves.
+            LOGGER.warn("Respawn after '{}' failed: {}", testName, e.getMessage());
         }
     }
 

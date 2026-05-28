@@ -50,6 +50,21 @@ Chose coordinate equality because MeshNode is used as a HashMap key in MeshPathf
 
 Chose drops-first because it matches the original intent (drops should allow 4.5 diagonal distance). The more specific condition must be checked before the more general one.
 
+## Mesh invalidation: full chunk regen, filtered
+
+**Decision**: `LevelChunkMixin.setBlockState` invalidates the mesh for the chunk via `MeshManager.invalidateMesh(chunkCoord)` whenever the change flips air↔solid, the chunk's level is the client's, and at least one entity has a mesh for that chunk.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Empty mixin / no invalidation (original) | Simple, no perf cost | Mining a wall leaves the mesh thinking the wall is still solid. The next A* search finds a path that ignores the hole the bot just dug. PathWalker then drives the bot back through the no-longer-walkable section it already cleared. |
+| Per-block slice update (compute which nodes are affected and edit just those) | Cheap per update | Tricky to get right: a single block change can affect not just the column it sits in but every neighbor's reachability (line-of-sight checks span ±5 blocks). Bug surface is high; full regen is correctness-first. |
+| Full chunk regen on every block update, no filter | Trivially correct | Every redstone tick, every leaf decay, every waterlogged toggle would re-walk the entire 16×16 chunk. Tests would slow to a crawl. |
+| Full chunk regen, filtered to air↔solid flips + active-mesh + client-side (chosen) | Three short conditions, all cheap to check, prune the expensive call to the cases where it actually matters. The air↔solid filter catches the cases that change walkability; non-mesh chunks pay nothing; the level filter prevents the double-fire in single-player. | Sub-state edits that DO affect walkability (e.g. stair direction change altering the upper face's slope) aren't currently detected. Not a problem in practice — bots don't navigate stairs as a special case yet. |
+| Lazy "dirty" flag + regen on next access | Avoids work for chunks that aren't currently being queried | Adds a flag to track and a check on every `findOrBuildNearestNode` call. The current implementation's filters already prune enough to make the eager regen affordable. |
+
+Chose filtered full regen because the filters reduce the firing rate by 100×+ (most `setBlockState` calls are sub-state edits or in chunks no bot is using). When it does fire, a 16×16 walk is fast enough — sub-millisecond on modern hardware — and the resulting mesh is guaranteed consistent with what the client sees. The lazy-flag option remains available if profiling later shows the eager regen is a bottleneck.
+
 ## EnderPearl test cooldown gating
 
 **Decision**: `EnderPearlTests` waits on the client-side `ItemCooldowns` (synced from the server via `ClientboundCooldownPacket`) and then adds a 30-tick safety margin before calling `EnderPearlTravelMethod.start()`; the travel method itself does not check or clear the cooldown.

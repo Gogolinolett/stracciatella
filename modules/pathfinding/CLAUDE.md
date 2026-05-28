@@ -118,6 +118,15 @@ PathWalker has extensive debug logging. **Always read the logs when editing Path
 - `MeshManager.connectAdjacentMeshes()` links border nodes when neighbor chunks exist
 - `reconnectBorderNodes()` rebuilds edges for nodes on chunk boundaries
 
+### Mesh invalidation on block changes
+
+`LevelChunkMixin.setBlockState` triggers `MeshManager.invalidateMesh` when:
+1. The state change is an air↔solid flip (sub-state edits like waterlogged or growth stages don't affect walkability — skipped).
+2. The chunk's level is the client's level (filters out the server-thread fire in single-player so we don't regenerate twice against stale data).
+3. At least one entity already has a mesh for that chunk (no point burning CPU on chunks no bot uses).
+
+Without this, mining a wall would leave the mesh thinking the wall is still solid, and subsequent A* searches route around the hole the bot just dug. Meshes are still built on-demand (chunk-load is intentionally a no-op).
+
 ## Commands (`/path`)
 
 | Command | Description |
