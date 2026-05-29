@@ -65,6 +65,47 @@ Chose drops-first because it matches the original intent (drops should allow 4.5
 
 Chose filtered full regen because the filters reduce the firing rate by 100×+ (most `setBlockState` calls are sub-state edits or in chunks no bot is using). When it does fire, a 16×16 walk is fast enough — sub-millisecond on modern hardware — and the resulting mesh is guaranteed consistent with what the client sees. The lazy-flag option remains available if profiling later shows the eager regen is a bottleneck.
 
+## Micro-strafing on safe corridors
+
+**Decision**: PathWalker injects brief (1–2 tick) sideways key presses (left/right) on path segments where the current and next-two nodes are same-Y gap=1 (a "corridor"). Cooldown 40–80 ticks between strafes. Disabled on any non-corridor segment.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No strafing (state before this change) | Most predictable movement | Reads as bot: every walking step is on the perfect line between nodes, no lateral drift like a human's hand-on-keyboard imperfection |
+| Continuous low-amplitude strafing on all segments | Most humanness | Single-block-platform jumps need precise alignment — a strafe in flight pushes the player off the landing block. Tests fail. |
+| Strafe only on safe corridors, brief windows, with cooldown (chosen) | Drifts the bot off-line by ~0.1 blocks on corridors where the alignment-hold + spring camera absorb it; never touches jump-prep or in-air segments | Adds keyLeft/keyRight to applyMovement's surface; calls during retreat/brake must explicitly pass strafeDir=0 |
+| Strafe via random target-offset perturbation | No new key state | The existing target offset (0.05–0.25 blocks) already provides micro-variance on the *target*; strafing instead varies the *input*, which is what reads as human "imperfect keyboard hand" |
+
+Chose gated strafing because the "safe corridor" predicate (`isSafeCorridor`) reliably excludes the failure modes — jumps, sharp turns, retreats — while still firing on the segments where a viewer is most likely to notice the lack of drift. `applyMovement` now explicitly drives all six movement keys so any in-flight strafe is cleared whenever a non-strafing path (jump, brake, retreat) calls it with `strafeDir=0`.
+
+## Pitch micro-variance during straight walks
+
+**Decision**: While `straightWalkTicks > 20`, the bot is on the ground, not approaching a jump, and the target is > 1.5 blocks away, add a slowly-refreshing offset (±2.5° Gaussian, refreshed every 20–40 ticks) to the desired pitch passed into `CameraController.updatePitch`. Outside those conditions, the offset is zeroed so the next walk starts clean.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No pitch variance (state before this change) | Most predictable; pitch is always near horizontal | Frozen-gaze: the bot's vertical aim is identical every tick, every walk. Reads as bot |
+| Continuous pitch noise | Most lively | When approaching a jump, pitch is part of the camera-derived facing target; noisy pitch makes the angular jump-tolerance check (`JUMP_FACING_TOLERANCE_DEG`) flutter and can delay a jump fire by 1–2 ticks. Manifests as occasional "stuck at the edge" |
+| Gated low-frequency offset (chosen) | The 20-tick straight-walk gate guarantees the bot is well past any jump prep; the 1.5-block target distance gate excludes the precise approach. Offset is part of the *desired* pitch, so the spring-damper does the smoothing — output is a slow drift, not jitter | Offset must be zeroed on exit; failure to do so would leave the next jump approaching with a stale tilt |
+
+Chose the gated offset because the pitch-variance behaviour is a "scanning the path" cue, which only makes sense during sustained walking. The straight-walk counter is also used by micro-strafing for the same reason — once the bot is committed to a long straight run, both humanness effects activate together.
+
+## Pre-jump hesitation on max-range jumps
+
+**Decision**: When entering the gap≥5 retreat branch from a standstill (`forwardVel ≤ 0.14`), pause for a Gaussian 4–12 tick window (mean 7, σ=2) before starting the retreat. Camera continues aiming at the target during the pause; no movement keys are pressed. If the bot enters with sprint-speed velocity (`forwardVel > 0.14` — meaning the standard skip-retreat branch applies), the hesitation is also skipped.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No hesitation (state before this change) | Fastest jump execution | Long jumps fire instantly when conditions align — reads as a script. A human pauses to "look at" a 4-air-block gap before committing |
+| Hesitation on all jumps (gap ≥ 2) | Most consistent humanness | Adds 250–500 ms to every step-up and short jump. Chain-jumps over single-block platforms get visibly choppy; tests that rely on a continuous gap=2 chain regress |
+| Hesitation on gap ≥ 5 only, gated to standstill (chosen) | Targets exactly the situation a viewer notices — the bot facing a wide gap and stopping to pre-aim. Mid-stride entries (already sprinting → skip retreat) don't pause, which preserves smooth gap-2 chains | Adds ~250–500 ms per max-range jump (gap ≥ 5 only) |
+| Look-then-pause via camera-only state | Hesitation visible without halting movement | The retreat phase needs the bot still — entering retreat at speed risks falling off the back edge. Stopping is the *correct* mechanic regardless of humanness |
+
+Chose the gap≥5 + standstill gate because (1) it matches the visual cue a human gives at a long jump, and (2) it's mechanically aligned with the retreat phase which already requires the bot to stop. The hesitation is realised in the same `if (maxJumpPhase == 0)` branch, sharing its state.
+
 ## EnderPearl test cooldown gating
 
 **Decision**: `EnderPearlTests` waits on the client-side `ItemCooldowns` (synced from the server via `ClientboundCooldownPacket`) and then adds a 30-tick safety margin before calling `EnderPearlTravelMethod.start()`; the travel method itself does not check or clear the cooldown.

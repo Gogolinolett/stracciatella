@@ -17,17 +17,34 @@ public class BotConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String CONFIG_FILE = "stracciatella/bot.json";
 
-    // Aim humanization: random offset on block face (blocks)
+    // Aim humanization: random offset on block face (blocks). Distribution is
+    // Gaussian centred at 0 with sigma = aimOffsetMax/2, clamped to ±aimOffsetMax.
     public double aimOffsetMin = 0.05;
     public double aimOffsetMax = 0.30;
 
-    // Camera speed variation per target (multiplier on effective turn speed)
+    // Camera speed variation per target (multiplier on spring acceleration).
+    // Drawn fresh at the start of each new SCANNING/LOOKING session so
+    // successive aims feel different. 1.0 = default critical damping; values
+    // above 1.0 introduce a hint of overshoot.
     public double lookSpeedMin = 0.7;
     public double lookSpeedMax = 1.3;
 
-    // Settle delay after aim converges before starting attack (ticks)
-    public int settleDelayMin = 2;
-    public int settleDelayMax = 5;
+    // Reaction delay at phase transitions: tick count drawn from a clamped
+    // Gaussian on every transition where currently the bot reacts instantly
+    // (SCANNING→NAVIGATING, POSITIONING→LOOKING, block-broken→next phase).
+    // ≈ 50-500 ms at 20 TPS, median 200 ms. Set min == max == 0 to disable.
+    public int reactionDelayMeanTicks = 4;
+    public int reactionDelaySigmaTicks = 2;
+    public int reactionDelayMinTicks = 1;
+    public int reactionDelayMaxTicks = 10;
+
+    // Pre-attack commit hesitation: a small uniform pause after both LOOKING
+    // gates fire (angular + hit-result) and before the first startAttack call.
+    // Replaces the old settleDelay — narrower range and a distinct concept (the
+    // "commit moment" between locking on and clicking, not a timing buffer for
+    // server sync, which already happens during the LOOKING camera turn).
+    public int preAttackHesitationMin = 1;
+    public int preAttackHesitationMax = 3;
 
     // Hard timeout for COLLECTING if drops never become reachable. Needs to
     // be large enough for the server→client item-entity sync under heavy load
@@ -37,12 +54,6 @@ public class BotConfig {
     // Consecutive ticks the target block must be observed as air before the
     // break is considered server-confirmed (see design.md).
     public int airConfirmTicks = 8;
-
-    // Ticks to wait after selecting a tool before starting the first attack,
-    // so the server can process the ServerboundSetCarriedItemPacket. Without
-    // this, under accelerated ticks the break can resolve against a stale
-    // server-side held slot and the drop is computed with the wrong tool.
-    public int toolSettleTicks = 8;
 
     // Ticks items must be absent from the search AABB after at least one
     // sighting before COLLECTING exits (see design.md).
@@ -61,9 +72,9 @@ public class BotConfig {
     // Maximum reach distance for mining
     public double reachDistance = 4.0;
 
-    // Maximum ticks INTERACTING runs before giving up (mine + settle + wait
-    // for drop entity). Must cover the slowest legitimate break on the server
-    // plus item-entity spawn sync under load.
+    // Maximum ticks INTERACTING runs before giving up (mine + wait for drop
+    // entity). Must cover the slowest legitimate break on the server plus
+    // item-entity spawn sync under load.
     public int maxBreakTicks = 400;
 
     // Phase timeouts
@@ -79,11 +90,14 @@ public class BotConfig {
         this.aimOffsetMax = other.aimOffsetMax;
         this.lookSpeedMin = other.lookSpeedMin;
         this.lookSpeedMax = other.lookSpeedMax;
-        this.settleDelayMin = other.settleDelayMin;
-        this.settleDelayMax = other.settleDelayMax;
+        this.reactionDelayMeanTicks = other.reactionDelayMeanTicks;
+        this.reactionDelaySigmaTicks = other.reactionDelaySigmaTicks;
+        this.reactionDelayMinTicks = other.reactionDelayMinTicks;
+        this.reactionDelayMaxTicks = other.reactionDelayMaxTicks;
+        this.preAttackHesitationMin = other.preAttackHesitationMin;
+        this.preAttackHesitationMax = other.preAttackHesitationMax;
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
-        this.toolSettleTicks = other.toolSettleTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;

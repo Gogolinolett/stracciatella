@@ -52,6 +52,18 @@ public class BotController {
     private static double aimOffsetZ = 0.0;
     private static boolean toolSelected = false;
 
+    // Pre-attack hesitation: ticks remaining in the "commit moment" between
+    // the LOOKING gates firing and the first startAttack. -1 means inactive.
+    private static int preAttackHesitationRemaining = -1;
+
+    // Deferred-action mechanism: when a phase decides to transition, it can
+    // request a Gaussian-distributed reaction delay first. During the delay
+    // the current phase's tick logic is skipped (the bot "freezes" briefly,
+    // as a human pausing between deciding and acting). On expiry the stored
+    // Runnable runs.
+    private static Runnable deferredAction = null;
+    private static int deferredActionDelay = 0;
+
     // Collection state
     private static boolean walkAfterCollect = false;
     // Position of the last mined block — COLLECTING walks toward this to pick up drops
@@ -85,6 +97,10 @@ public class BotController {
     public static void loadConfig() {
         BotConfig loaded = BotConfig.load();
         CONFIG.applyFrom(loaded);
+        // Roll a fresh session skill multiplier so each world join gives the
+        // bot a slightly different aim speed / reaction baseline. Stays
+        // constant for the lifetime of this session.
+        HumanBehavior.rollSessionSkill();
     }
 
     public static void enqueueTask(BotTask task) {
@@ -107,6 +123,9 @@ public class BotController {
         lastItemSeenTick = 0;
         airConfirmTicks = 0;
         walkAfterCollect = false;
+        deferredAction = null;
+        deferredActionDelay = 0;
+        preAttackHesitationRemaining = -1;
         releaseMovementKeys();
         LOGGER.info("Bot stopped");
     }
@@ -114,6 +133,11 @@ public class BotController {
     public static void pause() {
         paused = true;
         BlockInteractor.stopInteraction();
+        // Cancel any in-flight reaction delay so the deferred action doesn't
+        // fire during the pause. On resume the bot re-enters whatever phase
+        // it was in and re-derives the next transition naturally.
+        deferredAction = null;
+        deferredActionDelay = 0;
         releaseMovementKeys();
         LOGGER.info("Bot paused");
     }
@@ -166,6 +190,22 @@ public class BotController {
             return;
         }
 
+        // Deferred-action gate: when a reaction delay is in flight, neither
+        // the phase tick nor phaseTicks/taskTotalTicks advance. The bot
+        // visibly pauses for the configured number of ticks before the
+        // queued action runs.
+        if (deferredActionDelay > 0) {
+            deferredActionDelay--;
+            if (deferredActionDelay == 0) {
+                Runnable action = deferredAction;
+                deferredAction = null;
+                if (action != null) {
+                    action.run();
+                }
+            }
+            return;
+        }
+
         phaseTicks++;
         taskTotalTicks++;
 
@@ -202,16 +242,16 @@ public class BotController {
         if (phaseTicks > CONFIG.positionTimeout) {
             // If we're within a generous distance, try looking anyway
             if (isWithinReach(player, currentTask.targetPos())) {
-                transitionTo(Phase.LOOKING);
+                scheduleAction(() -> transitionTo(Phase.LOOKING));
             } else {
                 failCurrentTask("Could not get within reach of target");
             }
             return;
         }
 
-        // Check if we're within reach
+        // Check if we're within reach — reaction beat before LOOKING starts.
         if (isWithinReach(player, currentTask.targetPos())) {
-            transitionTo(Phase.LOOKING);
+            scheduleAction(() -> transitionTo(Phase.LOOKING));
             return;
         }
 
@@ -233,12 +273,17 @@ public class BotController {
         BlockPos target = currentTask.targetPos();
 
         if (phaseTicks == 1) {
-            // Initialize camera and humanization on first tick
+            // Initialize camera and humanization on first tick. A fresh
+            // controller defaults to multiplier=1.0 and saccades off; we
+            // immediately roll a per-target look-speed so the turn cadence
+            // varies block-to-block.
             camera = new CameraController();
             camera.initialize(player.getYRot(), player.getXRot());
+            camera.setLookSpeedMultiplier(HumanBehavior.randomLookSpeedMultiplier(CONFIG));
             aimOffsetX = HumanBehavior.randomAimOffset(CONFIG);
             aimOffsetY = HumanBehavior.randomAimOffset(CONFIG);
             aimOffsetZ = HumanBehavior.randomAimOffset(CONFIG);
+            preAttackHesitationRemaining = -1;
             // Select the tool now so the carried-item (and any inventory-swap)
             // packets travel to the server *in parallel* with the smooth
             // camera turn. By the time the hit-result gate fires, the server
@@ -291,11 +336,23 @@ public class BotController {
                 offX, offY, offZ, (float) CONFIG.facingTolerance);
         boolean aimedHit = isHitResultOnTarget(client, target);
         if (aimedAngular && aimedHit) {
-            // No settle delay — the hit-result gate already proves the bot
-            // is genuinely aimed at the target. An additional cosmetic pause
-            // here was visible as the bot "staring before mining", which
-            // made the transition feel artificial. Start mining the moment
-            // both gates fire.
+            // Pre-attack commit hesitation: between the moment both gates
+            // fire and the first startAttack, a human pauses ~50-150 ms (the
+            // "I've locked on, now I click" beat). This is distinct from the
+            // old settleDelay (a timing buffer for server packet sync) —
+            // tool selection already happened during LOOKING's camera turn,
+            // so the server is in sync by now. The hesitation here is purely
+            // humanness. During it the camera keeps aiming and saccades
+            // start (sustained aim is when frozen-gaze is most visible).
+            if (preAttackHesitationRemaining < 0) {
+                preAttackHesitationRemaining = HumanBehavior.randomPreAttackHesitation(CONFIG);
+                camera.setMicroSaccadesEnabled(true);
+            }
+            if (preAttackHesitationRemaining > 0) {
+                preAttackHesitationRemaining--;
+                return;
+            }
+            preAttackHesitationRemaining = -1;
             transitionTo(Phase.INTERACTING);
         }
     }
@@ -334,6 +391,12 @@ public class BotController {
             airConfirmTicks = 0;
             // Defensive re-send in case the packet was dropped while turning.
             InventoryHelper.resendCarriedItem(player);
+            // Sustained aim during mining is when "frozen gaze" reads as bot.
+            // Saccades may have been enabled by LOOKING's hesitation gate;
+            // ensure they're on here as well in case hesitation was 0.
+            if (camera != null) {
+                camera.setMicroSaccadesEnabled(true);
+            }
         }
 
         // Keep aiming at the target's exposed face (matches LOOKING's aim
@@ -395,10 +458,15 @@ public class BotController {
             }
 
             // airConfirmTicks resets on re-entry via the toolSelect branch above.
+            //
+            // Reaction beat between "the block broke" and the next phase —
+            // a human glances at the result for a moment before moving on.
+            // For sub-targets and same-reach next-targets we re-enter LOOKING;
+            // otherwise we COLLECT drops before walking.
 
-            // Sub-targets remaining in same task (e.g. tree logs) — mine next immediately
+            // Sub-targets remaining in same task (e.g. tree logs) — mine next next
             if (currentTask.advanceToNextTarget()) {
-                transitionTo(Phase.LOOKING);
+                scheduleAction(() -> transitionTo(Phase.LOOKING));
                 return;
             }
 
@@ -406,12 +474,16 @@ public class BotController {
             lastMinedPos = target;
             BotTask nextTask = taskQueue.peek();
             if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
-                // Next target is within reach — mine it immediately, no pause
-                currentTask = taskQueue.poll();
-                taskTotalTicks = 0;
-                transitionTo(Phase.LOOKING);
+                // Next target is within reach — mine it next, after the beat
+                scheduleAction(() -> {
+                    currentTask = taskQueue.poll();
+                    taskTotalTicks = 0;
+                    transitionTo(Phase.LOOKING);
+                });
             } else {
-                // Need to walk (or nothing left) — collect drops first
+                // Need to walk (or nothing left) — collect drops first.
+                // Don't delay here: COLLECTING begins immediately so the bot
+                // starts pursuing drops while they're still falling.
                 walkAfterCollect = nextTask != null;
                 itemsSeenThisCollect = false;
                 lastItemSeenTick = 0;
@@ -565,15 +637,17 @@ public class BotController {
 
     private static void tickScanning(Minecraft client, LocalPlayer player) {
         if (phaseTicks > CONFIG.scanTimeout) {
-            // Timeout — start navigation now
-            beginNavigation(player);
+            // Timeout — start navigation after a reaction beat
+            scheduleAction(BotController::beginNavigationFresh);
             return;
         }
 
         if (phaseTicks == 1) {
-            // Initialize camera from current rotation
+            // Initialize camera from current rotation and roll a per-target
+            // look-speed so successive aims don't all turn at the same rate.
             camera = new CameraController();
             camera.initialize(player.getYRot(), player.getXRot());
+            camera.setLookSpeedMultiplier(HumanBehavior.randomLookSpeedMultiplier(CONFIG));
         }
 
         // Smoothly look toward the next target
@@ -585,7 +659,20 @@ public class BotController {
         camera.aimAt(player, tx, ty, tz);
 
         if (camera.isAimedAt(player, tx, ty, tz, (float) CONFIG.scanFacingTolerance)) {
-            beginNavigation(player);
+            // Reaction delay between "I've spotted it" and "I start walking"
+            scheduleAction(BotController::beginNavigationFresh);
+        }
+    }
+
+    /**
+     * Wrapper for {@link #beginNavigation(LocalPlayer)} that re-fetches the
+     * player from the client. Used by {@link #scheduleAction} so the captured
+     * player reference is not stale across the delay.
+     */
+    private static void beginNavigationFresh() {
+        LocalPlayer p = Minecraft.getInstance().player;
+        if (p != null && currentTask != null) {
+            beginNavigation(p);
         }
     }
 
@@ -632,6 +719,29 @@ public class BotController {
         }
         phase = newPhase;
         phaseTicks = 0;
+        preAttackHesitationRemaining = -1;
+    }
+
+    /**
+     * Queue an action to run after a Gaussian-distributed reaction delay
+     * (configured via {@code reactionDelay*} in BotConfig). During the delay
+     * the current phase's tick logic is skipped — the bot freezes briefly,
+     * mimicking the gap between a human deciding to act and acting. If the
+     * configured delay is 0 the action runs immediately, preserving the
+     * old behaviour when humanness is disabled.
+     */
+    private static void scheduleAction(Runnable action) {
+        int delay = HumanBehavior.randomReactionDelayTicks(CONFIG);
+        if (delay <= 0) {
+            action.run();
+            return;
+        }
+        deferredAction = action;
+        deferredActionDelay = delay;
+        // Release any held movement input so the bot visibly pauses rather
+        // than coasting forward into the delay. Interaction is left alone
+        // because INTERACTING calls stopInteraction itself before scheduling.
+        releaseMovementKeys();
     }
 
     private static void startNextTask() {
@@ -687,6 +797,9 @@ public class BotController {
         currentTask = null;
         phase = Phase.IDLE;
         phaseTicks = 0;
+        deferredAction = null;
+        deferredActionDelay = 0;
+        preAttackHesitationRemaining = -1;
 
         // Try next task
         if (!taskQueue.isEmpty() && !paused) {

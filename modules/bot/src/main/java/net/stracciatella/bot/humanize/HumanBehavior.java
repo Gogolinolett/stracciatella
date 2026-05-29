@@ -7,30 +7,97 @@ import net.stracciatella.bot.BotConfig;
 /**
  * Provides randomization utilities for human-like behavior.
  * All methods are deterministic per-call (generate once, use for duration of a phase).
+ *
+ * <p>A "session skill" multiplier is rolled once per world join via
+ * {@link #rollSessionSkill()} and applied to look-speed (multiplicatively) and
+ * reaction delay (divisively). Each session feels like a slightly different
+ * human — sometimes more responsive, sometimes more languid — without
+ * persistent state.
  */
 public class HumanBehavior {
 
+    private static final double SESSION_SKILL_MEAN = 1.0;
+    private static final double SESSION_SKILL_SIGMA = 0.05;
+    private static final double SESSION_SKILL_MIN = 0.85;
+    private static final double SESSION_SKILL_MAX = 1.15;
+    private static double sessionSkill = 1.0;
+
     /**
-     * Generate a random aim offset within the configured range.
-     * Returns a value between -aimOffsetMax and +aimOffsetMax, biased toward center.
+     * Roll a fresh session skill multiplier. Call once per session start
+     * (e.g. from {@code BotController.loadConfig()} on world join).
+     */
+    public static void rollSessionSkill() {
+        double g = ThreadLocalRandom.current().nextGaussian() * SESSION_SKILL_SIGMA + SESSION_SKILL_MEAN;
+        if (g < SESSION_SKILL_MIN) g = SESSION_SKILL_MIN;
+        if (g > SESSION_SKILL_MAX) g = SESSION_SKILL_MAX;
+        sessionSkill = g;
+    }
+
+    public static double sessionSkill() {
+        return sessionSkill;
+    }
+
+    /**
+     * Generate a random aim offset within the configured range, distributed as
+     * a clamped Gaussian centred at 0 with σ = aimOffsetMax/2. Most samples
+     * cluster near the centre (where a human's aim naturally lands), with
+     * heavy tails rare but possible. Values below {@code aimOffsetMin} in
+     * magnitude are pushed out to ±aimOffsetMin so the result is never
+     * imperceptibly close to dead-centre.
      */
     public static double randomAimOffset(BotConfig config) {
-        double range = randomInRange(config.aimOffsetMin, config.aimOffsetMax);
-        return ThreadLocalRandom.current().nextBoolean() ? range : -range;
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        double sigma = config.aimOffsetMax / 2.0;
+        double v = r.nextGaussian() * sigma;
+        // Clamp magnitude to [min, max]
+        if (v > config.aimOffsetMax) v = config.aimOffsetMax;
+        if (v < -config.aimOffsetMax) v = -config.aimOffsetMax;
+        if (Math.abs(v) < config.aimOffsetMin) {
+            v = v < 0 ? -config.aimOffsetMin : config.aimOffsetMin;
+        }
+        return v;
     }
 
     /**
-     * Generate a random settle delay in ticks after aim convergence.
-     */
-    public static int randomSettleDelay(BotConfig config) {
-        return randomIntInRange(config.settleDelayMin, config.settleDelayMax);
-    }
-
-    /**
-     * Generate a random look speed multiplier for this target.
+     * Generate a random look-speed multiplier for this target, uniformly
+     * distributed in [lookSpeedMin, lookSpeedMax] then scaled by the
+     * current {@link #sessionSkill()}. Applied via
+     * {@code CameraController.setLookSpeedMultiplier} so successive aims have
+     * varying turn speeds; a "skilled" session aims slightly faster on
+     * every block.
      */
     public static double randomLookSpeedMultiplier(BotConfig config) {
-        return randomInRange(config.lookSpeedMin, config.lookSpeedMax);
+        return randomInRange(config.lookSpeedMin, config.lookSpeedMax) * sessionSkill;
+    }
+
+    /**
+     * Generate a Gaussian-distributed reaction delay in ticks. Clamped to
+     * {@code [reactionDelayMinTicks, reactionDelayMaxTicks]} then divided
+     * by the current {@link #sessionSkill()} (skilled session = faster
+     * reactions). Returns 0 when the configured mean is zero
+     * (humanness disabled).
+     */
+    public static int randomReactionDelayTicks(BotConfig config) {
+        if (config.reactionDelayMeanTicks <= 0
+                && config.reactionDelaySigmaTicks <= 0) {
+            return 0;
+        }
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        double g = r.nextGaussian() * config.reactionDelaySigmaTicks
+                + config.reactionDelayMeanTicks;
+        g /= sessionSkill;
+        int v = (int) Math.round(g);
+        if (v < config.reactionDelayMinTicks) v = config.reactionDelayMinTicks;
+        if (v > config.reactionDelayMaxTicks) v = config.reactionDelayMaxTicks;
+        return Math.max(0, v);
+    }
+
+    /**
+     * Generate a uniform pre-attack hesitation in ticks. The "commit moment"
+     * between the LOOKING gates firing and the first startAttack call.
+     */
+    public static int randomPreAttackHesitation(BotConfig config) {
+        return randomIntInRange(config.preAttackHesitationMin, config.preAttackHesitationMax);
     }
 
     private static double randomInRange(double min, double max) {

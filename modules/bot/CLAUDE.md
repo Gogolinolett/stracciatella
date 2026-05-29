@@ -52,7 +52,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
-| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn). Exit the moment the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — no settle delay. | `lookTimeout` |
+| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target. A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`; exit once items have been observed and are all picked up | `collectWaitMax` |
 
@@ -113,18 +113,25 @@ Break detection requires TWO authoritative signals before considering the block 
 
 It then sends `ServerboundSetCarriedItemPacket` after `setSelectedSlot` so the server's held-item state matches the client's. Without the packet sync, server-side drops are computed with the wrong tool (e.g. iron_ore mined with server-side bare hand drops nothing).
 
-Tool selection now happens in LOOKING (tick 1), not INTERACTING. The carried-item (and any B1 inventory-swap) packet travels to the server during the smooth camera turn — by the time the hit-result gate fires, the server has had the full LOOKING duration to apply the slot change. INTERACTING then attacks on its first tick after a single defensive `resendCarriedItem` call. This removes both the cosmetic settle delay (formerly 2–5 ticks at the end of LOOKING) and the tool-settle wait (formerly 8 ticks at the start of INTERACTING) — total ~10–13 saved ticks of visible "staring before mining". `LOOKING` re-resends the carried-item packet each subsequent tick as a dropped-packet safety net.
+Tool selection now happens in LOOKING (tick 1), not INTERACTING. The carried-item (and any inventory-swap) packet travels to the server during the smooth camera turn — by the time the hit-result gate fires, the server has had the full LOOKING duration to apply the slot change. INTERACTING then attacks on its first tick after a single defensive `resendCarriedItem` call, with no tool-settle wait. `LOOKING` re-resends the carried-item packet each subsequent tick as a dropped-packet safety net.
+
+A short `preAttackHesitation` (default 1–3 ticks) is held between the LOOKING gate firing and the transition to INTERACTING. This is **not** the old `settleDelay` (a timing buffer for the server) — packet sync is already done by parallel tool selection above. The hesitation is purely humanness: the visible "I see it, I click" beat between locking on and clicking. Micro-saccades enable at the start of the hesitation so the gaze trembles slightly during the commit moment.
 
 ## Test setup: waiting on gamemode sync
 
-A separate race used to produce the same "block broken, no drop" symptom: the test runs `/gamemode survival` and then immediately enqueues a mining task on the client. On the heavily-loaded accelerated-tick server, `/gamemode` can be queued behind other command packets. When the bot starts attacking, the server still has the player in creative — block breaks are instant client-side and drop nothing. `BotTests.switchToSurvivalAt` now waits on `!mc.player.getAbilities().instabuild` (the server→client ack of the mode change) before starting the bot, which eliminates the whole class of failure without any timing tuning. Under accelerated ticks (`-PtickSpeed>1`) a fast block can break within ~20 ticks of entering INTERACTING — less wall time than the packet round-trip — so the break resolves against a stale server-side held slot. The settle delay lets the server apply the carried-item packet before any attack packets arrive. This affects only the first attack per target; subsequent ticks call `continueAttack` normally.
+A separate race used to produce the same "block broken, no drop" symptom: the test runs `/gamemode survival` and then immediately enqueues a mining task on the client. On the heavily-loaded accelerated-tick server, `/gamemode` can be queued behind other command packets. When the bot starts attacking, the server still has the player in creative — block breaks are instant client-side and drop nothing. `BotTests.switchToSurvivalAt` now waits on `!mc.player.getAbilities().instabuild` (the server→client ack of the mode change) before starting the bot, which eliminates the whole class of failure without any timing tuning.
+
+The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 lets the carried-item packet travel during the whole camera-turn window, so by the time INTERACTING fires the server is already on the right slot. The `preAttackHesitation` does add a small (1–3 tick) wait between the gate firing and the attack, but its purpose is humanness — not packet timing — and disabling it must not regress drop reliability.
 
 ## Human-Like Behavior
 
-- Spring-damper camera smoothing (5-15 ticks to converge)
-- Random aim offset within block face (not dead center)
-- Settle delay after aim convergence (2-5 ticks)
-- Tool selection before mining starts
+- Spring-damper camera smoothing (5–15 ticks to converge), with a randomised look-speed multiplier per target so successive aims don't all turn at the same rate
+- Random aim offset within block face (Gaussian, clustered near center, clamped to ±aimOffsetMax)
+- Gaussian reaction delay between phase decisions — applied at `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and the block-broken transition; mean 4 ticks (~200 ms), σ=2
+- Pre-attack commit hesitation: a 1–3 tick "I see it, I click" beat between both LOOKING gates firing and the first `startAttack`. Distinct from the old settle delay — tool sync already happens during the LOOKING camera turn, this is purely humanness
+- Micro-saccades during sustained aim (INTERACTING): ±0.5° yaw, ±0.3° pitch perturbations refreshed every ~12 ticks. Avoid the "frozen gaze" look while mining
+- Tool selection done in LOOKING tick 1 (carried-item packet travels in parallel with the camera turn, no separate tool-settle wait in INTERACTING)
+- Per-session "skill jitter": at `loadConfig` (world join), `HumanBehavior.rollSessionSkill` draws a Gaussian multiplier in [0.85, 1.15]. Multiplied into look-speed and divided out of reaction-delay so every session has slightly different baseline cadence — sometimes the bot is a touch faster, sometimes a touch slower
 
 ## Commands (`/bot`)
 
@@ -144,17 +151,23 @@ A separate race used to produce the same "block broken, no drop" symptom: the te
 
 Persisted to `stracciatella/bot.json`. Key parameters:
 
-- `aimOffsetMin/Max` — block face aim jitter
-- `settleDelayMin/Max` — ticks after aim converges
+Humanness:
+- `aimOffsetMin/Max` — block-face aim jitter magnitude (Gaussian, σ = max/2)
+- `lookSpeedMin/Max` — spring-acceleration multiplier rolled per new target (default 0.7–1.3)
+- `reactionDelayMeanTicks` / `reactionDelaySigmaTicks` / `reactionDelayMinTicks` / `reactionDelayMaxTicks` — clamped Gaussian for inter-phase reaction delay (default mean 4, σ=2, range [1, 10] ≈ 50–500 ms). Set mean and σ to 0 to disable.
+- `preAttackHesitationMin/Max` — uniform pre-attack hesitation ticks between LOOKING gate firing and first `startAttack` (default 1–3)
+
+Phases / timing:
 - `collectWaitMax` — hard timeout for COLLECTING if drops never become reachable (default 1200, covers delayed item-entity sync at 20x tickSpeed)
 - `airConfirmTicks` — consecutive air-observation ticks required to confirm a break (default 8)
-- `toolSettleTicks` — ticks to wait after tool select before first attack (default 8). Carried-item packet is re-sent each tick during the window.
 - `itemAbsenceTicks` — ticks items must be absent after a sighting before COLLECTING exits (default 60)
 - `scanTimeout` — max ticks to look toward next target before walking (30)
 - `scanFacingTolerance` — degrees tolerance for scan convergence (15.0)
 - `scanRadius` — block scan radius
+- `facingTolerance` — degrees tolerance for LOOKING angular gate (default 5.0)
 - `reachDistance` — max mining reach (4.0)
-- `maxBreakTicks` — interaction timeout (default 400, must cover settle + mine + drop-spawn wait)
+- `maxBreakTicks` — interaction timeout (default 400, must cover mine + drop-spawn wait)
+- `navigateTimeout` / `positionTimeout` / `lookTimeout` — per-phase deadlines
 
 ## Dependencies
 

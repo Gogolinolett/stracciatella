@@ -80,6 +80,45 @@ public class PathWalker {
     // overshoot on the narrow landing platform.
     private static boolean postBrakeAirRelease = false;
 
+    // === Human-Like Movement state ===
+
+    // Pre-jump hesitation for max-range jumps (gap >= 5): humans pause briefly
+    // to "look at" a long gap before committing. Ticks remain in this stillness
+    // window; -1 means not yet rolled for this approach.
+    private static int preJumpHesitationRemaining = -1;
+    private static final int PRE_JUMP_HESITATION_MEAN = 7;
+    private static final int PRE_JUMP_HESITATION_SIGMA = 2;
+    private static final int PRE_JUMP_HESITATION_MIN = 4;
+    private static final int PRE_JUMP_HESITATION_MAX = 12;
+
+    // Pitch micro-variance: a small target-pitch offset refreshed every
+    // PITCH_VARIANCE_REFRESH ticks while walking long straight segments.
+    // Spring-damper pitch absorbs the change smoothly so it reads as the
+    // bot's gaze drifting up/down across the path, not jerking. Gated off
+    // near jumps where pitch tracking accuracy matters.
+    private static float pitchVarianceOffset = 0.0f;
+    private static int pitchVarianceRefreshIn = 0;
+    private static final float PITCH_VARIANCE_MAX_DEG = 2.5f;
+    private static final int PITCH_VARIANCE_REFRESH_MIN = 20;
+    private static final int PITCH_VARIANCE_REFRESH_MAX = 40;
+
+    // Micro-strafe state: brief (1-2 tick) sideways key presses on long
+    // straight gap=1 corridors. Magnitude is small enough that the spring
+    // camera and alignment-hold absorb it without pushing the player off
+    // course.
+    private static int strafeTicksRemaining = 0;
+    private static int strafeCooldown = 60;  // start with no strafe immediately
+    private static int strafeDirection = 0;  // -1=left, 0=none, +1=right
+    private static final int STRAFE_COOLDOWN_MIN = 40;
+    private static final int STRAFE_COOLDOWN_MAX = 80;
+    private static final int STRAFE_DURATION_MIN = 1;
+    private static final int STRAFE_DURATION_MAX = 2;
+
+    // Counter for detecting "long straight walk" — only allow strafing /
+    // pitch variance after this many consecutive ticks of normal walking
+    // without jumps or sharp turns.
+    private static int straightWalkTicks = 0;
+
     public static void start(List<MeshNode> path) {
         if (path == null || path.isEmpty()) {
             stop();
@@ -105,6 +144,13 @@ public class PathWalker {
         landingBrakeActive = false;
         justBraked = false;
         postBrakeAirRelease = false;
+        preJumpHesitationRemaining = -1;
+        pitchVarianceOffset = 0.0f;
+        pitchVarianceRefreshIn = 0;
+        strafeTicksRemaining = 0;
+        strafeCooldown = randomInt(STRAFE_COOLDOWN_MIN, STRAFE_COOLDOWN_MAX);
+        strafeDirection = 0;
+        straightWalkTicks = 0;
         updateTargetOffset();
     }
 
@@ -204,6 +250,12 @@ public class PathWalker {
             index++;
             updateTargetOffset();
             maxJumpPhase = 0;
+            // Reset per-approach humanness state. preJumpHesitation re-rolls
+            // for each new gap≥5 jump; strafe / straight-walk counters reset
+            // to give each segment a fresh "did we just turn?" baseline.
+            preJumpHesitationRemaining = -1;
+            strafeTicksRemaining = 0;
+            straightWalkTicks = 0;
             if (index >= currentPath.size()) {
                 stop();
                 return;
@@ -304,6 +356,34 @@ public class PathWalker {
             }
 
             if (maxJumpPhase == 0) {
+                // Pre-jump hesitation: humans visibly pause to "look at" a
+                // long gap before committing. Hold still for a Gaussian
+                // 4–12 tick window (~200–600 ms) while the camera stays
+                // aimed at the target. Only applied for genuine long jumps
+                // (gap ≥ 5) — shorter jumps don't read as long enough to
+                // warrant a pause.
+                Vec3 vel0 = player.getDeltaMovement();
+                double forwardVel0 = (vel0.x * dx + vel0.z * dz) / distance;
+                if (preJumpHesitationRemaining < 0) {
+                    // Don't pre-hesitate if the player is already cruising at
+                    // sprint speed — they'll skip retreat anyway, so a pause
+                    // here would just slow the bot for no humanness gain.
+                    if (forwardVel0 > 0.14) {
+                        preJumpHesitationRemaining = 0;
+                    } else {
+                        preJumpHesitationRemaining = rollPreJumpHesitation();
+                        if (debug) {
+                            System.out.println(String.format(Locale.US,
+                                    "[PathWalker] Pre-jump hesitation: %d ticks", preJumpHesitationRemaining));
+                        }
+                    }
+                }
+                if (preJumpHesitationRemaining > 0) {
+                    preJumpHesitationRemaining--;
+                    applyMovement(client, false, false, false, false);
+                    return;
+                }
+
                 Vec3 vel = player.getDeltaMovement();
                 double forwardVel = (vel.x * dx + vel.z * dz) / distance;
                 // Skip retreat only when the player already has near-terminal sprint speed.
@@ -422,6 +502,30 @@ public class PathWalker {
         }
         float newYaw = camera.updateYaw(desiredYaw);
         float desiredPitch = AngleUtil.computeDesiredPitch(dy, distance);
+        // Pitch micro-variance during long straight walks: add a slowly-
+        // refreshing offset to the target pitch. The spring-damper absorbs
+        // it smoothly so the bot's gaze drifts up/down across the path
+        // instead of staring flat. Gated to "safe" walking — disabled when
+        // approaching a jump or already airborne, where pitch accuracy
+        // matters for the AngleUtil.isFacingTarget jump-tolerance check.
+        if (straightWalkTicks > 20 && !stabilizeForJump && distance > 1.5
+                && player.onGround() && maxJumpPhase == 0) {
+            if (pitchVarianceRefreshIn <= 0) {
+                double g = ThreadLocalRandom.current().nextGaussian() * (PITCH_VARIANCE_MAX_DEG / 2.0);
+                if (g > PITCH_VARIANCE_MAX_DEG) g = PITCH_VARIANCE_MAX_DEG;
+                if (g < -PITCH_VARIANCE_MAX_DEG) g = -PITCH_VARIANCE_MAX_DEG;
+                pitchVarianceOffset = (float) g;
+                pitchVarianceRefreshIn = randomInt(PITCH_VARIANCE_REFRESH_MIN, PITCH_VARIANCE_REFRESH_MAX);
+            } else {
+                pitchVarianceRefreshIn--;
+            }
+            desiredPitch += pitchVarianceOffset;
+        } else {
+            // Outside the safe corridor, fade the offset back to zero so the
+            // next walk segment doesn't start with a stale tilt.
+            pitchVarianceOffset = 0.0f;
+            pitchVarianceRefreshIn = 0;
+        }
         float newPitch = camera.updatePitch(desiredPitch);
 
         player.setYRot(newYaw);
@@ -708,7 +812,70 @@ public class PathWalker {
             return;
         }
 
-        applyMovement(client, canMoveForward, shouldBrake, jump, sprint);
+        // Track sustained straight walking: a tick is "straight" when the
+        // bot is moving forward on the ground, no jump pending, no brake
+        // active, no max-range retreat in progress, and the next path
+        // segment is a same-Y gap=1 (corridor). Used to gate pitch variance
+        // and micro-strafing onto safe segments only.
+        boolean straightWalkTick = canMoveForward && !jump && !shouldBrake
+                && !landingBrakeActive && maxJumpPhase == 0
+                && player.onGround() && nodeGap == 1 && isSafeCorridor();
+        if (straightWalkTick) {
+            if (straightWalkTicks < 1000) straightWalkTicks++;
+        } else {
+            straightWalkTicks = 0;
+        }
+
+        int strafeDir = updateMicroStrafe(straightWalkTick);
+        applyMovement(client, canMoveForward, shouldBrake, jump, sprint, strafeDir);
+    }
+
+    /**
+     * True if the path beyond the current target is a same-Y gap=1 corridor
+     * for at least the next two nodes. Restricts micro-strafing / pitch
+     * variance to segments where a 0.1-block lateral drift can't push the
+     * player off a narrow platform.
+     */
+    private static boolean isSafeCorridor() {
+        if (index + 2 >= currentPath.size()) return false;
+        MeshNode curr = currentPath.get(index);
+        MeshNode next1 = currentPath.get(index + 1);
+        MeshNode next2 = currentPath.get(index + 2);
+        if (curr.getY() != next1.getY() || next1.getY() != next2.getY()) return false;
+        int g1 = Math.max(Math.abs(next1.getX() - curr.getX()), Math.abs(next1.getZ() - curr.getZ()));
+        int g2 = Math.max(Math.abs(next2.getX() - next1.getX()), Math.abs(next2.getZ() - next1.getZ()));
+        return g1 == 1 && g2 == 1;
+    }
+
+    /**
+     * Manages the micro-strafe state machine and returns this tick's strafe
+     * direction (-1 / 0 / +1). Only fires while the bot is on a safe
+     * corridor and has been walking straight long enough that a brief
+     * sideways drift won't be misread as a jump approach.
+     */
+    private static int updateMicroStrafe(boolean straightWalkTick) {
+        if (!straightWalkTick || straightWalkTicks < 25) {
+            // Not on a safe corridor — clear any in-flight strafe so the
+            // sideways key isn't held into a jump.
+            strafeTicksRemaining = 0;
+            strafeDirection = 0;
+            return 0;
+        }
+        if (strafeTicksRemaining > 0) {
+            strafeTicksRemaining--;
+            if (strafeTicksRemaining == 0) {
+                strafeCooldown = randomInt(STRAFE_COOLDOWN_MIN, STRAFE_COOLDOWN_MAX);
+            }
+            return strafeDirection;
+        }
+        if (strafeCooldown > 0) {
+            strafeCooldown--;
+            return 0;
+        }
+        // Roll a new strafe — direction uniform, duration uniform.
+        strafeDirection = ThreadLocalRandom.current().nextBoolean() ? -1 : 1;
+        strafeTicksRemaining = randomInt(STRAFE_DURATION_MIN, STRAFE_DURATION_MAX);
+        return strafeDirection;
     }
 
     private static void logFallDiagnostics(LocalPlayer player, MeshNode target, double dy, double distance, JumpDecision jumpDecision) {
@@ -833,13 +1000,26 @@ public class PathWalker {
     }
 
     private static void applyMovement(Minecraft client, boolean forward, boolean jump, boolean sprint) {
-        applyMovement(client, forward, false, jump, sprint);
+        applyMovement(client, forward, false, jump, sprint, 0);
     }
 
     private static void applyMovement(Minecraft client, boolean forward, boolean backward, boolean jump, boolean sprint) {
+        applyMovement(client, forward, backward, jump, sprint, 0);
+    }
+
+    /**
+     * Master applyMovement: explicitly drives all six movement keys so any
+     * leftover key state from a previous tick (notably {@code keyLeft} /
+     * {@code keyRight} from micro-strafing) is reset on every call.
+     * {@code strafeDir} is {@code -1} for left, {@code +1} for right, {@code 0}
+     * for no strafe.
+     */
+    private static void applyMovement(Minecraft client, boolean forward, boolean backward, boolean jump, boolean sprint, int strafeDir) {
         Options options = client.options;
         options.keyUp.setDown(forward);
         options.keyDown.setDown(backward);
+        options.keyLeft.setDown(strafeDir < 0);
+        options.keyRight.setDown(strafeDir > 0);
         options.keyJump.setDown(jump);
         options.keySprint.setDown(sprint);
         if (client.player != null) {
@@ -1682,6 +1862,24 @@ public class PathWalker {
             max = tmp;
         }
         return min + (max - min) * ThreadLocalRandom.current().nextDouble();
+    }
+
+    private static int randomInt(int min, int max) {
+        if (max <= min) return min;
+        return ThreadLocalRandom.current().nextInt(min, max + 1);
+    }
+
+    /**
+     * Roll a Gaussian-distributed pre-jump hesitation duration in ticks.
+     * Clamped to [PRE_JUMP_HESITATION_MIN, PRE_JUMP_HESITATION_MAX].
+     */
+    private static int rollPreJumpHesitation() {
+        double g = ThreadLocalRandom.current().nextGaussian() * PRE_JUMP_HESITATION_SIGMA
+                + PRE_JUMP_HESITATION_MEAN;
+        int v = (int) Math.round(g);
+        if (v < PRE_JUMP_HESITATION_MIN) v = PRE_JUMP_HESITATION_MIN;
+        if (v > PRE_JUMP_HESITATION_MAX) v = PRE_JUMP_HESITATION_MAX;
+        return v;
     }
 
     private static double forwardSpeed(Vec3 velocity, float yawDeg) {

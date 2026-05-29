@@ -83,6 +83,35 @@ Chose angular + hit-result because the hit-result gate is **directly the signal 
 
 Chose full-inventory + SWAP because it's the cheapest correct answer: one packet that the server natively understands, no inventory-state tricks, no creative-only assumptions. Slots 36–40 (armor + offhand) are intentionally skipped — they're not tool slots in any practical sense. The chosen hotbar destination is the currently-selected slot, so after the swap the carried-item packet doesn't need a slot change.
 
+## Pre-attack hesitation vs removed settle delay
+
+**Decision**: After both LOOKING gates fire (angular + hit-result) but before the first `startAttack` call, hold for a short uniform `preAttackHesitation` window (default 1–3 ticks ≈ 50–150 ms). During the window the camera keeps aiming and micro-saccades are enabled. This is a **distinct concept** from the removed `settleDelay`: it's humanness, not a timing buffer for packet sync.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No pause at all (state after commit `67eea42`) | Fastest transition; reads as "adjust → mine" in one motion | Loses the visible human "commit moment" between locking on and clicking. Combined with the spring-damper camera, the transition feels too eager — particularly visible block-to-block in a vein where the bot is otherwise standing still |
+| Re-add old `settleDelay` (2–5 ticks) | Restores some humanness | The old delay was framed as a timing buffer for the server's carried-item packet — that buffer is no longer needed (tool selection now happens during the LOOKING camera turn). Keeping the same name and timing conflates two different reasons for the same pause |
+| Pre-attack hesitation (1–3 ticks, distinct name, chosen) | Narrower window than the old settle, clearly labelled as humanness; saccades start here so the bot's gaze "trembles" during the commit moment | Adds 50–150 ms per block break — within the user-authorised "small reliability degradation" budget |
+
+Chose the narrower, renamed concept because the cleanup commit (`67eea42`) was right to remove the old delay (it was solving a problem that no longer existed), but removing it entirely also removed the bit of humanness that pause was inadvertently providing. The new field reintroduces that humanness with half the duration and a clear semantic separation: tool selection sync is done by parallel packet sending during LOOKING; the hesitation here is purely the human "I see it / I click" beat.
+
+## Reaction delays at phase transitions vs LOOKING→INTERACTING gate
+
+**Decision**: A Gaussian-distributed reaction delay (mean 4 ticks, σ=2, clamped to [1, 10]) is inserted at three transitions where the bot currently reacts instantly: `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and `INTERACTING-broken→{LOOKING|next-LOOKING}`. The delay is **not** applied on the `LOOKING→INTERACTING` gate — that boundary already uses the more authoritative pre-attack hesitation (see "Pre-attack hesitation vs removed settle delay") and the hit-result gate prevents the gate from firing too early.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Apply reaction delay on every transition | Most consistent humanness | The `LOOKING→INTERACTING` gate is the latency-sensitive one (block-break timing in accelerated tests). Adding a second uncorrelated random delay on top of pre-attack hesitation doubles the variance for no readability gain — viewers can't tell two short delays from one slightly longer one |
+| No reaction delay anywhere; rely on camera smoothing only | Simplest | Camera smoothing only hides reaction time *during* a turn — between phases (e.g. when the bot has already aimed and now decides to walk) there's nothing to mask the instant transition |
+| Reaction delay only at top-of-task (`SCANNING` entry) | One place to tune | Misses the most visible cue — the pause after a block breaks. A bot that drops a log and instantly turns to the next log reads as a script; the pause is exactly the "human notices the result" moment |
+| Reaction delay at the three chosen transitions (chosen) | Captures the cues a viewer actually notices: "decided to walk", "decided to attack the next block", "spotted the next block in reach". Avoids stacking with pre-attack hesitation | Mechanism (deferred Runnable + delay counter) is one extra state in the tick loop |
+
+Chose the three-transition application because those are the moments where the bot's *decision* changes — a viewer's eye is drawn to phase changes, and a millisecond pause at each one is what reads as "a person is doing this." `LOOKING→INTERACTING` is excluded because pre-attack hesitation already covers that boundary with the right semantics (commit moment, not phase change).
+
+**Implementation note**: the delay is realised by storing a `Runnable` and a tick countdown on `BotController`; while the countdown is non-zero, the main tick early-returns without running the current phase's logic or incrementing `phaseTicks` — so per-phase timeouts (`navigateTimeout`, `lookTimeout`, etc.) are not eaten by the delay. `releaseMovementKeys()` is called when scheduling so the bot visibly stops moving during the beat instead of coasting.
+
 ## Server-side held-item sync in tool selection
 
 **Decision**: `InventoryHelper.selectBestTool` sends `ServerboundSetCarriedItemPacket` every time it selects a slot, even if client-side `selectedSlot` is already at that index.
@@ -95,20 +124,6 @@ Chose full-inventory + SWAP because it's the cheapest correct answer: one packet
 | Send packet always (chosen) | Cheap, idempotent, guarantees server agreement | One extra packet per interaction start (negligible) |
 
 Chose to always send because the packet is tiny, idempotent, and a stale server-side slot is a silent-failure mode (drops computed with wrong tool). Worth the trivial cost.
-
-## First-attack settle after tool select
-
-**Decision**: In INTERACTING, after `InventoryHelper.selectBestTool` runs, hold off on the first attack for `CONFIG.toolSettleTicks` ticks (default 4) before letting `BlockInteractor` start.
-
-### Alternatives
-| Approach | Pros | Cons |
-|----------|------|------|
-| No delay (original) | Minimal | Under accelerated ticks, a fast block can break within ~20 ticks of entering INTERACTING. That's ~100ms wall time at 10x — less than packet round-trip. The server's held-slot may still be the previous value when the break resolves, producing the wrong drop (or none at all). Reproduced in `mineQueue` at 2/5 failure rate. |
-| Fixed `toolSettleTicks` wait + per-tick packet re-send (chosen) | Deterministic. 8 ticks at 10x ≈ 40ms wall + per-tick carried-item re-send defends against the server processing the attack before the carried-item packet. Applies only to the first attack per target. Cheap and robust. | Adds a small constant delay per block and ~8 tiny packets per settle |
-| Wait on observed server ack (e.g. hook `ClientboundSetCarriedItemPacket`) | Authoritative — no guessing | Extra mixin surface; the echo from a `ServerboundSetCarriedItemPacket` isn't always re-sent to the client |
-| Retry if the drop doesn't appear | Lazy | Requires per-task expected-drop metadata, which `BotTask` doesn't carry |
-
-Chose the fixed settle because it's a one-line change gated on the existing `toolSelected` first-tick branch, costs a negligible amount of wall time, and matches the same pattern used by `airConfirmTicks` for the other end of the break.
 
 ## Gamemode-sync wait in test setup
 

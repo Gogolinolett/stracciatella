@@ -87,6 +87,18 @@ All PathWalker logic is **tick-based** — no wall-clock time dependencies. This
 
 - **Alignment hold** (`alignmentHoldTicks`, default 5): After camera aligns with the target direction, holds forward movement enabled for this many ticks even if angle drifts slightly. Prevents stop-start jitter on turns. Configurable via `/path walkconfig alignhold <ticks>`.
 
+### Human-Like Movement
+
+PathWalker adds several humanness behaviours on top of the core movement physics. All are gated to *safe* segments so they cannot push the player off a narrow platform.
+
+- **Target offset**: random X/Z offset (0.05–0.25) added to each node's centre so arrival points cluster naturally around target, not on it. Suppressed for long-range jumps (gap ≥ 5) where precision matters.
+- **Jump aim yaw offset**: 1.5–4.0° random yaw jitter applied during jump preparation. Scales down for longer gaps (0.5–1.5° for gap=4, 0° for gap ≥ 5) where any angular deviation costs forward velocity.
+- **Pre-jump hesitation** (gap ≥ 5 only, standstill entry only): 4–12 tick Gaussian pause (mean 7, σ=2 — ~200–600 ms) at the start of the retreat phase. Camera holds aim at the landing target during the pause. Skipped if the player is already sprinting into the jump (the existing skip-retreat branch).
+- **Pitch micro-variance** during sustained straight walks (`straightWalkTicks > 20`, on ground, target > 1.5 blocks away, no jump pending): ±2.5° Gaussian offset added to the desired pitch, refreshed every 20–40 ticks. Spring-damper absorbs it as a slow gaze drift. Zeroed outside the safe window.
+- **Micro-strafing** on safe corridors (current + next 2 nodes all same-Y gap=1): 1–2 tick sideways key press every 40–80 ticks. Adds ~0.05–0.1 blocks of lateral drift, well within the 0.18-block arrival radius. Disabled on any segment containing a jump or sharp turn.
+
+The `applyMovement` master variant explicitly drives all six movement keys (forward/backward/left/right/jump/sprint) so any in-flight strafe is cleared whenever a non-strafing path (jump, brake, retreat) calls `applyMovement` with `strafeDir = 0`. This prevents leaked key state between segments.
+
 ### Config system
 
 - Stored in `pathwalker.json`, loaded/saved via `PathWalker.loadConfig()`/`saveConfig()`
