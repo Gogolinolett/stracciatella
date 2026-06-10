@@ -52,6 +52,11 @@ public class BotController {
     private static double aimOffsetZ = 0.0;
     private static boolean toolSelected = false;
 
+    // Downward gaze pitch for COLLECTING (degrees below horizon), rolled once
+    // per phase. Looking at drops is capped at this angle — tracking the item
+    // point directly would tilt the head ever steeper on approach.
+    private static double collectGazePitch = 45.0;
+
     // Pre-attack hesitation: ticks remaining in the "commit moment" between
     // the LOOKING gates firing and the first startAttack. -1 means inactive.
     private static int preAttackHesitationRemaining = -1;
@@ -536,6 +541,8 @@ public class BotController {
                 // while standing over the drops reads as bot. Saccades are
                 // usually already on from INTERACTING; ensure it.
                 camera.setMicroSaccadesEnabled(true);
+                // Roll this collect's ground-scan angle (~45° with variance).
+                collectGazePitch = HumanBehavior.randomCollectGazePitch(CONFIG);
             }
 
             // Find nearby item entities within 8 blocks
@@ -588,7 +595,7 @@ public class BotController {
                 client.options.keyUp.setDown(false);
                 client.options.keySprint.setDown(false);
                 if (nearestHorizDistSq > 0.5) {
-                    aimCameraAt(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
+                    aimCollectGaze(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
                 } else if (hasLastAim) {
                     aimCameraAt(player, lastAimX, lastAimY, lastAimZ);
                 }
@@ -608,7 +615,7 @@ public class BotController {
                     client.options.keyUp.setDown(false);
                     client.options.keySprint.setDown(false);
                     // Keep watching the spot where the drop will appear.
-                    aimCameraAt(player, tx, ty, tz);
+                    aimCollectGaze(player, tx, ty, tz);
                 }
             } else {
                 client.options.keyUp.setDown(false);
@@ -684,9 +691,9 @@ public class BotController {
                                    double targetX, double targetY, double targetZ,
                                    double horizDistSq) {
         // Look at what we're walking to — yaw steers the walk, pitch follows
-        // the target naturally. A human watches the drop they're collecting,
-        // not the horizon above it.
-        aimCameraAt(player, targetX, targetY, targetZ);
+        // the target but is capped at the ground-scan angle so the head
+        // doesn't crane ever steeper as the bot closes in on a drop.
+        aimCollectGaze(player, targetX, targetY, targetZ);
         client.options.keyUp.setDown(true);
         client.options.keySprint.setDown(horizDistSq > 4.0);
     }
@@ -893,6 +900,38 @@ public class BotController {
         lastAimY = y;
         lastAimZ = z;
         hasLastAim = true;
+    }
+
+    /**
+     * Aim toward a drop (or expected drop spot) with the downward pitch capped
+     * at this collect's {@code collectGazePitch}. Tracking the item point
+     * directly makes the head tilt ever steeper as the bot closes in; a player
+     * instead holds a ~45° "scanning the ground ahead" angle, so once the
+     * direct angle would exceed the cap, the aim point is pushed out along the
+     * same horizontal direction (same yaw — the walk steering is unaffected)
+     * to the distance where the pitch equals the cap.
+     */
+    private static void aimCollectGaze(LocalPlayer player, double x, double y, double z) {
+        double dx = x - player.getX();
+        double dz = z - player.getZ();
+        double drop = player.getEyeY() - y;
+        double horizDist = Math.sqrt(dx * dx + dz * dz);
+        double pitchToTarget = Math.toDegrees(Math.atan2(drop, horizDist));
+        if (pitchToTarget > collectGazePitch) {
+            double aimDist = drop / Math.tan(Math.toRadians(collectGazePitch));
+            if (horizDist > 1.0e-4) {
+                double scale = aimDist / horizDist;
+                x = player.getX() + dx * scale;
+                z = player.getZ() + dz * scale;
+            } else {
+                // Target directly underfoot — look down at the capped angle
+                // in the current view direction.
+                double yawRad = Math.toRadians(player.getYRot());
+                x = player.getX() - Math.sin(yawRad) * aimDist;
+                z = player.getZ() + Math.cos(yawRad) * aimDist;
+            }
+        }
+        aimCameraAt(player, x, y, z);
     }
 
     private static boolean isWithinReach(LocalPlayer player, BlockPos target) {

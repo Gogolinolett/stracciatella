@@ -101,6 +101,16 @@ public class HumanBehavior {
     }
 
     /**
+     * Downward gaze pitch (degrees below horizon) used while collecting
+     * drops, uniform in [collectGazePitchMinDeg, collectGazePitchMaxDeg].
+     * Rolled once per COLLECTING phase — the "scanning the ground ahead"
+     * angle a player holds instead of craning ever steeper at a nearby item.
+     */
+    public static double randomCollectGazePitch(BotConfig config) {
+        return randomInRange(config.collectGazePitchMinDeg, config.collectGazePitchMaxDeg);
+    }
+
+    /**
      * Reaction delay for the "spotted the target, about to walk over" moment
      * (SCANNING→NAVIGATING). Usually the standard
      * {@link #randomReactionDelayTicks reaction delay}, but with probability

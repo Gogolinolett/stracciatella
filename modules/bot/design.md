@@ -43,18 +43,19 @@ Chose the conditional skip because the `itemAbsenceTicks` wait is solving a diff
 
 **Companion change — direct-to-LOOKING when in reach after COLLECTING**: if the bot ends up within reach of the next task by the time COLLECTING exits (e.g. the next ore in a vein was right next to the one just mined), skip `SCANNING` and transition straight to `LOOKING`. The aim-cue is unnecessary when there's no movement to do.
 
-## COLLECTING gaze: watch the drops, not the horizon
+## COLLECTING gaze: watch the drops, not the horizon — at a capped ground-scan angle
 
-**Decision**: During COLLECTING the camera aims at what the bot is doing: the nearest item while walking to it (`walkToward` takes the full 3D target and drives `aimAt`), the item while standing in pickup range (unless it is nearly underfoot, horizontal dist² ≤ 0.5), `lastMinedPos` while waiting for the drop to sync, and the last aim point (still saccading) while waiting out the absence window. Micro-saccades are enabled for the whole phase.
+**Decision**: During COLLECTING the camera aims at what the bot is doing: the nearest item while walking to it (`walkToward` takes the full 3D target), the item while standing in pickup range (unless it is nearly underfoot, horizontal dist² ≤ 0.5), `lastMinedPos` while waiting for the drop to sync, and the last aim point (still saccading) while waiting out the absence window. All drop-directed aims go through `aimCollectGaze`: the downward pitch is capped at a per-phase angle (uniform in `[collectGazePitchMinDeg, collectGazePitchMaxDeg]`, default 38–52°). When the direct angle to the item would exceed the cap, the aim point is pushed out along the same horizontal direction to the distance where the pitch equals the cap — same yaw (walk steering unaffected), gaze on the ground ahead. Micro-saccades are enabled for the whole phase.
 
 ### Alternatives
 | Approach | Pros | Cons |
 |----------|------|------|
 | Smooth yaw to walk direction only (original) | Steers the walk correctly | Pitch stays frozen at whatever INTERACTING left (eye-level at the mined block); the bot walks "through" its drops staring ahead, and stands dead-still with a locked gaze during the 60-tick absence window. Both read as bot. |
-| Aim at the item / expected drop position (chosen) | The gaze tells the story a human's would: watch the drop, walk to it, watch it slide over. Yaw still steers the walk since the look target is the walk target. Saccades keep the gaze alive while standing. | Aiming at an item almost directly underfoot makes the yaw target unstable (tiny horizontal deltas flip it 180°) — guarded by skipping the look inside 0.5 horizontal dist² and easing toward the last aim point instead. |
-| Look ahead to the next queued target while collecting | Saves a later camera turn | Wrong story: humans look at what they're picking up; the next-target glance belongs to SCANNING, which already does it. |
+| Aim at the item point directly (first attempt) | Gaze follows the drop | The pitch steepens continuously on approach (~22° at 4 blocks, ~58° at 1 block) — the head visibly cranes further and further down, which the user reported as unnatural. Humans don't head-track a point on the floor; they hold a scanning angle. |
+| Aim at the item, pitch capped at a ~45° ground-scan angle (chosen) | Far away the bot looks at the drop (flat angle); closing in it holds a steady "scanning the floor ahead" posture and the drop enters the lower view. Per-phase variance (38–52°) avoids a fixed signature angle. Yaw is unchanged by the cap, so walking is unaffected. | The gaze passes "over" items closer than the cap distance (~1.4 blocks) — acceptable, vanilla pickup needs no aim and that is exactly the floor-scan look requested. |
+| Fixed 45° pitch always during COLLECTING (no item tracking at all) | Simplest | Loses the distant-drop glance that makes the walk-over read intentional; also pins the pitch even when the drop is above eye level (ledge), where looking up at it is the natural move. The cap only restricts *downward* pitch. |
 
-Chose item-following gaze because COLLECTING was the last phase where the camera was effectively unmanaged, and a frozen pitch over moving feet is one of the most recognizable bot tells.
+Chose the capped gaze because the walk steering needs item-directed yaw anyway, and capping only the downward pitch keeps both stories right: "I see the drop over there" at range, "I'm scanning the ground in front of me" up close.
 
 ## INTERACTING break confirmation: sustained air + drop-entity proof
 

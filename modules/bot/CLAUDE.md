@@ -54,7 +54,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block | `positionTimeout` |
 | **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target. A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
-| **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop being collected (saccades on; skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
+| **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
 
 ### Smart transitions after block break
 
@@ -139,7 +139,7 @@ The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 
 - Occasional long "breather" pause at `SCANNING→NAVIGATING`: with `longPauseChance` (default 4%) the standard reaction delay is replaced by a 12–25 tick pause — breaks the otherwise machine-constant cadence
 - Pre-attack commit hesitation: a 1–3 tick "I see it, I click" beat between both LOOKING gates firing and the first `startAttack`. Distinct from the old settle delay — tool sync already happens during the LOOKING camera turn, this is purely humanness
 - Micro-saccades during sustained aim (INTERACTING and COLLECTING): ±0.5° yaw, ±0.3° pitch perturbations refreshed every ~12 ticks. Avoid the "frozen gaze" look while mining and while standing over drops
-- Gaze follows the work: POSITIONING walks while smoothly looking at the target block (no hard yaw snap); COLLECTING looks at the drop being collected / the expected drop position
+- Gaze follows the work: POSITIONING walks while smoothly looking at the target block (no hard yaw snap); COLLECTING looks at the drop being collected / the expected drop position, with the downward pitch capped at a per-phase ground-scan angle (~45° with variance) — tracking the item point directly would crane the head ever steeper on approach
 - Nearest-task routing: the next task is always the one closest to the bot's current position, not the scanner's fixed order — no zigzag routes across a gather area
 - Tool selection done in LOOKING tick 1 (carried-item packet travels in parallel with the camera turn, no separate tool-settle wait in INTERACTING)
 - Per-session "skill jitter": at `loadConfig` (world join), `HumanBehavior.rollSessionSkill` draws a Gaussian multiplier in [0.85, 1.15]. Multiplied into look-speed and divided out of reaction-delay so every session has slightly different baseline cadence — sometimes the bot is a touch faster, sometimes a touch slower
@@ -168,6 +168,7 @@ Humanness:
 - `reactionDelayMeanTicks` / `reactionDelaySigmaTicks` / `reactionDelayMinTicks` / `reactionDelayMaxTicks` — clamped Gaussian for inter-phase reaction delay (default mean 4, σ=2, range [1, 10] ≈ 50–500 ms). Set mean and σ to 0 to disable.
 - `preAttackHesitationMin/Max` — uniform pre-attack hesitation ticks between LOOKING gate firing and first `startAttack` (default 1–3)
 - `longPauseChance` / `longPauseMinTicks` / `longPauseMaxTicks` — chance (default 0.04) that the SCANNING→NAVIGATING reaction delay becomes a longer uniform "breather" pause (default 12–25 ticks). Set chance to 0 to disable.
+- `collectGazePitchMinDeg/MaxDeg` — cap on the downward pitch while looking at drops in COLLECTING (uniform per phase, default 38–52°); steeper aims become a "scan the ground ahead" look in the item's direction
 
 Phases / timing:
 - `collectWaitMax` — hard timeout for COLLECTING if drops never become reachable (default 1200, covers delayed item-entity sync at 20x tickSpeed)

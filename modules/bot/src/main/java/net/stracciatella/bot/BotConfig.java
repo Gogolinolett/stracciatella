@@ -46,6 +46,14 @@ public class BotConfig {
     public int preAttackHesitationMin = 1;
     public int preAttackHesitationMax = 3;
 
+    // COLLECTING gaze: while walking to / standing over drops, the bot does
+    // not track the item point directly (the head would tilt ever steeper on
+    // approach) — beyond this downward pitch it looks at the ground ahead in
+    // the item's direction instead, like a player scanning the floor for the
+    // drop. Rolled uniformly once per COLLECTING phase.
+    public double collectGazePitchMinDeg = 38.0;
+    public double collectGazePitchMaxDeg = 52.0;
+
     // Occasional longer "breather" pause replacing the standard reaction delay
     // at the SCANNING→NAVIGATING transition (the "spotted it, about to walk
     // over" moment). A human doesn't keep a perfectly constant cadence — every
@@ -105,6 +113,8 @@ public class BotConfig {
         this.reactionDelayMaxTicks = other.reactionDelayMaxTicks;
         this.preAttackHesitationMin = other.preAttackHesitationMin;
         this.preAttackHesitationMax = other.preAttackHesitationMax;
+        this.collectGazePitchMinDeg = other.collectGazePitchMinDeg;
+        this.collectGazePitchMaxDeg = other.collectGazePitchMaxDeg;
         this.longPauseChance = other.longPauseChance;
         this.longPauseMinTicks = other.longPauseMinTicks;
         this.longPauseMaxTicks = other.longPauseMaxTicks;
