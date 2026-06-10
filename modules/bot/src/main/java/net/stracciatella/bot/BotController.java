@@ -64,6 +64,15 @@ public class BotController {
     private static Runnable deferredAction = null;
     private static int deferredActionDelay = 0;
 
+    // Last world-space point the bot's own camera was aimed at (jitter offset
+    // already folded in). While a reaction delay is in flight the camera keeps
+    // easing toward this point — a spring mid-swing that freezes for N ticks
+    // reads as stop-motion, not as hesitation.
+    private static double lastAimX;
+    private static double lastAimY;
+    private static double lastAimZ;
+    private static boolean hasLastAim = false;
+
     // Collection state
     private static boolean walkAfterCollect = false;
     // Position of the last mined block — COLLECTING walks toward this to pick up drops
@@ -126,6 +135,7 @@ public class BotController {
         deferredAction = null;
         deferredActionDelay = 0;
         preAttackHesitationRemaining = -1;
+        hasLastAim = false;
         releaseMovementKeys();
         LOGGER.info("Bot stopped");
     }
@@ -193,8 +203,14 @@ public class BotController {
         // Deferred-action gate: when a reaction delay is in flight, neither
         // the phase tick nor phaseTicks/taskTotalTicks advance. The bot
         // visibly pauses for the configured number of ticks before the
-        // queued action runs.
+        // queued action runs. The camera is NOT frozen during the pause —
+        // it keeps easing toward its last aim point (finishing any in-flight
+        // swing, saccading if enabled), because a gaze that halts mid-turn
+        // and resumes N ticks later reads as stop-motion.
         if (deferredActionDelay > 0) {
+            if (camera != null && hasLastAim) {
+                camera.aimAt(player, lastAimX, lastAimY, lastAimZ);
+            }
             deferredActionDelay--;
             if (deferredActionDelay == 0) {
                 Runnable action = deferredAction;
@@ -255,12 +271,21 @@ public class BotController {
             return;
         }
 
-        // Walk toward the target using simple key input
+        if (phaseTicks == 1) {
+            // Fresh camera from the player's current rotation: POSITIONING
+            // follows NAVIGATING, where PathWalker rotated the player with its
+            // own camera — any controller we still hold has stale yaw/pitch.
+            camera = new CameraController();
+            camera.initialize(player.getYRot(), player.getXRot());
+            camera.setLookSpeedMultiplier(HumanBehavior.randomLookSpeedMultiplier(CONFIG));
+        }
+
+        // Walk toward the target, looking at it: the camera eases onto the
+        // block (yaw and pitch) and the player walks in view direction —
+        // a human closes the last few blocks watching the thing they're
+        // about to mine, instead of strafing over with a hard-snapped view.
         BlockPos target = currentTask.targetPos();
-        double dx = (target.getX() + 0.5) - player.getX();
-        double dz = (target.getZ() + 0.5) - player.getZ();
-        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
-        player.setYRot(targetYaw);
+        aimCameraAt(player, target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5);
         client.options.keyUp.setDown(true);
     }
 
@@ -321,7 +346,7 @@ public class BotController {
         double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
         double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
 
-        camera.aimAt(player, tx, ty, tz, offX, offY, offZ);
+        aimCameraAt(player, tx + offX, ty + offY, tz + offZ);
 
         // Two gates before transitioning to INTERACTING:
         //   1. Angular: camera direction within facingTolerance of target vector.
@@ -409,11 +434,10 @@ public class BotController {
             double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
             double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
             double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
-            camera.aimAt(player,
-                    target.getX() + 0.5 + face.getStepX() * 0.5,
-                    target.getY() + 0.5 + face.getStepY() * 0.5,
-                    target.getZ() + 0.5 + face.getStepZ() * 0.5,
-                    offX, offY, offZ);
+            aimCameraAt(player,
+                    target.getX() + 0.5 + face.getStepX() * 0.5 + offX,
+                    target.getY() + 0.5 + face.getStepY() * 0.5 + offY,
+                    target.getZ() + 0.5 + face.getStepZ() * 0.5 + offZ);
         }
 
         // Start mining if not already. Pass the explicit target so the
@@ -470,13 +494,18 @@ public class BotController {
                 return;
             }
 
-            // Task fully done — decide what to do next based on the queue
+            // Task fully done — decide what to do next based on the queue.
+            // The "next" task is always the one nearest to the player, not
+            // the queue head (see startNextTask).
             lastMinedPos = target;
-            BotTask nextTask = taskQueue.peek();
+            BotTask nextTask = taskQueue.peekNearest(player.blockPosition());
             if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
                 // Next target is within reach — mine it next, after the beat
                 scheduleAction(() -> {
-                    currentTask = taskQueue.poll();
+                    LocalPlayer p = Minecraft.getInstance().player;
+                    currentTask = p != null
+                            ? taskQueue.pollNearest(p.blockPosition())
+                            : taskQueue.poll();
                     taskTotalTicks = 0;
                     transitionTo(Phase.LOOKING);
                 });
@@ -498,9 +527,15 @@ public class BotController {
         boolean itemsNearby = false;
 
         if (player != null && client.level != null) {
-            if (phaseTicks == 1 && camera == null) {
-                camera = new CameraController();
-                camera.initialize(player.getYRot(), player.getXRot());
+            if (phaseTicks == 1) {
+                if (camera == null) {
+                    camera = new CameraController();
+                    camera.initialize(player.getYRot(), player.getXRot());
+                }
+                // The bot watches its own pickup — a perfectly frozen gaze
+                // while standing over the drops reads as bot. Saccades are
+                // usually already on from INTERACTING; ensure it.
+                camera.setMicroSaccadesEnabled(true);
             }
 
             // Find nearby item entities within 8 blocks
@@ -542,25 +577,48 @@ public class BotController {
             // we're inside that radius — any closer and we'd overshoot.
             // 1.5² = 2.25.
             if (nearest != null && nearestDistSq > 2.25) {
-                walkToward(client, player, nearest.getX(), nearest.getZ(), nearestHorizDistSq);
+                walkToward(client, player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ(),
+                        nearestHorizDistSq);
+            } else if (nearest != null) {
+                // In pickup range — stand still and watch the drop slide
+                // over. Skip the look when the item is almost directly
+                // underfoot: the yaw target becomes unstable there (tiny
+                // horizontal deltas flip it tick-to-tick) and craning
+                // straight down isn't what a player does anyway.
+                client.options.keyUp.setDown(false);
+                client.options.keySprint.setDown(false);
+                if (nearestHorizDistSq > 0.5) {
+                    aimCameraAt(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
+                } else if (hasLastAim) {
+                    aimCameraAt(player, lastAimX, lastAimY, lastAimZ);
+                }
             } else if (!itemsSeenThisCollect && lastMinedPos != null) {
                 // No items visible yet, but we expect a drop at lastMinedPos.
                 // Walk there so the entity enters the AABB as soon as the server
                 // syncs its spawn.
                 double tx = lastMinedPos.getX() + 0.5;
+                double ty = lastMinedPos.getY() + 0.5;
                 double tz = lastMinedPos.getZ() + 0.5;
                 double dx = tx - player.getX();
                 double dz = tz - player.getZ();
                 double horizDistSq = dx * dx + dz * dz;
                 if (horizDistSq > 1.0) {
-                    walkToward(client, player, tx, tz, horizDistSq);
+                    walkToward(client, player, tx, ty, tz, horizDistSq);
                 } else {
                     client.options.keyUp.setDown(false);
                     client.options.keySprint.setDown(false);
+                    // Keep watching the spot where the drop will appear.
+                    aimCameraAt(player, tx, ty, tz);
                 }
             } else {
                 client.options.keyUp.setDown(false);
                 client.options.keySprint.setDown(false);
+                // Everything picked up, waiting out the absence window —
+                // let the camera finish its swing and keep saccading
+                // rather than freezing in place.
+                if (hasLastAim) {
+                    aimCameraAt(player, lastAimX, lastAimY, lastAimZ);
+                }
             }
         }
 
@@ -598,7 +656,9 @@ public class BotController {
             lastItemSeenTick = 0;
             currentTask = null;
             if (walkAfterCollect && !taskQueue.isEmpty() && !paused) {
-                currentTask = taskQueue.poll();
+                currentTask = player != null
+                        ? taskQueue.pollNearest(player.blockPosition())
+                        : taskQueue.poll();
                 taskTotalTicks = 0;
                 // tickCollecting walks toward the next task while items
                 // settle, so by the time we exit we may already be in reach.
@@ -621,16 +681,12 @@ public class BotController {
     }
 
     private static void walkToward(Minecraft client, LocalPlayer player,
-                                   double targetX, double targetZ, double horizDistSq) {
-        double dx = targetX - player.getX();
-        double dz = targetZ - player.getZ();
-        float targetYaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
-        // Smooth camera turn to avoid erratic spinning
-        if (camera != null) {
-            player.setYRot(camera.updateYaw(targetYaw));
-        } else {
-            player.setYRot(targetYaw);
-        }
+                                   double targetX, double targetY, double targetZ,
+                                   double horizDistSq) {
+        // Look at what we're walking to — yaw steers the walk, pitch follows
+        // the target naturally. A human watches the drop they're collecting,
+        // not the horizon above it.
+        aimCameraAt(player, targetX, targetY, targetZ);
         client.options.keyUp.setDown(true);
         client.options.keySprint.setDown(horizDistSq > 4.0);
     }
@@ -656,11 +712,14 @@ public class BotController {
         double ty = target.getY() + 0.5;
         double tz = target.getZ() + 0.5;
 
-        camera.aimAt(player, tx, ty, tz);
+        aimCameraAt(player, tx, ty, tz);
 
         if (camera.isAimedAt(player, tx, ty, tz, (float) CONFIG.scanFacingTolerance)) {
-            // Reaction delay between "I've spotted it" and "I start walking"
-            scheduleAction(BotController::beginNavigationFresh);
+            // Reaction delay between "I've spotted it" and "I start walking".
+            // Occasionally a longer breather — humans don't set off with a
+            // machine-constant cadence every single time.
+            scheduleAction(BotController::beginNavigationFresh,
+                    HumanBehavior.randomTaskSwitchDelayTicks(CONFIG));
         }
     }
 
@@ -731,7 +790,15 @@ public class BotController {
      * old behaviour when humanness is disabled.
      */
     private static void scheduleAction(Runnable action) {
-        int delay = HumanBehavior.randomReactionDelayTicks(CONFIG);
+        scheduleAction(action, HumanBehavior.randomReactionDelayTicks(CONFIG));
+    }
+
+    /**
+     * Variant with an explicit delay for callers that draw from a different
+     * distribution (e.g. the occasional long "breather" pause at
+     * SCANNING→NAVIGATING).
+     */
+    private static void scheduleAction(Runnable action, int delay) {
         if (delay <= 0) {
             action.run();
             return;
@@ -745,7 +812,13 @@ public class BotController {
     }
 
     private static void startNextTask() {
-        currentTask = taskQueue.poll();
+        LocalPlayer player = Minecraft.getInstance().player;
+        // Take the task nearest to where the bot currently stands. A human
+        // works an area closest-first from wherever they are — replaying the
+        // queue's fixed scan order instead produces visible zigzag routes.
+        currentTask = player != null
+                ? taskQueue.pollNearest(player.blockPosition())
+                : taskQueue.poll();
         if (currentTask == null) {
             phase = Phase.IDLE;
             return;
@@ -756,7 +829,6 @@ public class BotController {
             LOGGER.info("Starting task: {}", currentTask.description());
         }
 
-        LocalPlayer player = Minecraft.getInstance().player;
         if (player == null) {
             failCurrentTask("No player");
             return;
@@ -808,6 +880,20 @@ public class BotController {
     }
 
     // --- Utility methods ---
+
+    /**
+     * Drive the bot's camera one smoothing tick toward the given world-space
+     * point (any jitter offset already folded in) and remember the point, so
+     * an in-flight reaction delay can keep easing the camera toward it
+     * instead of freezing it mid-swing.
+     */
+    private static void aimCameraAt(LocalPlayer player, double x, double y, double z) {
+        camera.aimAt(player, x, y, z);
+        lastAimX = x;
+        lastAimY = y;
+        lastAimZ = z;
+        hasLastAim = true;
+    }
 
     private static boolean isWithinReach(LocalPlayer player, BlockPos target) {
         double dx = (target.getX() + 0.5) - player.getX();

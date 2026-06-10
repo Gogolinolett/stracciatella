@@ -100,6 +100,22 @@ public class HumanBehavior {
         return randomIntInRange(config.preAttackHesitationMin, config.preAttackHesitationMax);
     }
 
+    /**
+     * Reaction delay for the "spotted the target, about to walk over" moment
+     * (SCANNING→NAVIGATING). Usually the standard
+     * {@link #randomReactionDelayTicks reaction delay}, but with probability
+     * {@code longPauseChance} it is replaced by a longer uniform "breather"
+     * pause in {@code [longPauseMinTicks, longPauseMaxTicks]} — the occasional
+     * beat of distraction that breaks an otherwise machine-constant cadence.
+     */
+    public static int randomTaskSwitchDelayTicks(BotConfig config) {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        if (config.longPauseChance > 0 && r.nextDouble() < config.longPauseChance) {
+            return randomIntInRange(config.longPauseMinTicks, config.longPauseMaxTicks);
+        }
+        return randomReactionDelayTicks(config);
+    }
+
     private static double randomInRange(double min, double max) {
         if (min >= max) {
             return min;

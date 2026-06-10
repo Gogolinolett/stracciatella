@@ -1,5 +1,18 @@
 # Bot Module — Design Decisions
 
+## Camera behavior during reaction delays: ease out, don't freeze
+
+**Decision**: While a deferred-action reaction delay is in flight, the bot's camera keeps easing toward its last aim point (`aimCameraAt` records the point; the deferred gate replays it each tick). Movement keys stay released, but the gaze finishes its swing and keeps saccading.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Freeze everything during the delay (original) | Simplest; the pause is clearly visible | The spring-damper camera can be mid-swing when the delay starts — SCANNING's 15° facing tolerance fires while the camera still has high angular velocity. Halting the turn for 1–10 ticks and then resuming reads as stop-motion, the opposite of the humanness the delay is for. |
+| Ease toward last aim point during the delay (chosen) | The body pauses (movement released) while the gaze settles naturally — exactly what a human pausing between deciding and acting looks like. Saccades stay alive. | One extra static field set (`lastAim*`) on every camera-driving tick. |
+| Only delay transitions where the camera has converged | No mid-swing freeze possible | Couples delay placement to camera state; SCANNING→NAVIGATING (tolerance 15°) is precisely the transition where the beat is most visible and most wanted. |
+
+Chose easing because the reaction delay models a *decision* pause, not a motor freeze — humans stop walking while they think, but their eyes finish settling on the target.
+
 ## COLLECTING phase exit gate
 
 **Decision**: Exit COLLECTING only when items have been observed and then absent for a sustained window — `itemsSeenThisCollect && !itemsNearby && phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — and walk toward `lastMinedPos` while no items are visible yet.
@@ -29,6 +42,19 @@ Chose the items-seen + sustained-absence gate because it closes three races dete
 Chose the conditional skip because the `itemAbsenceTicks` wait is solving a different problem (multi-drop pickup race) than the smoothness complaint addresses (queue-driven multi-task flow). One window can't satisfy both, and the queue gives a deterministic signal to switch.
 
 **Companion change — direct-to-LOOKING when in reach after COLLECTING**: if the bot ends up within reach of the next task by the time COLLECTING exits (e.g. the next ore in a vein was right next to the one just mined), skip `SCANNING` and transition straight to `LOOKING`. The aim-cue is unnecessary when there's no movement to do.
+
+## COLLECTING gaze: watch the drops, not the horizon
+
+**Decision**: During COLLECTING the camera aims at what the bot is doing: the nearest item while walking to it (`walkToward` takes the full 3D target and drives `aimAt`), the item while standing in pickup range (unless it is nearly underfoot, horizontal dist² ≤ 0.5), `lastMinedPos` while waiting for the drop to sync, and the last aim point (still saccading) while waiting out the absence window. Micro-saccades are enabled for the whole phase.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Smooth yaw to walk direction only (original) | Steers the walk correctly | Pitch stays frozen at whatever INTERACTING left (eye-level at the mined block); the bot walks "through" its drops staring ahead, and stands dead-still with a locked gaze during the 60-tick absence window. Both read as bot. |
+| Aim at the item / expected drop position (chosen) | The gaze tells the story a human's would: watch the drop, walk to it, watch it slide over. Yaw still steers the walk since the look target is the walk target. Saccades keep the gaze alive while standing. | Aiming at an item almost directly underfoot makes the yaw target unstable (tiny horizontal deltas flip it 180°) — guarded by skipping the look inside 0.5 horizontal dist² and easing toward the last aim point instead. |
+| Look ahead to the next queued target while collecting | Saves a later camera turn | Wrong story: humans look at what they're picking up; the next-target glance belongs to SCANNING, which already does it. |
+
+Chose item-following gaze because COLLECTING was the last phase where the camera was effectively unmanaged, and a frozen pitch over moving feet is one of the most recognizable bot tells.
 
 ## INTERACTING break confirmation: sustained air + drop-entity proof
 
@@ -68,6 +94,34 @@ Chose angular + hit-result because the hit-result gate is **directly the signal 
 **Companion change — clamp aim jitter to the face plane**: human-aim offsets are still applied, but only on the two axes perpendicular to the face normal. Adding offset *along* the face normal pushes the aim point off the face plane; the raycast then exits the block's face range by the offset amount and just barely grazes a neighbor (or the platform below a single block). The hit-result gate sees the neighbor and the bot stares forever — reported as "the bot doesn't start mining even when it looks at the right block". Restricting the jitter to the in-face axes keeps the visual humanization while guaranteeing the aim ray crosses the target's face rather than skirting it.
 
 **Companion change — no settle delay, no tool-settle**: once the hit-result gate fires, INTERACTING starts the same tick — there is no cosmetic settle countdown after aim. The tool-settle wait that used to live at the start of INTERACTING is also gone, replaced by selecting the tool during LOOKING. The carried-item packet (and any inventory-swap packet from B1) travels to the server in parallel with the smooth camera turn, so by the time aim is achieved the server has already had the entire LOOKING duration to apply the slot change. INTERACTING calls `resendCarriedItem` once on tick 1 as a dropped-packet safety net, then proceeds straight to `startDestroyBlock`. Reported feedback: "adjust → mine" instead of "adjust → start mining" — the transition now reads as one motion rather than two.
+
+## Long-pause patterns: occasional breather at SCANNING→NAVIGATING
+
+**Decision**: The reaction delay at the SCANNING→NAVIGATING transition is drawn via `HumanBehavior.randomTaskSwitchDelayTicks`: with probability `longPauseChance` (default 0.04) a uniform "breather" pause of `[longPauseMinTicks, longPauseMaxTicks]` (default 12–25 ticks) replaces the standard Gaussian reaction delay. Other transitions keep the standard delay.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| No long pauses (original) | No test-budget impact | Every pause the bot makes is 1–10 ticks — over minutes of watching, the cadence is recognizably machine-constant. The module description has promised "pause patterns" since the start; only the per-transition Gaussian existed. |
+| Long-pause chance on every scheduleAction | Most variety | Multiplies the flake risk in tick-budgeted tests (the within-reach vein flow alone rolls 2+ times per run) and a mid-vein stall reads less natural than a pre-walk one. |
+| Long-pause chance only at SCANNING→NAVIGATING (chosen) | The "spotted it, about to walk over" moment is where humans genuinely idle (re-grip mouse, glance at inventory); walk-flow tests have the largest timeout budgets (200–280 ticks), so a rare extra ≤25 ticks fits. | The breather never occurs while standing in a vein — acceptable, the pre-attack hesitation and reaction delays already vary that cadence. |
+| Idle fidgeting (random look-arounds while IDLE) | Strongest idle realism | IDLE means no task — out of scope for task execution humanness; can be layered later. |
+
+Chose the single-transition application to get a visible cadence-breaker with bounded, testable timing risk. Defaults are deliberately conservative (4% × ≤25 ticks); both knobs are config-exposed.
+
+## Nearest-task selection: route like a human, not like the scanner
+
+**Decision**: Whenever the bot takes the next task from the queue (`startNextTask`, the within-reach continuation in `tickInteracting`, and the walk-flow exit in `tickCollecting`), it takes the task whose target is nearest to the player's current position (`TaskQueue.pollNearest`/`peekNearest`, ties keep insertion order) instead of the queue head. Explicit single commands still run in submission order (a single-element queue is unaffected).
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| FIFO in scan order (original) | Deterministic, trivial | `BlockScanner` sorts by distance to the *scan center*, so equidistant targets on opposite sides interleave — the bot visibly zigzags across the area, which no human does. The order also ignores where the bot ends up after each task. |
+| Re-sort the whole queue after every task | Same routing result | Mutates global order on every poll for no benefit over picking one element; harder to reason about with concurrent enqueues. |
+| Greedy nearest-from-current-position (chosen) | Matches how a player works an area: finish here, do the closest thing next. O(n) scan per poll over a small queue. Ties preserve FIFO so single-task flows and equal-distance tests stay deterministic. | Greedy is not the globally optimal route — which is fine, humans aren't optimal either. |
+| Nearest with random second-choice ("imperfect human") | Models human suboptimality | Deliberately re-introduces the zigzag the change removes; randomness in *route choice* (vs. timing/aim) reads as erratic, not human. |
+
+Chose greedy nearest because the visible failure mode was routing, and nearest-from-here is both the simplest fix and the most human-plausible heuristic.
 
 ## Tool search scope: full main inventory with hotbar swap
 

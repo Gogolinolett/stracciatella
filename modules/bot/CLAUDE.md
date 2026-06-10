@@ -12,7 +12,7 @@ net.stracciatella.bot
 ├── BotCommands.java                # /bot subcommands
 ├── task/
 │   ├── BotTask.java                # Interface: targetPos, interactionType, isComplete
-│   ├── TaskQueue.java              # ArrayDeque<BotTask> with offer/poll/clear
+│   ├── TaskQueue.java              # ArrayDeque<BotTask>; pollNearest/peekNearest for human-like routing
 │   ├── TaskResult.java             # Record: success, reason, ticksElapsed
 │   ├── InteractionType.java        # Enum: ATTACK, USE
 │   ├── MineBlockTask.java          # Mine single block (complete when → air)
@@ -51,10 +51,10 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **IDLE** | No active task, poll queue when new task enqueued | — |
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
-| **POSITIONING** | Fine-tune position if not within reach after navigation | `positionTimeout` |
+| **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block | `positionTimeout` |
 | **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target. A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
-| **COLLECTING** | Walk toward visible drops or `lastMinedPos`; exit once items have been observed and are all picked up | `collectWaitMax` |
+| **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop being collected (saccades on; skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
 
 ### Smart transitions after block break
 
@@ -62,6 +62,14 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 - **Next task within reach**: straight to LOOKING with new task, no pause
 - **Next task needs walking**: COLLECTING → SCANNING → NAVIGATING
 - **No more tasks**: COLLECTING → IDLE
+
+### Task selection: nearest from current position
+
+Every place that takes the next task from the queue (`startNextTask`, the within-reach continuation after a break, the COLLECTING walk-flow exit) uses `TaskQueue.pollNearest(player.blockPosition())` — the task whose target is closest to where the bot currently stands, ties keeping insertion order. A human works an area closest-first from wherever they are; replaying the scanner's fixed order produces visible zigzag routes. Single explicitly-issued commands are unaffected (one-element queue).
+
+### Reaction delays don't freeze the camera
+
+While a deferred-action reaction delay is in flight, movement keys are released but the camera keeps easing toward its last aim point (recorded by `aimCameraAt`) and keeps saccading. A spring-damper camera frozen mid-swing for 1–10 ticks reads as stop-motion — most visible at SCANNING→NAVIGATING, where the 15° tolerance fires while the camera still has angular velocity.
 
 ### COLLECTING exit conditions
 
@@ -127,9 +135,12 @@ The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 
 
 - Spring-damper camera smoothing (5–15 ticks to converge), with a randomised look-speed multiplier per target so successive aims don't all turn at the same rate
 - Random aim offset within block face (Gaussian, clustered near center, clamped to ±aimOffsetMax)
-- Gaussian reaction delay between phase decisions — applied at `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and the block-broken transition; mean 4 ticks (~200 ms), σ=2
+- Gaussian reaction delay between phase decisions — applied at `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and the block-broken transition; mean 4 ticks (~200 ms), σ=2. During the delay the body pauses but the camera keeps easing toward its last aim point (no stop-motion freeze)
+- Occasional long "breather" pause at `SCANNING→NAVIGATING`: with `longPauseChance` (default 4%) the standard reaction delay is replaced by a 12–25 tick pause — breaks the otherwise machine-constant cadence
 - Pre-attack commit hesitation: a 1–3 tick "I see it, I click" beat between both LOOKING gates firing and the first `startAttack`. Distinct from the old settle delay — tool sync already happens during the LOOKING camera turn, this is purely humanness
-- Micro-saccades during sustained aim (INTERACTING): ±0.5° yaw, ±0.3° pitch perturbations refreshed every ~12 ticks. Avoid the "frozen gaze" look while mining
+- Micro-saccades during sustained aim (INTERACTING and COLLECTING): ±0.5° yaw, ±0.3° pitch perturbations refreshed every ~12 ticks. Avoid the "frozen gaze" look while mining and while standing over drops
+- Gaze follows the work: POSITIONING walks while smoothly looking at the target block (no hard yaw snap); COLLECTING looks at the drop being collected / the expected drop position
+- Nearest-task routing: the next task is always the one closest to the bot's current position, not the scanner's fixed order — no zigzag routes across a gather area
 - Tool selection done in LOOKING tick 1 (carried-item packet travels in parallel with the camera turn, no separate tool-settle wait in INTERACTING)
 - Per-session "skill jitter": at `loadConfig` (world join), `HumanBehavior.rollSessionSkill` draws a Gaussian multiplier in [0.85, 1.15]. Multiplied into look-speed and divided out of reaction-delay so every session has slightly different baseline cadence — sometimes the bot is a touch faster, sometimes a touch slower
 
@@ -156,6 +167,7 @@ Humanness:
 - `lookSpeedMin/Max` — spring-acceleration multiplier rolled per new target (default 0.7–1.3)
 - `reactionDelayMeanTicks` / `reactionDelaySigmaTicks` / `reactionDelayMinTicks` / `reactionDelayMaxTicks` — clamped Gaussian for inter-phase reaction delay (default mean 4, σ=2, range [1, 10] ≈ 50–500 ms). Set mean and σ to 0 to disable.
 - `preAttackHesitationMin/Max` — uniform pre-attack hesitation ticks between LOOKING gate firing and first `startAttack` (default 1–3)
+- `longPauseChance` / `longPauseMinTicks` / `longPauseMaxTicks` — chance (default 0.04) that the SCANNING→NAVIGATING reaction delay becomes a longer uniform "breather" pause (default 12–25 ticks). Set chance to 0 to disable.
 
 Phases / timing:
 - `collectWaitMax` — hard timeout for COLLECTING if drops never become reachable (default 1200, covers delayed item-entity sync at 20x tickSpeed)

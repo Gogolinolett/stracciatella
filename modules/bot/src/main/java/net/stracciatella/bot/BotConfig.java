@@ -46,6 +46,15 @@ public class BotConfig {
     public int preAttackHesitationMin = 1;
     public int preAttackHesitationMax = 3;
 
+    // Occasional longer "breather" pause replacing the standard reaction delay
+    // at the SCANNING→NAVIGATING transition (the "spotted it, about to walk
+    // over" moment). A human doesn't keep a perfectly constant cadence — every
+    // now and then there's a beat of distraction before setting off. Chance is
+    // rolled once per transition. Set chance to 0 to disable.
+    public double longPauseChance = 0.04;
+    public int longPauseMinTicks = 12;
+    public int longPauseMaxTicks = 25;
+
     // Hard timeout for COLLECTING if drops never become reachable. Needs to
     // be large enough for the server→client item-entity sync under heavy load
     // (accelerated ticks amplify packet-queue backup).
@@ -96,6 +105,9 @@ public class BotConfig {
         this.reactionDelayMaxTicks = other.reactionDelayMaxTicks;
         this.preAttackHesitationMin = other.preAttackHesitationMin;
         this.preAttackHesitationMax = other.preAttackHesitationMax;
+        this.longPauseChance = other.longPauseChance;
+        this.longPauseMinTicks = other.longPauseMinTicks;
+        this.longPauseMaxTicks = other.longPauseMaxTicks;
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;
