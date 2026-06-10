@@ -26,7 +26,10 @@ stracciatella/
 ├── modules/                       # All game modules live here
 │   ├── build.gradle.kts           # Declares all modules for aggregation
 │   ├── core/                      # Core module — shared state, mixins
+│   ├── camera/                    # Camera module — human-like yaw/pitch smoothing
 │   ├── pathfinding/               # Pathfinding module — autonomous movement & parkour
+│   ├── bot/                       # Bot module — task execution + behavior layer
+│   ├── miner/                     # Miner module — specialized mining behaviors (diamond strip miner)
 │   ├── testing/                   # Testing framework — in-game integration tests
 │   ├── fullscreen/                # Fullscreen module — config and utilities
 │   └── anonymous-modlist/         # Anonymous mod list module
@@ -48,12 +51,16 @@ modules/<name>/
     └── ...                        # Module-specific packages
 ```
 
+**Cross-module class loading**: every module gets its own class loader; classes from other modules resolve through a parent fallback that only works once all modules are loaded — and the load ORDER of modules is not deterministic. The module main class is loaded with verification + `initialize=true` during the load phase, so it must not resolve other modules' types at class-load time. That includes more than static initializers: the bytecode VERIFIER loads classes for subtype checks anywhere in the main class's methods (e.g. `init()` passing an own type into a parameter typed by another module's interface). Safe pattern: keep the main class trivial — `init()` delegates to a separate setup class (see `MinerModule`/`MinerSetup`), which is only loaded when init() actually runs in the lifecycle phase, after all modules are present.
+
 ### Module Overview
 
 | Module | Purpose | Has CLAUDE.md |
 |--------|---------|---------------|
+| **bot** | Human-like task execution (mine/chop/gather) + behavior layer for strategies | Yes |
 | **camera** | Human-like camera movement (yaw/pitch smoothing, angle utilities) | Yes |
 | **core** | Shared state management, core mixins | No |
+| **miner** | Specialized mining behaviors on the bot's behavior layer (diamond strip miner) | Yes |
 | **pathfinding** | Autonomous player movement, mesh generation, A* pathfinding, parkour | Yes |
 | **testing** | In-game integration test framework with annotations and test runner | Yes |
 | **fullscreen** | Fullscreen configuration and utilities | No |
@@ -69,6 +76,14 @@ modules/<name>/
 - `PathCommands.java` — All `/path` subcommands
 - `PathDisplay.java` — In-game mesh/path rendering
 - `PathWalkerTests.java` — In-game integration tests for pathwalking
+
+**Bot**:
+- `BotController.java` — Task execution engine (static, tick-driven state machine)
+- `behavior/BehaviorRunner.java` — Registry + executor for long-running strategies (`BotBehavior`)
+- `task/TaskQueue.java` — Task queue with nearest-from-player selection
+
+**Miner**:
+- `DiamondMinerBehavior.java` — Diamond strip miner (LOCATE → DESCEND → TUNNEL), plans `MineBlockTask` batches on the BotController
 
 **Testing**:
 - `TestRunner.java` — Singleton test execution engine

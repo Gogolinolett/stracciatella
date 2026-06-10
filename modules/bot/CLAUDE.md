@@ -2,6 +2,13 @@
 
 Automation bot that uses pathfinding to navigate and perform tasks like mining ores, chopping trees, and gathering resources — all through simulated input for human-like behavior.
 
+## Layering
+
+Two layers, strictly separated:
+
+1. **Task layer** (`BotController` + `BotTask` queue) — executes one block interaction at a time with human-like camera movement, timing, tool selection and drop collection.
+2. **Behavior layer** (`behavior/`) — long-running strategies (strip mining, future farming/building) that decide *what to work on next*. A `BotBehavior` plans by enqueuing tasks and waiting for the controller to go idle; it must never simulate input itself. Registered via `BehaviorRunner.register(...)` (typically from a specialized module's init, e.g. `modules/miner`), started by id, at most one active. `BehaviorRunner.tick` runs before `BotController.tick` so a plan made this tick executes this tick. Stopping flows top-down: `/bot stop` stops the runner (which aborts the behavior) and then the controller — never the other way around.
+
 ## Architecture
 
 ```
@@ -18,6 +25,10 @@ net.stracciatella.bot
 │   ├── MineBlockTask.java          # Mine single block (complete when → air)
 │   ├── ChopTreeTask.java           # Mine tree logs top-to-bottom (multi-target)
 │   └── GatherAreaTask.java         # Meta-task: scan + enqueue mine/chop subtasks
+├── behavior/
+│   ├── BotBehavior.java            # Interface for long-running strategies (id, start, tick, abort, statusLine)
+│   ├── BehaviorStatus.java         # Enum: RUNNING, SUCCEEDED, FAILED
+│   └── BehaviorRunner.java         # Static registry + executor, one active behavior, ticked before BotController
 ├── interaction/
 │   ├── BlockInteractor.java        # Simulates attack/use key hold
 │   └── InventoryHelper.java        # Reads hotbar, selects best tool
@@ -51,7 +62,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **IDLE** | No active task, poll queue when new task enqueued | — |
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
-| **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block | `positionTimeout` |
+| **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block. After a failed look (`forceApproach`) it walks to close range (2.0) instead of reach distance — the re-approach exists to change the viewpoint | `positionTimeout` |
 | **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — the crosshair touching the block is when a human clicks; no angular convergence required (the camera keeps easing toward its aim point during INTERACTING). A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
@@ -87,15 +98,17 @@ If COLLECTING exits while the queue has more work, and the bot has ended up with
 
 ### Key integration points
 
-- **PathWalker**: Bot calls `PathWalker.start(path)` for navigation, monitors `PathWalker.isActive()`. Creates its own `CameraController` instance for aiming (separate from PathWalker's camera), and drives it via the high-level `aimAt` / `isAimedAt` APIs so no yaw/pitch math lives in the bot.
-- **MeshManager**: Bot queries `MeshManager.meshes` to find walkable standoff nodes near targets.
+- **PathWalker**: Bot calls `PathWalker.start(path)` for navigation, monitors `PathWalker.isActive()`. Creates its own `CameraController` instance for aiming (separate from PathWalker's camera), and drives it via the high-level `aimAt` / `isAimedAt` APIs so no yaw/pitch math lives in the bot. Targets within `reachDistance + 2.5` skip the pipeline entirely — POSITIONING walks the last couple of blocks directly (no pathfinding ceremony for two steps).
+- **MeshManager**: Bot queries `MeshManager.meshes` to find walkable standoff nodes near targets. Standoff scoring is line-biased (`1.05 × distToPlayer + horizDistToTarget`) so the chosen node lies on the straight player→target line — the player-nearest rule produced a visible sideways dog-leg right before the target.
 - **MeshPathfinder**: Bot uses A* to find paths from player to standoff positions.
 
 ## Block Interaction
 
 ### LOOKING → INTERACTING gate
 
-A single condition gates the transition: `mc.hitResult instanceof BlockHitResult` AND `bhr.getBlockPos().equals(target)` — the client's raycast actually lands on the target block. Mining starts the moment the crosshair touches the block (the way a human clicks), not once the camera has converged on its ideal aim point; the camera keeps easing toward the aim point during INTERACTING. The hit-result check carries the obstacle correctness: when something blocks the line of sight the raycast lands on the obstacle, the gate holds, and `lookTimeout` fails the task cleanly.
+A single condition gates the transition: `mc.hitResult instanceof BlockHitResult` AND `bhr.getBlockPos().equals(target)` — the client's raycast actually lands on the target block. Mining starts the moment the crosshair touches the block (the way a human clicks), not once the camera has converged on its ideal aim point; the camera keeps easing toward the aim point during INTERACTING. The hit-result check carries the obstacle correctness: when something blocks the line of sight the raycast lands on the obstacle and the gate holds.
+
+On the **first** look timeout per target the bot does not fail — it re-approaches: POSITIONING walks to close range (2.0 blocks, ignoring the reach-distance early exit) and LOOKING retries, the way a human steps up to a block they can't see from where they stand. The **second** timeout fails the task with diagnostics (player position, chosen face, actual raycast hit).
 
 The aim point is the center of the face most directly visible from the bot's eye (via `BlockInteractor.faceTowardPlayer`), not the block center — otherwise a raycast aimed at the center of a block sitting in the middle of a stack (e.g. the top log of a tree) lands on the neighbor and the hit-result gate never satisfies. Human-aim jitter is applied only on the two axes perpendicular to the face normal; jitter along the face normal would push the aim point off the face plane and cause the ray to graze a neighbor block instead.
 
@@ -106,9 +119,9 @@ Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while c
 Break detection requires TWO authoritative signals before considering the block broken:
 
 1. **Sustained-air window**: `level.getBlockState(pos).isAir()` for `CONFIG.airConfirmTicks` consecutive ticks (default 8). `getBlockState` returns the client's view which can be a sequenced-transaction prediction; the sustained window tolerates normal server-confirmation delay.
-2. **Drop-entity proof**: at least one item entity must have spawned within a 5×5×5 AABB around the target block. This is the authoritative server-side signal — a drop entity only exists if the server completed the break.
+2. **A break artifact** — either a drop entity observed within a 5×5×5 AABB around the target at any point since the break started (polled every tick and **latched**: standing next to the block, vanilla pickup inhales the drop within a tick of spawning), or growth of the main-inventory item count since break start (the pickup itself, server-driven via slot sync). Both only exist if the server completed the break.
 
-**Why the drop-entity check is necessary**: the client's block prediction can remain "air" long enough to pass the sustained-air window even when the server ultimately never broke the block (it reverts the client's prediction later). We observed `lastMinedPos state=iron_ore` at COLLECTING exit — the block had reverted to iron_ore on the client, proving the server never actually broke it. Without the drop check, the bot falsely "confirms" breaks on predictions the server rejects, resulting in missing drops.
+**Why the artifact check is necessary**: the client's block prediction can remain "air" long enough to pass the sustained-air window even when the server ultimately never broke the block (it reverts the client's prediction later). We observed `lastMinedPos state=iron_ore` at COLLECTING exit — the block had reverted to iron_ore on the client, proving the server never actually broke it. Without the artifact check, the bot falsely "confirms" breaks on predictions the server rejects, resulting in missing drops. The inventory-growth path exists because a once-after-air query missed instantly-inhaled drops and left the bot punching the already-broken block until `maxBreakTicks`.
 
 `airConfirmTicks` resets to 0 whenever the block is observed non-air. `maxBreakTicks` (default 400) caps INTERACTING — covers the slowest legit break + drop-spawn sync under load.
 
@@ -148,9 +161,9 @@ The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 
 | `/bot chop` | Chop looked-at tree |
 | `/bot gather ores [radius]` | Mine all ores in radius |
 | `/bot gather logs [radius]` | Chop all trees in radius |
-| `/bot stop` | Stop and clear queue |
+| `/bot stop` | Stop behavior layer, then controller; clears the queue |
 | `/bot pause` / `/bot resume` | Pause/resume |
-| `/bot status` | Show phase, task, queue |
+| `/bot status` | Show phase, task, queue, active behavior |
 | `/bot debug on\|off` | Toggle debug logging |
 
 ## Config

@@ -86,24 +86,53 @@ public class BlockInteractor {
     }
 
     /**
-     * Pick the face of {@code target} that faces the player's eye. Used as the
+     * Pick the face of {@code target} to aim at: of the (up to three) faces
+     * oriented toward the player's eye, the most directly facing one whose
+     * neighbor block is air — i.e. a face the raycast can actually reach.
+     * Plain axis dominance is not enough: for a floor block right in front
+     * of the feet the dominant face is UP, which is still covered by the
+     * block above it — the bot would stare at an invisible face until
+     * lookTimeout. If every candidate is covered, the dominant face is
+     * returned as fallback (callers clear the blockers first). Used as the
      * direction hint in the destroy-block packets and as the aim point in
-     * LOOKING (a raycast at the block center is blocked by neighboring solids
-     * — aiming at the exposed face guarantees the raycast lands on the target).
+     * LOOKING.
      */
     public static Direction faceTowardPlayer(Minecraft mc, BlockPos target) {
         double px = mc.player.getX();
         double py = mc.player.getEyeY();
         double pz = mc.player.getZ();
-        double cx = target.getX() + 0.5;
-        double cy = target.getY() + 0.5;
-        double cz = target.getZ() + 0.5;
-        double dx = px - cx;
-        double dy = py - cy;
-        double dz = pz - cz;
+        double dx = px - (target.getX() + 0.5);
+        double dy = py - (target.getY() + 0.5);
+        double dz = pz - (target.getZ() + 0.5);
+
+        Direction faceX = dx >= 0 ? Direction.EAST : Direction.WEST;
+        Direction faceY = dy >= 0 ? Direction.UP : Direction.DOWN;
+        Direction faceZ = dz >= 0 ? Direction.SOUTH : Direction.NORTH;
+
+        // Candidate faces sorted by how directly they point at the eye.
+        Direction[] byDominance = new Direction[3];
         double ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
-        if (ax >= ay && ax >= az) return dx >= 0 ? Direction.EAST : Direction.WEST;
-        if (ay >= ax && ay >= az) return dy >= 0 ? Direction.UP : Direction.DOWN;
-        return dz >= 0 ? Direction.SOUTH : Direction.NORTH;
+        if (ax >= ay && ax >= az) {
+            byDominance[0] = faceX;
+            byDominance[1] = ay >= az ? faceY : faceZ;
+            byDominance[2] = ay >= az ? faceZ : faceY;
+        } else if (ay >= ax && ay >= az) {
+            byDominance[0] = faceY;
+            byDominance[1] = ax >= az ? faceX : faceZ;
+            byDominance[2] = ax >= az ? faceZ : faceX;
+        } else {
+            byDominance[0] = faceZ;
+            byDominance[1] = ax >= ay ? faceX : faceY;
+            byDominance[2] = ax >= ay ? faceY : faceX;
+        }
+
+        if (mc.level != null) {
+            for (Direction face : byDominance) {
+                if (mc.level.getBlockState(target.relative(face)).isAir()) {
+                    return face;
+                }
+            }
+        }
+        return byDominance[0];
     }
 }

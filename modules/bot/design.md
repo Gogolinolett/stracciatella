@@ -1,5 +1,19 @@
 # Bot Module — Design Decisions
 
+## Behavior layer: strategies above the task queue
+
+**Decision**: Specialized long-running automation (strip mining, future farming/building, ...) lives in a new layer above the task queue: `BotBehavior` (interface: `id`, `start`, `tick → BehaviorStatus`, `abort`, `statusLine`) + static `BehaviorRunner` (registry, one active behavior, ticked from the bot module before `BotController.tick`). Behaviors plan by enqueuing `BotTask`s and waiting for the controller to go idle; they never simulate input themselves. Specialized modules (e.g. `modules/miner`) depend on the bot module and register their behaviors at init — the same registry pattern as the pathfinding module's `TravelMethod`/`Navigator`.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Grow BotController phases per use-case | No new layer | The controller's phases encode *how to interact with one block humanly* — mixing in *what to mine next over minutes* (strategy state machines) would bloat a class that is already the project's most delicate. Every new use-case would touch the same file. |
+| Meta-tasks in the queue (extend the GatherAreaTask pattern) | Reuses the queue | A queue entry is consumed once; strategies need to observe results and re-plan (scan → mine → verify → scan). GatherAreaTask already shows the limit: it can only pre-plan a static snapshot. |
+| Each module registers its own ClientTick hook, drives BotController ad-hoc | No bot-module change | Two modules could fight over the controller with no arbitration; no shared stop semantics (`/bot stop` couldn't stop them), no discoverability/status. |
+| Behavior layer with registry + single active slot (chosen) | Strategy and execution separate cleanly: behaviors own *what/where-next*, the controller owns *human-like how*. One active behavior at a time gives natural arbitration; `/bot stop` stops top-down (runner → controller); proven registry pattern in this codebase (Navigator). | One more concept and tick hook in the bot module. |
+
+Chose the behavior layer because the miner immediately needed observe-replan loops (verify each step, chase ore veins, fail fast on hazards) that neither the controller's phases nor one-shot queue entries can express, and the next specialized modules get the same seam for free.
+
 ## Camera behavior during reaction delays: ease out, don't freeze
 
 **Decision**: While a deferred-action reaction delay is in flight, the bot's camera keeps easing toward its last aim point (`aimCameraAt` records the point; the deferred gate replays it each tick). Movement keys stay released, but the gaze finishes its swing and keeps saccading.
@@ -57,6 +71,19 @@ Chose the conditional skip because the `itemAbsenceTicks` wait is solving a diff
 
 Chose the capped gaze because the walk steering needs item-directed yaw anyway, and capping only the downward pitch keeps both stories right: "I see the drop over there" at range, "I'm scanning the ground in front of me" up close.
 
+## Face selection: prefer exposed faces over the dominant axis
+
+**Decision**: `BlockInteractor.faceTowardPlayer` sorts the up-to-three player-oriented faces by how directly they point at the eye and returns the first whose neighbor block is air; only when all candidates are covered does it fall back to the dominant face.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Dominant axis only (original) | One comparison chain | For a floor block right in front of the feet, the dominant face is UP (eye height ≈ 1.6 over a block ~1 away) — but UP is still covered by the block above. The bot aims at an invisible face, the raycast hits the coverer, and the task burns the full lookTimeout before failing (observed as 11 look-timeout retries in a single miner test run). The strictly-closer side face was visible the whole time. |
+| Exposed-face preference, dominance-ordered (chosen) | Picks the face a human would click: the most direct one that is actually visible. Three cheap `isAir` checks per call; the destroy-packet direction hint improves consistently. Covered-everything falls back to dominance, which callers resolve by clearing blockers first. | An air neighbor doesn't guarantee a clear ray from the *eye* (other blocks can still intersect the path) — but the hit-result gate keeps protecting that case, and the heuristic removes the common systematic failure. |
+| Full raycast per candidate face | Exact visibility | A `level.clip` per face per LOOKING tick for a case three block reads already solve. |
+
+Chose the exposed-face preference because the dominant-axis bug was systematic (every floor-level block adjacent to the player misses on first attempt), while the fix is local, cheap, and strictly more accurate as a "which face can I see" estimate.
+
 ## INTERACTING break confirmation: sustained air + drop-entity proof
 
 **Decision**: INTERACTING requires two authoritative signals before transitioning out:
@@ -73,6 +100,8 @@ Chose the capped gaze because the walk steering needs item-directed yaw anyway, 
 | Higher `/tick rate` on server to outpace client | Eliminates the race at the source | Can starve other server work; not all dev machines support it |
 
 Chose "air + drop-entity" because it's the first approach that's **load-independent**. All the earlier attempts at tuning windows (3 → 8 → 16 → 32 → 48 ticks for `airConfirmTicks` or `toolSettleTicks`) passed in some runs and flaked in others depending on system load. The drop-entity check relies on an actual server-side artifact, not a timing assumption — the block broke iff the drop exists.
+
+**Companion change — latch the drop query and accept inventory growth**: the original implementation queried the drop AABB only once the sustained-air window was already satisfied. That has a hole when the bot stands right next to the block (gallery mining, close-range re-approach): vanilla pickup inhales the drop within a tick of spawning, so no post-air query ever sees it — the bot then kept attacking the already-broken block for the full `maxBreakTicks` (400 ticks = 20 s of punching air in real time; timestamped task-fail logs showed five such 400-tick stalls in one run). Two changes close it: (1) the AABB is polled every INTERACTING tick and **latched** (`dropSeenThisBreak`), so a drop that exists for even one tick counts; (2) growth of the main-inventory item count since break start is accepted as an alternative artifact — the pickup itself is server-driven (slot sync), so it proves the break as authoritatively as the entity did. A false positive would need the client's air prediction plus an unrelated simultaneous pickup; if the server then reverts, the planner's verify sees the solid block and re-plans, so the failure stays contained.
 
 ## LOOKING → INTERACTING gate: hit-result only
 
@@ -93,6 +122,22 @@ Chose hit-result only because both reported symptoms bracket the same truth: the
 **Companion change — clamp aim jitter to the face plane**: human-aim offsets are still applied, but only on the two axes perpendicular to the face normal. Adding offset *along* the face normal pushes the aim point off the face plane; the raycast then exits the block's face range by the offset amount and just barely grazes a neighbor (or the platform below a single block). The hit-result gate sees the neighbor and the bot stares forever — reported as "the bot doesn't start mining even when it looks at the right block". Restricting the jitter to the in-face axes keeps the visual humanization while guaranteeing the aim ray crosses the target's face rather than skirting it.
 
 **Companion change — no settle delay, no tool-settle**: once the hit-result gate fires, INTERACTING starts the same tick — there is no cosmetic settle countdown after aim. The tool-settle wait that used to live at the start of INTERACTING is also gone, replaced by selecting the tool during LOOKING. The carried-item packet (and any inventory-swap packet from B1) travels to the server in parallel with the smooth camera turn, so by the time aim is achieved the server has already had the entire LOOKING duration to apply the slot change. INTERACTING calls `resendCarriedItem` once on tick 1 as a dropped-packet safety net, then proceeds straight to `startDestroyBlock`. Reported feedback: "adjust → mine" instead of "adjust → start mining" — the transition now reads as one motion rather than two.
+
+## Look timeout: re-approach once before failing
+
+**Decision**: When LOOKING times out (the crosshair raycast never reached the target), the first timeout per target does not fail the task — it sets `forceApproach` and transitions to POSITIONING, which then walks until the player is within `APPROACH_CLOSE_DISTANCE` (2.0) of the target instead of stopping at reach distance, and retries LOOKING. The second timeout fails with diagnostics (position, chosen face, actual hitResult).
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Fail on first look timeout (original) | Simple | The controller had no "in reach but no line of sight → move" path: POSITIONING stops at reach distance (4), so a target visible only from close up (e.g. a gallery block below eye level whose ceiling blocks the ray from a staircase ledge) failed forever no matter how often the planner retried — observed as repeated look timeouts at identical player positions in the miner. A human just steps closer. |
+| Re-approach once, then fail (chosen) | Fixes the systematic viewpoint problem for every consumer (bot commands, behaviors); bounded — one extra POSITIONING walk per target, the second timeout still fails cleanly. The obstacle-blocked case keeps failing (walking into the wall never reaches close range; the eventual retry times out again). | Adds ~40–100 ticks before a genuinely impossible target fails. |
+| Planner-side position gates (tried in the miner first) | No controller change | Whack-a-mole: the player's position at plan time differs from execution time (collect-walks, edge-standing on stair lips), so the planner cannot guarantee the viewpoint. The execution layer is the only place that knows the look failed. |
+| Raycast visibility pre-check before enqueuing | Catches it earlier | Duplicates what LOOKING already discovers; the answer ("from where?") still requires moving, which is exactly the re-approach. |
+
+Chose the one-shot re-approach because "step closer when you can't see it" is both the human behavior and the only fix that works at the layer where visibility is actually determined.
+
+**Companion change — fire early on a stuck crosshair**: waiting out the full `lookTimeout` (40 ticks = 2 s at real speed) before re-approaching reads as staring. Once the camera has settled on its aim point (angular ≤ 3°) and the crosshair has rested on the *same* wrong block for `WRONG_HIT_STREAK_TICKS` (8) consecutive ticks, the geometry is not going to change — the re-approach fires immediately. The full timeout remains the fallback for non-block hit results (sky) and as the second, failing attempt.
 
 ## Long-pause patterns: occasional breather at SCANNING→NAVIGATING
 
@@ -121,6 +166,32 @@ Chose the single-transition application to get a visible cadence-breaker with bo
 | Nearest with random second-choice ("imperfect human") | Models human suboptimality | Deliberately re-introduces the zigzag the change removes; randomness in *route choice* (vs. timing/aim) reads as erratic, not human. |
 
 Chose greedy nearest because the visible failure mode was routing, and nearest-from-here is both the simplest fix and the most human-plausible heuristic.
+
+## Standoff node selection: stay on the player→target line
+
+**Decision**: `findStandoffNode` scores candidate nodes (in reach of the target) by `1.05 × distToPlayer + horizDistToTarget` and takes the minimum. By the triangle inequality the sum is minimal for nodes on the straight player→target line; the slight walk-distance bias makes the winner the *first* in-reach node on that line (and deterministic — all line nodes share the same raw sum, so an unbiased score would fall back to hash iteration order).
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Player-nearest in-reach node (original) | Shortest walk | Regularly picks a node one block to the side of the approach line (whichever in-reach node happens to be closest to where the player stands). Debug path traces showed the walk going straight at the target and then dog-legging sideways for the last two nodes — the reported "weird pathfinding" in the ore→tree test. No human side-steps right before a target. |
+| Line-biased score (chosen) | Walks read as "straight at the target, stop in front of it". One multiply more per node. | The chosen node can be ~5% farther than the absolute nearest — irrelevant at reach distances. |
+| Target-nearest in-reach node | Also line-ish | Walks PAST the natural stopping point right up to the block, which reads overeager and risks bumping into the target. |
+
+Chose the line bias because the dog-leg was pure artifact of the scoring, not of the mesh or A* — the path was the true shortest route to a badly chosen destination.
+
+## Short-hop navigation: skip the pathfinding ceremony
+
+**Decision**: `beginNavigation` sends targets within `reachDistance + 2.5` blocks straight to POSITIONING (walk at the target, hand over to LOOKING once in reach) instead of standoff search + A* + PathWalker.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Always use the full pipeline (original) | One code path | Debug traces showed PathWalker launched for a 1.5-block, two-node path whose first node was the player's own position — scan swing, reaction delay, walker start, final settling, all for one step. Reads as mechanical orchestration where a player just takes two steps. |
+| POSITIONING shortcut for short hops (chosen) | The last-couple-blocks walk is literally what POSITIONING is: walk toward the target while looking at it, stop when in reach. No new mechanics. | POSITIONING walks blind (no mesh) — fine for a couple of blocks on terrain the bot is already standing on; longer routes keep the full pipeline. |
+| Raise reachDistance instead | Even simpler | Changes mining semantics everywhere (server reach limits); the problem is route ceremony, not reach. |
+
+Chose the shortcut because POSITIONING already implements the human behavior exactly, and the threshold keeps real navigation (drops, obstacles, distance) on the mesh pipeline.
 
 ## Tool search scope: full main inventory with hotbar swap
 

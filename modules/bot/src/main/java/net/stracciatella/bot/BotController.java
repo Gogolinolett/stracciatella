@@ -61,6 +61,22 @@ public class BotController {
     // the LOOKING gates firing and the first startAttack. -1 means inactive.
     private static int preAttackHesitationRemaining = -1;
 
+    // One re-approach per target: when LOOKING can't get the raycast onto
+    // the target (typically aimed from a spot where another block covers
+    // it), walk closer once and retry instead of failing. A human steps up
+    // to a block they can't see from where they stand. The decision fires
+    // early — once the camera has settled and the crosshair has rested on
+    // the same wrong block for a streak of ticks, waiting out the full
+    // lookTimeout is just staring. The second failure fails the task.
+    // forceApproach makes POSITIONING walk to close range instead of
+    // stopping at reach distance.
+    private static boolean lookRetryUsed = false;
+    private static boolean forceApproach = false;
+    private static int wrongHitStreak = 0;
+    private static BlockPos lastWrongHit = null;
+    private static final double APPROACH_CLOSE_DISTANCE = 2.0;
+    private static final int WRONG_HIT_STREAK_TICKS = 8;
+
     // Deferred-action mechanism: when a phase decides to transition, it can
     // request a Gaussian-distributed reaction delay first. During the delay
     // the current phase's tick logic is skipped (the bot "freezes" briefly,
@@ -95,6 +111,15 @@ public class BotController {
     // server confirmed the break (not just client-side prediction, which gets
     // reverted if the server rejects the break under accelerated ticks).
     private static int airConfirmTicks = 0;
+    // Latched true when a drop entity has been observed near the target at
+    // any point during this break. The drop must be polled every tick: when
+    // the bot stands right next to the block (gallery mining, re-approach),
+    // vanilla pickup inhales the drop before a once-after-air-confirm query
+    // would ever see it.
+    private static boolean dropSeenThisBreak = false;
+    // Total main-inventory item count at break start. A pickup raises it —
+    // a server-authoritative break signal for exactly the inhaled-drop case.
+    private static int breakStartInventoryCount = 0;
 
     public enum Phase {
         IDLE,
@@ -141,6 +166,8 @@ public class BotController {
         deferredActionDelay = 0;
         preAttackHesitationRemaining = -1;
         hasLastAim = false;
+        lookRetryUsed = false;
+        forceApproach = false;
         releaseMovementKeys();
         LOGGER.info("Bot stopped");
     }
@@ -262,6 +289,7 @@ public class BotController {
     private static void tickPositioning(Minecraft client, LocalPlayer player) {
         if (phaseTicks > CONFIG.positionTimeout) {
             // If we're within a generous distance, try looking anyway
+            forceApproach = false;
             if (isWithinReach(player, currentTask.targetPos())) {
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
             } else {
@@ -270,8 +298,12 @@ public class BotController {
             return;
         }
 
-        // Check if we're within reach — reaction beat before LOOKING starts.
-        if (isWithinReach(player, currentTask.targetPos())) {
+        // Close enough? Reaction beat before LOOKING starts. After a failed
+        // look (forceApproach) "close enough" means close range, not reach —
+        // the whole point of the re-approach is to change the viewpoint.
+        double closeEnough = forceApproach ? APPROACH_CLOSE_DISTANCE : CONFIG.reachDistance;
+        if (distanceToTarget(player, currentTask.targetPos()) <= closeEnough) {
+            forceApproach = false;
             scheduleAction(() -> transitionTo(Phase.LOOKING));
             return;
         }
@@ -296,6 +328,30 @@ public class BotController {
 
     private static void tickLooking(Minecraft client, LocalPlayer player) {
         if (phaseTicks > CONFIG.lookTimeout) {
+            if (!lookRetryUsed) {
+                // Couldn't get the raycast onto the target from here — step
+                // closer once and try again, the way a human would.
+                lookRetryUsed = true;
+                forceApproach = true;
+                if (CONFIG.debugEnabled) {
+                    LOGGER.info("Look timeout — re-approaching {}", currentTask.targetPos());
+                }
+                transitionTo(Phase.POSITIONING);
+                return;
+            }
+            // Failure-only diagnostics: where the bot stood, which face it
+            // aimed for, and what the crosshair raycast actually hit.
+            BlockPos t = currentTask.targetPos();
+            net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, t);
+            HitResult hr = client.hitResult;
+            String hit = hr instanceof BlockHitResult bhr
+                    ? bhr.getBlockPos().toShortString() + " (" + bhr.getDirection() + ")"
+                    : String.valueOf(hr == null ? null : hr.getType());
+            LOGGER.warn("Look timeout diagnostics: target={} face={} player=({}, {}, {}) hitResult={}",
+                    t.toShortString(), face,
+                    String.format(java.util.Locale.US, "%.2f", player.getX()),
+                    String.format(java.util.Locale.US, "%.2f", player.getY()),
+                    String.format(java.util.Locale.US, "%.2f", player.getZ()), hit);
             failCurrentTask("Look timeout — could not aim at target");
             return;
         }
@@ -314,6 +370,8 @@ public class BotController {
             aimOffsetY = HumanBehavior.randomAimOffset(CONFIG);
             aimOffsetZ = HumanBehavior.randomAimOffset(CONFIG);
             preAttackHesitationRemaining = -1;
+            wrongHitStreak = 0;
+            lastWrongHit = null;
             // Select the tool now so the carried-item (and any inventory-swap)
             // packets travel to the server *in parallel* with the smooth
             // camera turn. By the time the hit-result gate fires, the server
@@ -363,6 +421,33 @@ public class BotController {
         // raycast lands on the obstacle and the gate holds (lookTimeout
         // fails the task cleanly if it never clears).
         boolean aimedHit = isHitResultOnTarget(client, target);
+        if (!aimedHit) {
+            // Early re-approach: the camera has settled on its aim point but
+            // the crosshair keeps resting on the same other block — the
+            // geometry won't change by staring, so step closer now instead
+            // of waiting out the full lookTimeout.
+            boolean aimSettled = camera.isAimedAt(player, tx, ty, tz, offX, offY, offZ, 3.0f);
+            BlockPos hitBlock = client.hitResult instanceof BlockHitResult bhr
+                    ? bhr.getBlockPos() : null;
+            if (aimSettled && hitBlock != null && hitBlock.equals(lastWrongHit)) {
+                wrongHitStreak++;
+            } else {
+                wrongHitStreak = aimSettled && hitBlock != null ? 1 : 0;
+            }
+            lastWrongHit = hitBlock;
+            if (wrongHitStreak >= WRONG_HIT_STREAK_TICKS && !lookRetryUsed) {
+                lookRetryUsed = true;
+                forceApproach = true;
+                wrongHitStreak = 0;
+                if (CONFIG.debugEnabled) {
+                    LOGGER.info("Crosshair stuck on {} — re-approaching {}", hitBlock, target);
+                }
+                transitionTo(Phase.POSITIONING);
+                return;
+            }
+        } else {
+            wrongHitStreak = 0;
+        }
         if (aimedHit) {
             // Pre-attack commit hesitation: between the moment both gates
             // fire and the first startAttack, a human pauses ~50-150 ms (the
@@ -417,6 +502,8 @@ public class BotController {
         // sub-targets like sequential tree logs).
         if (phaseTicks == 1) {
             airConfirmTicks = 0;
+            dropSeenThisBreak = false;
+            breakStartInventoryCount = countMainInventory(player);
             // Defensive re-send in case the packet was dropped while turning.
             InventoryHelper.resendCarriedItem(player);
             // Sustained aim during mining is when "frozen gaze" reads as bot.
@@ -460,24 +547,31 @@ public class BotController {
         // reverts, we require two things:
         //   1. The block must remain air for `airConfirmTicks` consecutive
         //      ticks (sustained-air window).
-        //   2. A drop entity must have spawned nearby — an authoritative
-        //      signal that the server actually completed the break.
-        // If the server reverts, either check fails and we keep mining.
+        //   2. A server-authoritative break artifact: a drop entity observed
+        //      near the target at ANY point since the break started
+        //      (latched, polled every tick — when the bot stands right next
+        //      to the block, vanilla pickup inhales the drop within a tick),
+        //      OR the main inventory grew since the break started (the
+        //      pickup itself, also server-driven via slot sync). Without the
+        //      latch+inventory path the bot kept attacking the already-broken
+        //      block for the full maxBreakTicks — "punching air".
+        // If the server reverts, the air check fails and we keep mining.
         boolean isAir = currentTask.isCurrentTargetComplete(level);
         if (isAir) {
             airConfirmTicks++;
         } else {
             airConfirmTicks = 0;
         }
-        boolean dropNearby = false;
-        if (airConfirmTicks >= CONFIG.airConfirmTicks) {
+        if (!dropSeenThisBreak) {
             net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
                     target.getX() - 2, target.getY() - 2, target.getZ() - 2,
                     target.getX() + 3, target.getY() + 3, target.getZ() + 3);
-            dropNearby = !client.level.getEntities(
+            dropSeenThisBreak = !client.level.getEntities(
                     net.minecraft.world.entity.EntityType.ITEM, box, e -> true).isEmpty();
         }
-        if (airConfirmTicks >= CONFIG.airConfirmTicks && dropNearby) {
+        boolean breakArtifact = dropSeenThisBreak
+                || countMainInventory(player) > breakStartInventoryCount;
+        if (airConfirmTicks >= CONFIG.airConfirmTicks && breakArtifact) {
             BlockInteractor.stopInteraction();
 
             if (CONFIG.debugEnabled) {
@@ -493,6 +587,7 @@ public class BotController {
 
             // Sub-targets remaining in same task (e.g. tree logs) — mine next next
             if (currentTask.advanceToNextTarget()) {
+                lookRetryUsed = false;
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
                 return;
             }
@@ -510,6 +605,7 @@ public class BotController {
                             ? taskQueue.pollNearest(p.blockPosition())
                             : taskQueue.poll();
                     taskTotalTicks = 0;
+                    lookRetryUsed = false;
                     transitionTo(Phase.LOOKING);
                 });
             } else {
@@ -665,6 +761,7 @@ public class BotController {
                         ? taskQueue.pollNearest(player.blockPosition())
                         : taskQueue.poll();
                 taskTotalTicks = 0;
+                lookRetryUsed = false;
                 // tickCollecting walks toward the next task while items
                 // settle, so by the time we exit we may already be in reach.
                 // Skip SCANNING in that case — the human-like "look at next
@@ -751,6 +848,15 @@ public class BotController {
             return;
         }
 
+        // Just-out-of-reach targets need a step or two, not a pathfinding
+        // ceremony: POSITIONING walks straight at the target while looking
+        // at it and hands over to LOOKING the moment it's in reach — which
+        // is exactly what a player does for the last couple of blocks.
+        if (distanceToTarget(player, target) <= CONFIG.reachDistance + 2.5) {
+            transitionTo(Phase.POSITIONING);
+            return;
+        }
+
         MeshNode standoff = findStandoffNode(player, target);
         if (standoff == null) {
             transitionTo(Phase.POSITIONING);
@@ -830,6 +936,8 @@ public class BotController {
         }
 
         taskTotalTicks = 0;
+        lookRetryUsed = false;
+        forceApproach = false;
         if (CONFIG.debugEnabled) {
             LOGGER.info("Starting task: {}", currentTask.description());
         }
@@ -877,6 +985,8 @@ public class BotController {
         deferredAction = null;
         deferredActionDelay = 0;
         preAttackHesitationRemaining = -1;
+        lookRetryUsed = false;
+        forceApproach = false;
 
         // Try next task
         if (!taskQueue.isEmpty() && !paused) {
@@ -933,16 +1043,38 @@ public class BotController {
     }
 
     private static boolean isWithinReach(LocalPlayer player, BlockPos target) {
-        double dx = (target.getX() + 0.5) - player.getX();
-        double dy = (target.getY() + 0.5) - player.getEyeY();
-        double dz = (target.getZ() + 0.5) - player.getZ();
-        double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        return distance <= CONFIG.reachDistance;
+        return distanceToTarget(player, target) <= CONFIG.reachDistance;
     }
 
     /**
-     * Find the nearest walkable mesh node to the given position within reach
-     * of the target block.
+     * Total item count across the 36 main inventory slots. Used as a break
+     * artifact: a pickup between break start and now proves the server
+     * completed a break even when the drop entity was inhaled before any
+     * tick could observe it.
+     */
+    private static int countMainInventory(LocalPlayer player) {
+        int count = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            count += player.getInventory().getItem(slot).getCount();
+        }
+        return count;
+    }
+
+    private static double distanceToTarget(LocalPlayer player, BlockPos target) {
+        double dx = (target.getX() + 0.5) - player.getX();
+        double dy = (target.getY() + 0.5) - player.getEyeY();
+        double dz = (target.getZ() + 0.5) - player.getZ();
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /**
+     * Find a walkable mesh node within reach of the target block to stand on.
+     * Scored by walk distance PLUS horizontal node→target distance: by the
+     * triangle inequality that prefers nodes ON the straight player→target
+     * line. Picking purely the player-nearest node (the old rule) regularly
+     * chose a node one block to the side, so the walk went straight at the
+     * target and then visibly dog-legged sideways for the last two blocks.
+     * A human walks the straight line and stops in front of the target.
      */
     private static MeshNode findStandoffNode(LocalPlayer player, BlockPos target) {
         HashMap<ChunkCoordinate, Mesh> meshesForPlayer = MeshManager.meshes.get(player);
@@ -951,7 +1083,7 @@ public class BotController {
         }
 
         MeshNode best = null;
-        double bestDist = Double.MAX_VALUE;
+        double bestScore = Double.MAX_VALUE;
         double maxReach = CONFIG.reachDistance;
 
         // Search in chunks around the target
@@ -978,12 +1110,18 @@ public class BotController {
                         continue;
                     }
 
-                    // Pick the node closest to the player
-                    double pdx = node.getX() - player.getX();
-                    double pdz = node.getZ() - player.getZ();
-                    double distToPlayer = pdx * pdx + pdz * pdz;
-                    if (distToPlayer < bestDist) {
-                        bestDist = distToPlayer;
+                    double pdx = (node.getX() + 0.5) - player.getX();
+                    double pdz = (node.getZ() + 0.5) - player.getZ();
+                    double distToPlayer = Math.sqrt(pdx * pdx + pdz * pdz);
+                    double horizToTarget = Math.sqrt(ndx * ndx + ndz * ndz);
+                    // Slight walk-distance bias: every node on the straight
+                    // line has the same sum, so without it the winner among
+                    // line nodes would be hash-order — with it, it's the
+                    // first in-reach node on the line (a human stops as soon
+                    // as they're close enough).
+                    double score = 1.05 * distToPlayer + horizToTarget;
+                    if (score < bestScore) {
+                        bestScore = score;
                         best = node;
                     }
                 }

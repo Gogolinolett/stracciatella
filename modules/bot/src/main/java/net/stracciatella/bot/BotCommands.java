@@ -15,6 +15,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
+import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.bot.scan.BlockScanner;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
@@ -89,8 +90,10 @@ public class BotCommands {
                                         .executes(context -> gatherLogs(context.getSource().getPlayer(), context.getSource().getWorld(),
                                                 IntegerArgumentType.getInteger(context, "radius"), context.getSource())))))
 
-                // /bot stop
+                // /bot stop — stops the behavior layer first (it would
+                // otherwise immediately re-plan new tasks), then the controller.
                 .then(literal("stop").executes(context -> {
+                    BehaviorRunner.stop();
                     BotController.stop();
                     context.getSource().sendFeedback(Component.literal("Bot stopped"));
                     return 1;
@@ -120,6 +123,7 @@ public class BotCommands {
                         status += "\nTask: " + BotController.getCurrentTask().description();
                     }
                     status += "\nQueue: " + BotController.getTaskQueue().size() + " tasks";
+                    status += "\nBehavior: " + BehaviorRunner.statusLine();
                     context.getSource().sendFeedback(Component.literal(status));
                     return 1;
                 }))

@@ -32,6 +32,7 @@ includeModule("camera")
 includeModule("pathfinding")
 includeModule("testing")
 includeModule("bot")
+includeModule("miner")
 
 fun includeModule(path: String) {
     include("modules:$path")
