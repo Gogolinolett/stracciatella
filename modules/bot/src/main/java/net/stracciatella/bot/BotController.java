@@ -353,19 +353,17 @@ public class BotController {
 
         aimCameraAt(player, tx + offX, ty + offY, tz + offZ);
 
-        // Two gates before transitioning to INTERACTING:
-        //   1. Angular: camera direction within facingTolerance of target vector.
-        //   2. HitResult: the client's raycast actually lands on the target block.
-        // The angular check alone isn't enough — when an obstacle stands in the
-        // line of sight, the camera can be aimed within tolerance while the
-        // raycast hits the obstacle. The bot would visibly start attacking the
-        // wrong block before the camera converged further. Requiring both gates
-        // means the settle countdown only progresses once the bot can actually
-        // see the target.
-        boolean aimedAngular = camera.isAimedAt(player, tx, ty, tz,
-                offX, offY, offZ, (float) CONFIG.facingTolerance);
+        // Single gate before transitioning to INTERACTING: the client's
+        // raycast actually lands on the target block. A human starts mining
+        // the moment the crosshair touches the block — not once the camera
+        // has settled on its ideal aim point — so no angular convergence is
+        // required; the camera keeps easing toward the aim point during
+        // INTERACTING. The hit-result check is authoritative for "am I
+        // looking at it": when an obstacle blocks the line of sight the
+        // raycast lands on the obstacle and the gate holds (lookTimeout
+        // fails the task cleanly if it never clears).
         boolean aimedHit = isHitResultOnTarget(client, target);
-        if (aimedAngular && aimedHit) {
+        if (aimedHit) {
             // Pre-attack commit hesitation: between the moment both gates
             // fire and the first startAttack, a human pauses ~50-150 ms (the
             // "I've locked on, now I click" beat). This is distinct from the

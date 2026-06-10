@@ -53,6 +53,7 @@ PathWalker is entirely **static**. It simulates keyboard input (forward, sprint,
 - **`longRangeJump`** = effectiveGap ≥ 5. Uses collision-based edge detection instead of simulation. Gap=4 uses simulation (collision-edge overshoots single-block platforms at that distance)
 - **Node arrival**: sphere check (distance < 0.18) OR box check within block bounds with 0.15 margin. The **final node** instead counts as arrived when standing within 0.5 of the true block center (target offset excluded) at low residual speed (≤ 0.12 b/t) — no walk-to-center after landing; re-centering made the bot visibly pirouette around the center point
 - **Final-node settling**: while standing inside the final arrival disc but still above the 0.12 speed gate, target steering is skipped entirely — the camera yaw is held (spring settles, no turn) and the 8-way counter-brake kills the momentum until arrival fires. Without this, the desired yaw orbits the walk target during the brake-out ticks and the camera follows (the post-landing pirouette)
+- **Desired-yaw freeze near nodes**: below 0.5 blocks horizontal distance the atan2 yaw target flips ~180° when stepping past the point — `stableDesiredYaw` freezes the target at its last stable value through that zone (movement aim + landing-brake retarget). Combined with the camera module's 35°/tick angular-velocity cap, this removes the remaining one-tick gaze snaps
 - **Target offset**: random X/Z offset (0.05–0.25) added for natural-looking movement, suppressed for long jumps
 
 ### Jump decision system (`shouldJumpNow()`)

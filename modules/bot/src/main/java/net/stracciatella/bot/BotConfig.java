@@ -83,9 +83,6 @@ public class BotConfig {
     // Block scan radius
     public int scanRadius = 32;
 
-    // Facing tolerance for aim convergence (degrees)
-    public double facingTolerance = 5.0;
-
     // Maximum reach distance for mining
     public double reachDistance = 4.0;
 
@@ -124,7 +121,6 @@ public class BotConfig {
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;
         this.scanRadius = other.scanRadius;
-        this.facingTolerance = other.facingTolerance;
         this.reachDistance = other.reachDistance;
         this.maxBreakTicks = other.maxBreakTicks;
         this.navigateTimeout = other.navigateTimeout;

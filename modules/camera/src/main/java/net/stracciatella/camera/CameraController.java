@@ -27,6 +27,12 @@ public class CameraController {
     // Spring physics for yaw rotation (critically damped at default multiplier=1.0)
     private static final float TURN_ACCEL = 0.8f;
     private static final float TURN_FRICTION = 0.8f;
+    // Hard cap on yaw angular velocity (degrees per tick, scaled by the
+    // look-speed multiplier). Without it the spring's first tick after a large
+    // target change moves 0.8 × delta — a 180° flip becomes a 144° one-tick
+    // snap, which is exactly the "teleporting gaze" the spring exists to
+    // avoid. 35°/t ≈ 700°/s: a brisk but visibly continuous mouse turn.
+    private static final float MAX_YAW_SPEED_DEG_PER_TICK = 35.0f;
 
     // Spring physics for pitch rotation (gentler — vertical tracking should feel calmer)
     private static final float PITCH_ACCEL = 0.5f;
@@ -129,6 +135,16 @@ public class CameraController {
         float accel = (float) (TURN_ACCEL * lookSpeedMultiplier);
         yawAccel = delta * accel - yawVelocity * TURN_FRICTION;
         yawVelocity += yawAccel;
+        // Cap the angular velocity so large target changes turn the head over
+        // several ticks instead of arriving almost-instantly on the first
+        // spring tick. Scaled by the multiplier so per-target speed variance
+        // survives the saturated phase of big turns.
+        float maxSpeed = (float) (MAX_YAW_SPEED_DEG_PER_TICK * lookSpeedMultiplier);
+        if (yawVelocity > maxSpeed) {
+            yawVelocity = maxSpeed;
+        } else if (yawVelocity < -maxSpeed) {
+            yawVelocity = -maxSpeed;
+        }
         yaw += yawVelocity;
         return yaw;
     }

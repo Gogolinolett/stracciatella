@@ -106,8 +106,9 @@ public class BotTests {
             return true;
         });
         waitForBotIdle(ctx);
-        // Logs drop right at the player's feet — collect at least 1
-        waitForItem(ctx, Items.OAK_LOG, 1, "oak logs");
+        // The test only ends when EVERY felled log has been picked up —
+        // 4 logs mined, 4 logs in the inventory.
+        waitForItem(ctx, Items.OAK_LOG, 4, "oak logs");
         LOGGER.info("Tree chop test passed (collected {} oak logs)", countItem(ctx, Items.OAK_LOG));
     }
 
@@ -259,8 +260,9 @@ public class BotTests {
             return true;
         });
         waitForBotIdle(ctx);
+        // All resources must be collected: 1 stone block and all 3 felled logs.
         waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
-        waitForItem(ctx, Items.OAK_LOG, 1, "oak logs");
+        waitForItem(ctx, Items.OAK_LOG, 3, "oak logs");
         LOGGER.info("Walk mine walk chop test passed");
     }
 

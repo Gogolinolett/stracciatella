@@ -136,6 +136,19 @@ Chose the gated offset because the pitch-variance behaviour is a "scanning the p
 
 Chose the gap≥5 + standstill gate because (1) it matches the visual cue a human gives at a long jump, and (2) it's mechanically aligned with the retreat phase which already requires the bot to stop. The hesitation is realised in the same `if (maxJumpPhase == 0)` branch, sharing its state.
 
+## Desired-yaw freeze at sub-half-block target distance
+
+**Decision**: `stableDesiredYaw(aimDx, aimDz)` returns the atan2 yaw toward the aim vector, but freezes at its last stable value while the horizontal distance is below 0.5 blocks. Used for the main movement desired-yaw and the landing-brake retarget; reset on `start()`.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Raw atan2 every tick (original) | No state | Within ~0.5 blocks of a node, stepping past the point flips the yaw target by up to 180° between ticks. The camera whips after every flip (with the velocity cap: a fast sweep; without: a snap). Happens at overflown intermediate nodes (airborne advance denied at sharp turns), during landing-brake slides toward a close node, and was the engine of the post-landing pirouette. |
+| Freeze below 0.5 blocks (chosen) | The gaze keeps its last meaningful direction through the unstable zone; node advance or genuine separation resets it naturally. One float + one boolean of state. | While frozen, the gaze can be slightly stale if the player drifts sideways — irrelevant at sub-half-block range where any direction reads as "looking at the node". |
+| Slerp/low-pass the desired yaw | Smooths flips too | Adds lag to *all* target changes including legitimate course corrections; the instability is strictly a near-field problem, so a distance gate is the precise tool. |
+
+Chose the freeze because the yaw target is simply not meaningful information at sub-half-block range — any human looks "at the block underfoot" without re-aiming at its mathematical center point.
+
 ## EnderPearl test cooldown gating
 
 **Decision**: `EnderPearlTests` waits on the client-side `ItemCooldowns` (synced from the server via `ClientboundCooldownPacket`) and then adds a 30-tick safety margin before calling `EnderPearlTravelMethod.start()`; the travel method itself does not check or clear the cooldown.

@@ -52,7 +52,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block | `positionTimeout` |
-| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the angular `isAimedAt(facingTolerance)` check passes **and** the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target. A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
+| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — the crosshair touching the block is when a human clicks; no angular convergence required (the camera keeps easing toward its aim point during INTERACTING). A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
 
@@ -95,12 +95,7 @@ If COLLECTING exits while the queue has more work, and the bot has ended up with
 
 ### LOOKING → INTERACTING gate
 
-Two conditions must both hold before LOOKING transitions to INTERACTING:
-
-1. **Angular**: `CameraController.isAimedAt(..., facingTolerance)` — camera vector within tolerance of target vector.
-2. **HitResult**: `mc.hitResult instanceof BlockHitResult` AND `bhr.getBlockPos().equals(target)` — the client's raycast actually lands on the target block.
-
-The angular check alone is insufficient: when an obstacle stands in the line of sight, the camera can be aimed within `facingTolerance` of the target vector while the raycast still hits the obstacle (visible to the player as the bot starting to attack the wrong block before correcting). Requiring both gates means the settle countdown only progresses once the bot can actually see the target. If line-of-sight is permanently blocked, `lookTimeout` fails the task cleanly.
+A single condition gates the transition: `mc.hitResult instanceof BlockHitResult` AND `bhr.getBlockPos().equals(target)` — the client's raycast actually lands on the target block. Mining starts the moment the crosshair touches the block (the way a human clicks), not once the camera has converged on its ideal aim point; the camera keeps easing toward the aim point during INTERACTING. The hit-result check carries the obstacle correctness: when something blocks the line of sight the raycast lands on the obstacle, the gate holds, and `lookTimeout` fails the task cleanly.
 
 The aim point is the center of the face most directly visible from the bot's eye (via `BlockInteractor.faceTowardPlayer`), not the block center — otherwise a raycast aimed at the center of a block sitting in the middle of a stack (e.g. the top log of a tree) lands on the neighbor and the hit-result gate never satisfies. Human-aim jitter is applied only on the two axes perpendicular to the face normal; jitter along the face normal would push the aim point off the face plane and cause the ray to graze a neighbor block instead.
 
@@ -177,7 +172,6 @@ Phases / timing:
 - `scanTimeout` — max ticks to look toward next target before walking (30)
 - `scanFacingTolerance` — degrees tolerance for scan convergence (15.0)
 - `scanRadius` — block scan radius
-- `facingTolerance` — degrees tolerance for LOOKING angular gate (default 5.0)
 - `reachDistance` — max mining reach (4.0)
 - `maxBreakTicks` — interaction timeout (default 400, must cover mine + drop-spawn wait)
 - `navigateTimeout` / `positionTimeout` / `lookTimeout` — per-phase deadlines

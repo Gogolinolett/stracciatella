@@ -89,3 +89,17 @@ Chose scale-acceleration-only because the overshoot at `m > 1` is exactly the hu
 | Keep asymmetric (old: spring yaw, exponential pitch) | What we had | Different "feel" on each axis is visible — a viewer can tell yaw is heavier than pitch; multiplier/saccade plumbing would need duplicate code paths |
 
 Chose symmetric spring-damper because (1) a single physics model simplifies the look-speed multiplier and saccade implementations to one branch instead of two, (2) the asymmetry was visible on diagonal jumps where pitch tracked instantly while yaw still swept, (3) PathWalker only consumes the smoothed pitch via `setXRot` (cosmetic) — its jump correctness depends solely on yaw, so a slightly different pitch profile cannot break path tests. The gentler pitch constants keep vertical tracking calm so the camera doesn't feel "jumpy" on every small terrain step.
+
+## Yaw angular-velocity cap
+
+**Decision**: `updateYaw` clamps the yaw angular velocity to `MAX_YAW_SPEED_DEG_PER_TICK = 35°` per tick, scaled by the look-speed multiplier.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Uncapped spring (original) | Mathematically clean; converges fastest | The spring's first tick after a target change covers `TURN_ACCEL × delta` — for a 180° flip that is a 144° single-tick snap. Per-tick yaw traces during pathwalking showed 74–141° jumps at path starts, at landing-brake retargets, and whenever a near node's atan2 target flipped: the spring only smooths *small* deltas; for large ones it IS the snap it was meant to prevent. |
+| Lower `TURN_ACCEL` globally | No new constant | Slows every turn including small corrections; jump-facing waits (18–36° tolerance) and the whole tuned movement physics shift. The problem is only the first saturated ticks of large turns. |
+| Velocity cap, scaled by look-speed multiplier (chosen) | Large turns become a constant-rate sweep (≈35°/t ≈ 700°/s — a brisk, visibly continuous mouse turn) that eases out via the unchanged spring once the remaining delta is small; small-delta behavior is byte-identical. Multiplier scaling keeps the per-target speed variance alive during the saturated phase. | Adds ~2–4 ticks to 90–180° turns; jump-facing fires correspondingly later (verified against the full jump-timing test suite). |
+| Cap inside consumers (PathWalker/Bot) | Camera module untouched | Every consumer would duplicate the clamp; the failure mode lives in the shared spring, not in any one consumer. |
+
+Chose the velocity cap because measured traces showed the "smooth" camera producing 141°-in-one-tick motion — the cap converts exactly those ticks into a sweep while leaving all small-delta smoothing untouched, in the one place all consumers share.

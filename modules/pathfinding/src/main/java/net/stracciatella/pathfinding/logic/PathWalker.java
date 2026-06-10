@@ -125,6 +125,13 @@ public class PathWalker {
     // without jumps or sharp turns.
     private static int straightWalkTicks = 0;
 
+    // Last numerically stable desired yaw. At sub-half-block horizontal
+    // distance the atan2 yaw target flips ~180° the moment the player steps
+    // past the point — the camera then whips after it. Inside that radius the
+    // desired yaw is frozen at its last stable value.
+    private static float lastStableDesiredYaw = 0.0f;
+    private static boolean hasStableDesiredYaw = false;
+
     public static void start(List<MeshNode> path) {
         if (path == null || path.isEmpty()) {
             stop();
@@ -133,6 +140,7 @@ public class PathWalker {
         currentPath = path;
         index = 0;
         active = true;
+        hasStableDesiredYaw = false;
         LocalPlayer player = Minecraft.getInstance().player;
         camera = new CameraController();
         if (player != null) {
@@ -345,7 +353,7 @@ public class PathWalker {
             Vec3 brakeVel = player.getDeltaMovement();
             double brakeSpeed = Math.sqrt(brakeVel.x * brakeVel.x + brakeVel.z * brakeVel.z);
             if (brakeSpeed > landingBrakeMaxSpeed) {
-                float desiredYaw = (float) (Math.toDegrees(Math.atan2(-dx, dz)));
+                float desiredYaw = stableDesiredYaw(dx, dz);
                 float newYaw = camera.updateYaw(desiredYaw);
                 player.setYRot(newYaw);
                 player.setXRot(AngleUtil.computeDesiredPitch(dy, distance));
@@ -527,7 +535,7 @@ public class PathWalker {
             aimDz = baseZ - player.getZ();
         }
 
-        float desiredYaw = (float) (Math.toDegrees(Math.atan2(-aimDx, aimDz)));
+        float desiredYaw = stableDesiredYaw(aimDx, aimDz);
         if (stabilizeForJump) {
             desiredYaw += jumpAimYawOffsetDeg;
         }
@@ -1047,6 +1055,23 @@ public class PathWalker {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Desired yaw toward the given horizontal aim vector, frozen at its last
+     * stable value while the horizontal distance is below half a block. At
+     * that range stepping past the point flips atan2 by ~180° between ticks
+     * and the camera whips after it — the frozen value keeps the gaze steady
+     * until either the node advances or the target is genuinely away again.
+     */
+    private static float stableDesiredYaw(double aimDx, double aimDz) {
+        float desired = (float) (Math.toDegrees(Math.atan2(-aimDx, aimDz)));
+        if (aimDx * aimDx + aimDz * aimDz < 0.25 && hasStableDesiredYaw) {
+            return lastStableDesiredYaw;
+        }
+        lastStableDesiredYaw = desired;
+        hasStableDesiredYaw = true;
+        return desired;
     }
 
     /**

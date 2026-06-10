@@ -14,7 +14,7 @@ net.stracciatella.camera
 ## Key Classes
 
 ### CameraController
-- **Yaw**: Spring-damper physics (hardcoded `TURN_ACCEL=0.8`, `TURN_FRICTION=0.8`). Critically damped at default look-speed.
+- **Yaw**: Spring-damper physics (hardcoded `TURN_ACCEL=0.8`, `TURN_FRICTION=0.8`). Critically damped at default look-speed. Angular velocity is hard-capped at 35°/tick (scaled by the look-speed multiplier) — without the cap, the spring's first tick after a large target change covers `0.8 × delta`, so a 180° flip became a near-instant 144° snap.
 - **Pitch**: Spring-damper physics with gentler constants (`PITCH_ACCEL=0.5`, `PITCH_FRICTION=0.7`). Slightly underdamped — mild overshoot is human-like. Snaps when within 0.5° **and** velocity below 0.05 to avoid micro-oscillation.
 - Instance-based — each consumer creates its own controller.
 - `initialize(yaw, pitch)` resets all state including look-speed and saccade settings.
