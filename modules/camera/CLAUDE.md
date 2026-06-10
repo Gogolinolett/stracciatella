@@ -46,5 +46,5 @@ High-level world-space aim (for callers aiming at a point, e.g. the bot):
 
 ## Consumers
 
-- **Pathfinding module** (`PathWalker.java`) — uses the low-level `updateYaw`/`updatePitch`/`snapYaw` APIs because its yaw targets are derived from movement physics (velocity yaw vs. path yaw, jump-facing tolerance), not from a single world-space point. Keeps default `lookSpeedMultiplier = 1.0` and saccades disabled — its physics is tuned for the default constants.
+- **Pathfinding module** (`PathWalker.java`) — uses the low-level `updateYaw`/`updatePitch` APIs because its yaw targets are derived from movement physics (velocity yaw vs. path yaw, jump-facing tolerance), not from a single world-space point. Keeps default `lookSpeedMultiplier = 1.0` and saccades disabled — its physics is tuned for the default constants. `snapYaw` is currently uncalled (the landing brake used to snap to velocity direction; it now counter-brakes with movement keys while turning smoothly).
 - **Bot module** (`BotController.java`) — uses the high-level `aimAt`/`isAimedAt` APIs in SCANNING/LOOKING/INTERACTING phases to aim at block centers plus per-target jitter offsets. Sets a randomised `lookSpeedMultiplier` per new target so successive aims have varying turn speeds. Enables saccades during sustained aim (INTERACTING) and disables them when transitioning to a new target.

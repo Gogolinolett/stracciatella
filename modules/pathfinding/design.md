@@ -50,6 +50,36 @@ Chose coordinate equality because MeshNode is used as a HashMap key in MeshPathf
 
 Chose drops-first because it matches the original intent (drops should allow 4.5 diagonal distance). The more specific condition must be checked before the more general one.
 
+## Final-node arrival: stop where you land, don't re-center
+
+**Decision**: The final path node counts as reached when the player is on the ground within `FINAL_ARRIVAL_RADIUS` (0.5) of the **true** block center — the per-node random target offset is excluded — and horizontal speed is at most `FINAL_ARRIVAL_MAX_SPEED` (0.12 b/t). Intermediate nodes keep the existing tight sphere (0.18, against the offset target) OR in-bounds box check.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| Tight sphere only (0.18 vs. offset target, original) | Guarantees a centered stop, comfortably inside the tests' 0.6 arrival radius | The bot lands off-center (jumps always do; the walk target itself sits up to 0.25 off-center from the random offset) and then walks the last fraction of a block to the point. At tiny remaining distances the desired yaw flips sign whenever the player oversteps the point, and the overshoot/moving-away logic spins him back — the reported "turning around the block center after landing on the target block". A human stops where they land. |
+| Box check for the final node too (bounds + 0.15 margin) | Simplest unification | Triggers up to 0.65 from center — outside the downstream 0.6 test radius, and standing half-off the block edge isn't a finished-looking stop either. |
+| 0.5 true-center radius + low-speed gate (chosen) | Fires the moment the bot stands securely on the block — covering every normal landing and the offset walk target, so no re-centering walk ever starts. The speed gate keeps a sprint landing braking (normal brake logic, S-key) until the post-release friction slide stays inside the block; overshooting the center is now irrelevant because the whole 0.5 disc is "arrived" — the yaw-flip pirouette cannot occur. | The bot's final resting point varies by up to ~0.5 from center instead of being centered — which is exactly the human-looking outcome, and all downstream checks (tests 0.6, WalkTravelMethod 2 blocks, bot reach 4.0) tolerate it. |
+| Velocity-projected arrival (predict resting point, stop early) | Theoretically earliest stop | Predicting the friction slide duplicates physics the brake logic already handles; the speed gate achieves the same with two constants. |
+
+Chose the true-center disc + speed gate because the pirouette is purely a product of chasing a sub-0.25-block point: widen "arrived" to the area a human would consider "I'm on the block" and the pathological geometry disappears, while the speed gate preserves the only thing the tight stop was actually protecting — not sliding off the far edge.
+
+**Companion change — final-node settling while the speed gate is closed**: the disc + gate alone did NOT fully remove the pirouette. Per-tick camera traces showed that during the 1–4 ticks between landing (speed 0.15–0.26) and the gate opening (≤ 0.12), the normal movement logic kept steering toward the walk target: standing next to the point, the desired yaw orbited it at ~7°/tick (`desiredYaw -150.7 → -143.5 → -136.5 → -125.7` over four ticks at constant ~0.2 speed) and the camera followed — the S-only `shouldBrake` path pushes opposite the *view* (which points at the target), so the sideways momentum component was never killed and the orbit persisted. The fix: when on the ground inside the arrival disc with the gate still closed, skip target steering entirely — hold the camera yaw (`updateYaw(getYaw())`, spring just settles) and run the same 8-way `applyCounterBrake` the landing brake uses, until the gate opens and arrival fires. Verified by trace: zero remaining ticks of target-steering inside the disc; the camera yaw stays constant through landing and stop.
+
+## Landing brake: counter-brake with movement keys instead of snapping to velocity direction
+
+**Decision**: During the active landing brake (speed > 0.1 b/t after a jump landing), the camera keeps turning smoothly toward the next path target (`camera.updateYaw`, no snap). The residual momentum is countered with movement keys: the momentum direction relative to the current view yaw is quantized to the 8 key directions (max 22.5° error) and the opposing combo is pressed — S when the momentum runs forward, A/D counter-strafe when it runs sideways, W when it runs backward, diagonals combined.
+
+### Alternatives
+| Approach | Pros | Cons |
+|----------|------|------|
+| `snapYaw(velocityYaw)` + press S (original) | Brake force exactly antiparallel to momentum — fastest possible deceleration | The camera visibly whips around to face the travel direction just to brake, then has to turn back to the next target. Reported as the bot "turning around to brake instead of just pressing S" — an instant yaw snap plus an unmotivated turn is a double bot-tell. |
+| Keep view on target, always press S | Single-key simplicity, no snap | S pushes opposite the *view*, not opposite the *momentum*. After diagonal jumps or while mid-turn toward a sharp corner the momentum can run sideways to the view — S then barely decelerates (cos ≈ 0 at 90°) and adds a sideways push that can shove the player off a single-block platform. |
+| 8-way key counter-brake, smooth view (chosen) | Reads exactly like a player braking (S or counter-strafe, eyes already on the next target). Worst-case key misalignment 22.5°, so ≥ 92% (cos 22.5°) of the push still decelerates; the camera is already converging on the next target when the brake ends. | Slightly weaker than a perfect antiparallel brake; up to sin 22.5° ≈ 38% of the push acts sideways for a few ticks. Verified against the single-block corner tests, which gate exactly this overshoot risk. |
+| 4-way quantization (W/A/S/D only) | Simpler sector logic | Max misalignment 45°: only ~71% of the push decelerates and up to 71% acts sideways — measurably worse on single-block landings for no readability gain over the diagonals humans use anyway. |
+
+Chose the 8-way counter-brake because the brake's purpose (kill momentum before the next segment) survives quantization, while the camera behavior — the only part the user actually sees — becomes indistinguishable from a player: gaze on the next target, fingers doing the braking.
+
 ## Mesh invalidation: full chunk regen, filtered
 
 **Decision**: `LevelChunkMixin.setBlockState` invalidates the mesh for the chunk via `MeshManager.invalidateMesh(chunkCoord)` whenever the change flips air↔solid, the chunk's level is the client's, and at least one entity has a mesh for that chunk.

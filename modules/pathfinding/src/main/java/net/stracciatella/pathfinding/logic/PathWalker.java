@@ -38,6 +38,12 @@ public class PathWalker {
     private static final double ARRIVAL_RADIUS = 0.18;
     private static final double BRAKE_RADIUS = 0.6;
     private static final double ARRIVAL_MARGIN = 0.15;
+    // Final-node arrival: standing anywhere within this radius of the TRUE
+    // block center counts as arrived — no walk-to-center afterwards. Must stay
+    // under the downstream test arrival radius (0.6) with margin for the
+    // friction slide that follows key release at FINAL_ARRIVAL_MAX_SPEED.
+    private static final double FINAL_ARRIVAL_RADIUS = 0.5;
+    private static final double FINAL_ARRIVAL_MAX_SPEED = 0.12;
     private static final double JUMP_FORWARD_AXIS_RATIO = 1.5;
     private static final int LEARN_MAX_GAP = 4;
     private static final int JUMP_SIM_HOLD_TICKS = 2;
@@ -304,32 +310,57 @@ public class PathWalker {
         boolean sprint = true;
         int nodeGap = computeNodeGap();
 
-        // Landing deceleration: face the direction of travel and press backward
-        // to actively counter momentum when speed is high. At lower speeds,
-        // release all keys and let ground friction handle the rest to avoid
-        // overshooting backward off narrow platforms.
+        // Final-node settling: standing inside the goal block's arrival disc
+        // but still carrying more speed than the arrival gate allows
+        // (hasReachedNode just returned false on the speed check). Do NOT
+        // keep steering toward the walk target — at this range the player
+        // slides around the point, the desired yaw orbits with him, and the
+        // camera visibly pirouettes around the block center (the S-only
+        // shouldBrake path never kills the sideways momentum component, so
+        // the orbit persists). Hold the gaze where it is and counter-brake
+        // against the momentum until the speed gate opens and arrival fires.
+        if (index + 1 >= currentPath.size() && player.onGround()) {
+            double cdx = target.getX() + 0.5 - player.getX();
+            double cdz = target.getZ() + 0.5 - player.getZ();
+            if (cdx * cdx + cdz * cdz <= FINAL_ARRIVAL_RADIUS * FINAL_ARRIVAL_RADIUS) {
+                float heldYaw = camera.updateYaw(camera.getYaw());
+                player.setYRot(heldYaw);
+                applyCounterBrake(client, player.getDeltaMovement(), heldYaw);
+                if (debug) {
+                    System.out.println(String.format(Locale.US,
+                            "[PathWalker] Final settling: centerDist=%.3f",
+                            Math.sqrt(cdx * cdx + cdz * cdz)));
+                }
+                return;
+            }
+        }
+
+        // Landing deceleration: keep looking at the next target (smooth turn,
+        // no camera snap) and press whichever movement key combo pushes
+        // against the residual momentum — the way a human brakes: usually S,
+        // a counter-strafe when the momentum runs sideways to the view. At
+        // lower speeds, release all keys and let ground friction handle the
+        // rest to avoid overshooting backward off narrow platforms.
         if (landingBrakeActive && player.onGround()) {
             Vec3 brakeVel = player.getDeltaMovement();
             double brakeSpeed = Math.sqrt(brakeVel.x * brakeVel.x + brakeVel.z * brakeVel.z);
             if (brakeSpeed > landingBrakeMaxSpeed) {
-                // Above 0.1 b/t: actively brake backward facing velocity direction.
-                // Below 0.1 b/t: just release all keys, friction handles the rest safely.
-                boolean activeBackward = brakeSpeed > 0.1;
-                if (activeBackward) {
-                    float velocityYaw = (float) (Math.toDegrees(Math.atan2(-brakeVel.x, brakeVel.z)));
-                    camera.snapYaw(velocityYaw);
-                    player.setYRot(velocityYaw);
-                } else {
-                    float desiredYaw = (float) (Math.toDegrees(Math.atan2(-dx, dz)));
-                    float newYaw = camera.updateYaw(desiredYaw);
-                    player.setYRot(newYaw);
-                }
+                float desiredYaw = (float) (Math.toDegrees(Math.atan2(-dx, dz)));
+                float newYaw = camera.updateYaw(desiredYaw);
+                player.setYRot(newYaw);
                 player.setXRot(AngleUtil.computeDesiredPitch(dy, distance));
-                applyMovement(client, false, activeBackward, false, false);
+                // Above 0.1 b/t: actively counter the momentum with keys.
+                // Below 0.1 b/t: just release all keys, friction handles the rest safely.
+                boolean activeBrake = brakeSpeed > 0.1;
+                if (activeBrake) {
+                    applyCounterBrake(client, brakeVel, newYaw);
+                } else {
+                    applyMovement(client, false, false, false, false);
+                }
                 if (debug) {
                     System.out.println(String.format(Locale.US,
                             "[PathWalker] Landing brake (%s): speed=%.3f target=%.3f",
-                            activeBackward ? "backward" : "release", brakeSpeed, landingBrakeMaxSpeed));
+                            activeBrake ? "counter-key" : "release", brakeSpeed, landingBrakeMaxSpeed));
                 }
                 return;
             }
@@ -907,12 +938,31 @@ public class PathWalker {
         if (player.onGround() && distanceSq <= ARRIVAL_RADIUS * ARRIVAL_RADIUS) {
             return true;
         }
-        // For the final node, only use the sphere check. The box check (block
-        // bounds + ARRIVAL_MARGIN) can trigger at block edges where the player
-        // is up to 0.65 blocks from center, which may exceed downstream
-        // arrival radius checks. The sphere check ensures a centered stop.
+        // For the final node, a human is "arrived" the moment they stand
+        // securely on the block — they don't walk another half block to
+        // center themselves on it. The old centered stop (tight sphere only)
+        // made the bot chase the offset block center after landing; at tiny
+        // remaining distances the desired yaw flips sign whenever the player
+        // oversteps the point, so the bot visibly pirouetted around the
+        // center. Accept anywhere within FINAL_ARRIVAL_RADIUS of the TRUE
+        // center (the random target offset is excluded — it alone can sit
+        // 0.25 off-center), gated on low residual speed so a sprint landing
+        // keeps braking via the normal movement logic until the friction
+        // slide after key release stays inside the block. The box check
+        // (bounds + ARRIVAL_MARGIN, up to 0.65 from center) stays
+        // intermediate-only: it would exceed the downstream 0.6 arrival
+        // radius used by the tests.
         if (isFinalNode) {
-            return false;
+            if (!player.onGround()) {
+                return false;
+            }
+            Vec3 vel = player.getDeltaMovement();
+            if (vel.x * vel.x + vel.z * vel.z > FINAL_ARRIVAL_MAX_SPEED * FINAL_ARRIVAL_MAX_SPEED) {
+                return false;
+            }
+            double cdx = target.getX() + 0.5 - player.getX();
+            double cdz = target.getZ() + 0.5 - player.getZ();
+            return cdx * cdx + cdz * cdz <= FINAL_ARRIVAL_RADIUS * FINAL_ARRIVAL_RADIUS;
         }
         double px = player.getX();
         double pz = player.getZ();
@@ -997,6 +1047,24 @@ public class PathWalker {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Press the movement-key combo whose push direction most opposes the
+     * current horizontal momentum, relative to the given view yaw — the way
+     * a human brakes without turning the camera. The momentum direction is
+     * quantized to the 8 key directions (max 22.5° off, so ≥92% of the key
+     * push still decelerates). Used by the landing brake and the final-node
+     * settling.
+     */
+    private static void applyCounterBrake(Minecraft client, Vec3 vel, float viewYaw) {
+        float velocityYaw = (float) (Math.toDegrees(Math.atan2(-vel.x, vel.z)));
+        float rel = AngleUtil.wrapDegrees(velocityYaw - viewYaw);
+        float a = Math.abs(rel);
+        boolean counterBackward = a <= 67.5f;
+        boolean counterForward = a >= 112.5f;
+        int strafeDir = (a > 22.5f && a < 157.5f) ? (rel > 0 ? -1 : 1) : 0;
+        applyMovement(client, counterForward, counterBackward, false, false, strafeDir);
     }
 
     private static void applyMovement(Minecraft client, boolean forward, boolean jump, boolean sprint) {

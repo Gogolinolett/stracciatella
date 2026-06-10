@@ -164,7 +164,9 @@ public class CameraController {
 
     /**
      * Instantly sets yaw to the given value and zeroes velocity/acceleration.
-     * Used for snapping camera direction (e.g. during landing brake).
+     * For non-human-driven direction changes only (e.g. re-syncing after a
+     * teleport) — a visible snap reads as bot, so movement code should prefer
+     * {@link #updateYaw(float)}.
      */
     public void snapYaw(float yaw) {
         this.yaw = yaw;
