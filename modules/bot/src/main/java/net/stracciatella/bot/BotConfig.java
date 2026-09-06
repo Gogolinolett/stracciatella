@@ -69,11 +69,11 @@ public class BotConfig {
     public int collectWaitMax = 1200;
 
     // Consecutive ticks the target block must be observed as air before the
-    // break is considered server-confirmed (see design.md).
+    // break is considered server-confirmed (see vault ticket STR-030).
     public int airConfirmTicks = 8;
 
     // Ticks items must be absent from the search AABB after at least one
-    // sighting before COLLECTING exits (see design.md).
+    // sighting before COLLECTING exits (see vault ticket STR-026).
     public int itemAbsenceTicks = 60;
 
     // Scanning: look toward distant target before walking
