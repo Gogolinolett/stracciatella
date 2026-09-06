@@ -1,0 +1,669 @@
+package net.stracciatella.miner;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
+import net.stracciatella.bot.BotController;
+import net.stracciatella.bot.BotPolicy;
+import net.stracciatella.bot.behavior.BehaviorStatus;
+import net.stracciatella.bot.behavior.BotBehavior;
+import net.stracciatella.bot.humanize.HumanBehavior;
+import net.stracciatella.bot.task.MineBlockTask;
+import net.stracciatella.bot.task.PlaceBlockTask;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Mines out one whole chunk, layer pair by layer pair, the way a person
+ * would: walk a 1-wide, 2-high corridor to the far side, step over one, walk
+ * back, and when the level is bare dig straight down through your own feet
+ * and start the next one.
+ *
+ * <p>Nothing about the progress is stored. The current slab is derived from
+ * the world every time one is needed — the topmost layer pair inside the
+ * requested range that still holds a diggable block. Stopping the run (or
+ * losing the client) therefore resumes exactly where it left off, and no
+ * saved cursor can ever disagree with what is actually still standing.
+ *
+ * <p>The bot never mines outside the target chunk and never places outside it
+ * except to cap a water source that would otherwise pour in.
+ */
+public class ChunkMinerBehavior implements BotBehavior {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("ChunkMiner");
+
+    private static final int CHUNK_SIZE = 16;
+    private static final int SLAB_HEIGHT = 2;
+    /** Cap on a liquid flood fill — enough to tell a puddle from an ocean. */
+    private static final int FLOOD_FILL_LIMIT = 16;
+    /** At most this many sources get capped individually; beyond it, dam. */
+    private static final int MAX_SEALABLE_SOURCES = 5;
+    /** Deepest drop the bot is allowed to open under its own feet. */
+    private static final int MAX_SAFE_DROP = 2;
+
+    private enum Phase {
+        SELECT_SLAB,
+        DESCEND,
+        CLEAR
+    }
+
+    private final MinerConfig config;
+
+    private Phase phase = Phase.SELECT_SLAB;
+    private ChunkPos chunk;
+    private int fromY;
+    private int toY;
+    private int slabFeetY;
+    private int requestedFromY;
+    private int requestedToY;
+    private boolean rangeRequested;
+
+    // Same execution contract as the diamond miner: one batch at a time, the
+    // controller runs it, then the result is verified against the world.
+    private final List<BlockPos> plannedBlocks = new ArrayList<>();
+    private final ArrayDeque<List<BlockPos>> batchQueue = new ArrayDeque<>();
+    // A queued filler placement is verified the same way a break is: without
+    // that, a placement the server rejects would be re-planned every tick
+    // forever, because the hole it was meant to fill is still a hole.
+    private BlockPos pendingPlacement;
+    private String placementWhat = "";
+    private int stepRetries;
+    private int breatherTicks;
+
+    private int blocksMined;
+    private String failReason;
+
+    public ChunkMinerBehavior(MinerConfig config) {
+        this.config = config;
+    }
+
+    /**
+     * Layer range for the next start. Pass {@code false} to fall back to "from
+     * the player's feet down to the configured bottom".
+     */
+    public void setRequestedRange(boolean requested, int newFromY, int newToY) {
+        this.rangeRequested = requested;
+        this.requestedFromY = newFromY;
+        this.requestedToY = newToY;
+    }
+
+    @Override
+    public String id() {
+        return "chunk_miner";
+    }
+
+    /**
+     * Every guard the policy layer offers. This behavior runs unattended for
+     * a long time in a place where the supervising player is not watching:
+     * damage means something found the bot, a swing means a player did, and a
+     * full inventory means everything it mines from here on is lost. The two
+     * collection flags are what make the drops actually end up in the
+     * inventory without the run crawling.
+     */
+    @Override
+    public BotPolicy policy() {
+        return BotPolicy.none()
+                .withDamageStop()
+                .withPlayerAttackStop()
+                .withInventoryFullStop(config.chunkMinerMinFreeSlots)
+                .withOpportunisticCollection()
+                .withFastCollectExit();
+    }
+
+    @Override
+    public void start(Minecraft client) {
+        phase = Phase.SELECT_SLAB;
+        chunk = null;
+        plannedBlocks.clear();
+        batchQueue.clear();
+        pendingPlacement = null;
+        stepRetries = 0;
+        breatherTicks = 0;
+        blocksMined = 0;
+        failReason = null;
+
+        LocalPlayer player = client.player;
+        if (player == null) {
+            return;
+        }
+        chunk = new ChunkPos(player.blockPosition());
+        int worldFloor = client.level != null ? client.level.getMinY() : Integer.MIN_VALUE;
+        fromY = rangeRequested ? requestedFromY : player.blockPosition().getY();
+        toY = rangeRequested ? requestedToY : config.chunkMinerBottomY;
+        if (toY < worldFloor) {
+            toY = worldFloor;
+        }
+        LOGGER.info("Chunk miner: chunk {} layers {}..{}", chunk, toY, fromY);
+    }
+
+    @Override
+    public void abort() {
+        BotController.stop();
+    }
+
+    /** Whether the last run ended on a hazard rather than on finishing. */
+    public boolean failed() {
+        return failReason != null;
+    }
+
+    @Override
+    public String statusLine() {
+        if (failReason != null) {
+            return failReason + " (blocks mined: " + blocksMined + ")";
+        }
+        if (chunk == null) {
+            return "starting";
+        }
+        return phase + " chunk " + chunk.x + "," + chunk.z
+                + " slab y=" + slabFeetY + ", blocks mined: " + blocksMined;
+    }
+
+    @Override
+    public BehaviorStatus tick(Minecraft client) {
+        LocalPlayer player = client.player;
+        Level level = client.level;
+        if (player == null || level == null || chunk == null) {
+            return BehaviorStatus.RUNNING;
+        }
+        if (fromY < toY) {
+            return fail("empty layer range " + toY + ".." + fromY);
+        }
+        if (BotController.isPaused() || BotController.isActive()
+                || !BotController.getTaskQueue().isEmpty()) {
+            return BehaviorStatus.RUNNING;
+        }
+
+        if (pendingPlacement != null) {
+            BehaviorStatus placed = verifyPlacement(level);
+            if (placed != null) {
+                return placed;
+            }
+            if (pendingPlacement != null) {
+                return BehaviorStatus.RUNNING;
+            }
+        }
+
+        if (!plannedBlocks.isEmpty()) {
+            BehaviorStatus verified = verifyPlannedBlocks(level);
+            if (verified != null) {
+                return verified;
+            }
+            if (!plannedBlocks.isEmpty()) {
+                return BehaviorStatus.RUNNING;
+            }
+        }
+
+        // Breather between columns. The controller already varies its own
+        // timings, but a run this long is where a perfectly even cadence
+        // between corridor steps would stand out.
+        if (breatherTicks > 0) {
+            breatherTicks--;
+            return BehaviorStatus.RUNNING;
+        }
+
+        if (!batchQueue.isEmpty()) {
+            plan(batchQueue.poll());
+            return BehaviorStatus.RUNNING;
+        }
+
+        return switch (phase) {
+            case SELECT_SLAB -> tickSelectSlab(level);
+            case DESCEND -> tickDescend(player, level);
+            case CLEAR -> tickClear(player, level);
+        };
+    }
+
+    // --- Phases ---
+
+    /**
+     * Pick the topmost layer pair that still holds something to dig. This is
+     * the resume mechanism: it reads the world, not a saved cursor.
+     */
+    private BehaviorStatus tickSelectSlab(Level level) {
+        for (int feetY = fromY - 1; feetY >= toY - 1; feetY -= SLAB_HEIGHT) {
+            if (slabHasWork(level, feetY)) {
+                slabFeetY = feetY;
+                phase = Phase.DESCEND;
+                LOGGER.info("Chunk miner: working slab y={}..{}", feetY, feetY + 1);
+                return BehaviorStatus.RUNNING;
+            }
+        }
+        LOGGER.info("Chunk miner finished: chunk {} cleared, {} blocks mined", chunk, blocksMined);
+        return BehaviorStatus.SUCCEEDED;
+    }
+
+    /**
+     * Get the bot's feet down to the slab it is about to clear by digging
+     * through its own column — one block per batch, so the bot drops a single
+     * level at a time and always lands on something it has already looked at.
+     */
+    private BehaviorStatus tickDescend(LocalPlayer player, Level level) {
+        BlockPos feet = player.blockPosition();
+        if (feet.getY() <= slabFeetY) {
+            phase = Phase.CLEAR;
+            return BehaviorStatus.RUNNING;
+        }
+        BlockPos under = feet.below();
+        if (!chunk.equals(new ChunkPos(under))) {
+            return fail("standing outside the target chunk at " + shortPos(feet));
+        }
+        BehaviorStatus liquid = handleLiquidsAround(level, under);
+        if (liquid != null) {
+            return liquid;
+        }
+        BehaviorStatus footing = ensureSafeDrop(level, under);
+        if (footing != null) {
+            return footing;
+        }
+        BlockState state = level.getBlockState(under);
+        if (state.isAir()) {
+            // Already open — the drop happens on its own next tick.
+            return BehaviorStatus.RUNNING;
+        }
+        if (!isDiggable(state)) {
+            return fail("cannot dig down through " + blockName(state) + " at " + shortPos(under));
+        }
+        plan(List.of(under));
+        return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * Clear the current slab one column at a time, in serpentine order.
+     * Columns are never batched together: the controller picks the task
+     * nearest the player, which on a straight corridor means it can target a
+     * block two columns ahead that the near column still hides.
+     */
+    private BehaviorStatus tickClear(LocalPlayer player, Level level) {
+        BlockPos column = nextColumn(player, level);
+        if (column == null) {
+            phase = Phase.SELECT_SLAB;
+            return BehaviorStatus.RUNNING;
+        }
+        BehaviorStatus liquid = handleLiquidsAround(level, column);
+        if (liquid != null) {
+            return liquid;
+        }
+        BehaviorStatus footing = ensureFloor(level, column.below());
+        if (footing != null) {
+            return footing;
+        }
+        // Head before feet: while the head block stands, the foot block's
+        // upward face is covered and its side faces are hidden by the corridor
+        // wall, so aiming at it first only burns a look timeout.
+        List<BlockPos> blocks = new ArrayList<>();
+        for (BlockPos pos : new BlockPos[] {column.above(), column}) {
+            if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
+                blocks.add(pos);
+            }
+        }
+        if (blocks.isEmpty()) {
+            return BehaviorStatus.RUNNING;
+        }
+        plan(blocks);
+        breatherTicks = HumanBehavior.randomTaskSwitchDelayTicks(BotController.CONFIG);
+        return BehaviorStatus.RUNNING;
+    }
+
+    // --- Slab geometry ---
+
+    private boolean slabHasWork(Level level, int feetY) {
+        for (BlockPos column : slabColumns(feetY)) {
+            for (BlockPos pos : new BlockPos[] {column, column.above()}) {
+                if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The next column with something to dig, following the snake onward from
+     * the one the bot is standing in and wrapping around.
+     *
+     * <p>Starting at the chunk corner instead would break as soon as the
+     * columns in between hold nothing — a blacklisted seam, a strip already
+     * cleared, the column the bot just descended through. The bot would be
+     * sent at a block several columns away that is still inside its reach, so
+     * the controller never walks over, but is hidden behind the columns that
+     * were skipped: the look times out and the run dies on a block it never
+     * had a line to. Resuming at the bot keeps every step of the sweep
+     * adjacent to the last, which is the whole point of a serpentine.
+     */
+    private BlockPos nextColumn(LocalPlayer player, Level level) {
+        List<BlockPos> columns = slabColumns(slabFeetY);
+        int start = columnIndex(columns, player.blockPosition());
+        for (int i = 0; i < columns.size(); i++) {
+            BlockPos column = columns.get((start + i) % columns.size());
+            for (BlockPos pos : new BlockPos[] {column, column.above()}) {
+                if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
+                    return column;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Index of the bot's own column in the sweep, or 0 if it stands outside. */
+    private static int columnIndex(List<BlockPos> columns, BlockPos feet) {
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).getX() == feet.getX() && columns.get(i).getZ() == feet.getZ()) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * The chunk's 256 columns at the given feet height, in serpentine order:
+     * along a row, step over, back along the next. The direction of the first
+     * row alternates per slab, so a finished slab hands the next one a start
+     * next to where it stopped instead of across the chunk.
+     */
+    private List<BlockPos> slabColumns(int feetY) {
+        int slabIndex = Math.floorDiv(fromY - 1 - feetY, SLAB_HEIGHT);
+        List<BlockPos> columns = new ArrayList<>(CHUNK_SIZE * CHUNK_SIZE);
+        for (int packed : SerpentinePlan.order(slabIndex)) {
+            columns.add(new BlockPos(
+                    chunk.getMinBlockX() + (packed % CHUNK_SIZE),
+                    feetY,
+                    chunk.getMinBlockZ() + (packed / CHUNK_SIZE)));
+        }
+        return columns;
+    }
+
+    // --- Safety ---
+
+    /**
+     * Make sure the bot lands on something when the block at {@code pos} is
+     * opened up. A hole deeper than a safe drop is filled in from the nearest
+     * sturdy neighbour rather than walked into.
+     */
+    private BehaviorStatus ensureSafeDrop(Level level, BlockPos pos) {
+        int open = 0;
+        BlockPos below = pos.below();
+        while (open <= MAX_SAFE_DROP && isPassable(level.getBlockState(below))) {
+            open++;
+            below = below.below();
+        }
+        if (open <= MAX_SAFE_DROP) {
+            return null;
+        }
+        return ensureFloor(level, pos.below());
+    }
+
+    /** Put a block at {@code pos} if nothing solid is there to stand on. */
+    private BehaviorStatus ensureFloor(Level level, BlockPos pos) {
+        if (!isPassable(level.getBlockState(pos))) {
+            return null;
+        }
+        if (!chunk.equals(new ChunkPos(pos))) {
+            return fail("no floor at " + shortPos(pos) + ", which is outside the chunk");
+        }
+        return planPlacement(level, pos, "floor");
+    }
+
+    // --- Liquids ---
+
+    /**
+     * Deal with any liquid touching the cell about to be opened, before it is
+     * opened. Water that comes from a handful of sources gets each source
+     * capped — cheap, permanent, and it leaves the chunk dry. Anything bigger,
+     * and all lava, gets dammed at the face it would flow in through: chasing
+     * an ocean's sources is endless, and letting lava burn itself out into
+     * obsidian costs far more time than a block of cobble.
+     */
+    private BehaviorStatus handleLiquidsAround(Level level, BlockPos column) {
+        Set<BlockPos> touching = new LinkedHashSet<>();
+        for (BlockPos cell : new BlockPos[] {column, column.above()}) {
+            for (Direction dir : Direction.values()) {
+                BlockPos neighbor = cell.relative(dir);
+                if (!level.getFluidState(neighbor).isEmpty()) {
+                    touching.add(neighbor);
+                }
+            }
+            if (!level.getFluidState(cell).isEmpty()) {
+                touching.add(cell);
+            }
+        }
+        if (touching.isEmpty()) {
+            return null;
+        }
+
+        BlockPos start = touching.iterator().next();
+        boolean lava = level.getFluidState(start).is(net.minecraft.tags.FluidTags.LAVA);
+        List<BlockPos> body = floodFill(level, start);
+        List<BlockPos> sources = new ArrayList<>();
+        for (BlockPos pos : body) {
+            if (level.getFluidState(pos).isSource()) {
+                sources.add(pos);
+            }
+        }
+
+        List<BlockPos> toSeal;
+        boolean capping = !lava && !sources.isEmpty() && sources.size() <= MAX_SEALABLE_SOURCES
+                && body.size() < FLOOD_FILL_LIMIT;
+        if (capping) {
+            // Small pool, fully surveyed: cap the sources themselves. This is
+            // the only case that may reach outside the chunk — an uncapped
+            // source next door refills the chunk as fast as it is dug.
+            toSeal = sources;
+        } else {
+            // Dam: only the cells the bot was about to occupy or walk past,
+            // and only inside the chunk.
+            toSeal = new ArrayList<>();
+            for (BlockPos pos : touching) {
+                if (chunk.equals(new ChunkPos(pos))) {
+                    toSeal.add(pos);
+                }
+            }
+            if (toSeal.isEmpty()) {
+                return fail((lava ? "lava" : "water") + " at " + shortPos(start)
+                        + " can only be dammed from outside the chunk");
+            }
+        }
+        LOGGER.info("Chunk miner: {} {} block(s) against {} at {}",
+                capping ? "capping" : "damming", toSeal.size(),
+                lava ? "lava" : "water", shortPos(start));
+        String what = capping ? "water cap" : (lava ? "lava dam" : "water dam");
+        for (BlockPos pos : toSeal) {
+            BehaviorStatus placement = planPlacement(level, pos, what);
+            if (placement != null) {
+                return placement;
+            }
+        }
+        return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * Connected fluid cells around {@code start}, up to {@link
+     * #FLOOD_FILL_LIMIT}. The cap is the point: the question is only "small
+     * pool or not", and answering it must not walk an ocean.
+     */
+    private List<BlockPos> floodFill(Level level, BlockPos start) {
+        List<BlockPos> found = new ArrayList<>();
+        Set<BlockPos> seen = new HashSet<>();
+        ArrayDeque<BlockPos> queue = new ArrayDeque<>();
+        queue.add(start);
+        seen.add(start);
+        while (!queue.isEmpty() && found.size() < FLOOD_FILL_LIMIT) {
+            BlockPos pos = queue.poll();
+            FluidState fluid = level.getFluidState(pos);
+            if (fluid.isEmpty()) {
+                continue;
+            }
+            found.add(pos);
+            for (Direction dir : Direction.values()) {
+                BlockPos neighbor = pos.relative(dir);
+                if (seen.add(neighbor) && !level.getFluidState(neighbor).isEmpty()) {
+                    queue.add(neighbor);
+                }
+            }
+        }
+        return found;
+    }
+
+    // --- Placement ---
+
+    /**
+     * Queue a filler block at {@code pos}. Fails the run when the position
+     * cannot be built against from any side, or when the bot carries none of
+     * the configured filler blocks — both mean the situation cannot be made
+     * safe, and carrying on would mean walking into it.
+     */
+    private BehaviorStatus planPlacement(Level level, BlockPos pos, String what) {
+        BlockPos support = PlaceBlockTask.findSupport(level, pos);
+        if (support == null) {
+            return fail("nothing to build the " + what + " at " + shortPos(pos) + " against");
+        }
+        BotController.enqueueTask(new PlaceBlockTask(pos, support, fillerPredicate(), "filler"));
+        pendingPlacement = pos;
+        placementWhat = what;
+        plannedBlocks.clear();
+        stepRetries = 0;
+        return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * Returns null when the placement is resolved, or a terminal status. A
+     * placement that keeps failing is fatal rather than skippable: it was
+     * planned because the bot could not safely proceed without it.
+     */
+    private BehaviorStatus verifyPlacement(Level level) {
+        BlockPos pos = pendingPlacement;
+        if (!isPassable(level.getBlockState(pos))) {
+            pendingPlacement = null;
+            stepRetries = 0;
+            return null;
+        }
+        if (stepRetries < config.maxStepRetries) {
+            stepRetries++;
+            BlockPos support = PlaceBlockTask.findSupport(level, pos);
+            if (support != null) {
+                BotController.enqueueTask(
+                        new PlaceBlockTask(pos, support, fillerPredicate(), "filler"));
+                return null;
+            }
+        }
+        pendingPlacement = null;
+        return fail("could not place the " + placementWhat + " at " + shortPos(pos)
+                + " — out of filler blocks?");
+    }
+
+    /** Matches any stack of a configured filler block. */
+    private Predicate<ItemStack> fillerPredicate() {
+        return stack -> {
+            if (!(stack.getItem() instanceof BlockItem blockItem)) {
+                return false;
+            }
+            String id = BuiltInRegistries.BLOCK.getKey(blockItem.getBlock()).toString();
+            return config.fillerBlocks.contains(id);
+        };
+    }
+
+    // --- Execution plumbing ---
+
+    /**
+     * Returns null when verification is resolved ({@code plannedBlocks}
+     * reflects the outcome), or a terminal status.
+     */
+    private BehaviorStatus verifyPlannedBlocks(Level level) {
+        List<BlockPos> remaining = new ArrayList<>();
+        for (BlockPos pos : plannedBlocks) {
+            BlockState state = level.getBlockState(pos);
+            if (state.isAir()) {
+                continue;
+            }
+            if (!state.getFluidState().isEmpty()) {
+                // Something flowed into the hole; deal with it as a liquid
+                // rather than retrying the break into running water.
+                plannedBlocks.clear();
+                stepRetries = 0;
+                return null;
+            }
+            remaining.add(pos);
+        }
+        blocksMined += plannedBlocks.size() - remaining.size();
+        if (remaining.isEmpty()) {
+            plannedBlocks.clear();
+            stepRetries = 0;
+            return null;
+        }
+        if (stepRetries < config.maxStepRetries) {
+            stepRetries++;
+            plannedBlocks.clear();
+            plannedBlocks.addAll(remaining);
+            enqueue(remaining);
+            return null;
+        }
+        return fail("cannot break " + shortPos(remaining.get(0)));
+    }
+
+    private void plan(List<BlockPos> blocks) {
+        plannedBlocks.clear();
+        plannedBlocks.addAll(blocks);
+        stepRetries = 0;
+        enqueue(blocks);
+    }
+
+    private void enqueue(List<BlockPos> blocks) {
+        for (BlockPos pos : blocks) {
+            BotController.enqueueTask(new MineBlockTask(pos));
+        }
+    }
+
+    private BehaviorStatus fail(String reason) {
+        failReason = reason;
+        LOGGER.warn("Chunk miner failed: {}", reason);
+        BotController.stop();
+        return BehaviorStatus.FAILED;
+    }
+
+    // --- Block predicates ---
+
+    private boolean isInRange(BlockPos pos) {
+        return pos.getY() >= toY && pos.getY() <= fromY && chunk.equals(new ChunkPos(pos));
+    }
+
+    /**
+     * Whether the chunk miner is allowed to break this block. Bedrock is
+     * excluded unconditionally rather than by blacklist entry — it is not a
+     * preference. Fluids are not "diggable": they are handled before the
+     * column is opened.
+     */
+    boolean isDiggable(BlockState state) {
+        if (state.isAir() || state.is(Blocks.BEDROCK) || !state.getFluidState().isEmpty()) {
+            return false;
+        }
+        return !config.chunkMinerBlacklist.contains(blockName(state));
+    }
+
+    private static boolean isPassable(BlockState state) {
+        return state.isAir() || !state.getFluidState().isEmpty();
+    }
+
+    private static String blockName(BlockState state) {
+        return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+    }
+
+    private static String shortPos(BlockPos pos) {
+        return pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
+    }
+}

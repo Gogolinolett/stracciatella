@@ -1,6 +1,10 @@
 package net.stracciatella.bot.task;
 
+import java.util.function.Predicate;
+
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 
 /**
@@ -47,4 +51,28 @@ public interface BotTask {
      * Maximum ticks allowed for a single block interaction before timeout.
      */
     int maxInteractionTicks();
+
+    /**
+     * The item this task needs in hand, or {@code null} to let the controller
+     * pick the fastest tool for the target block (the default for mining).
+     * USE tasks return the item they place — a pickaxe would be a nonsensical
+     * choice there.
+     */
+    default Predicate<ItemStack> requiredItem() {
+        return null;
+    }
+
+    /**
+     * The face of {@link #targetPos()} this task must interact with, or
+     * {@code null} to let the controller pick the face most visible from the
+     * bot's eye (the default for mining, see
+     * {@code BlockInteractor.faceTowardPlayer}).
+     *
+     * <p>Placement cannot use the most-visible face: a block is placed on the
+     * side you click, so the face is dictated by where the new block must end
+     * up, not by what is easiest to look at.
+     */
+    default Direction preferredFace() {
+        return null;
+    }
 }

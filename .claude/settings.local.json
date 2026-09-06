@@ -13,7 +13,8 @@
       "Bash(jar tf:*)",
       "Bash(xargs grep:*)",
       "Read(//tmp/**)",
-      "Bash(unzip -o \"C:/Users/sebas/.gradle/caches/fabric-loom/minecraftMaven/net/minecraft/minecraft-merged/1.21.11-loom.mappings.1_21_11.layered+hash.2198-v2/minecraft-merged-1.21.11-loom.mappings.1_21_11.layered+hash.2198-v2.jar\" \"net/minecraft/world/entity/player/Inventory.class\")"
+      "Bash(unzip -o \"C:/Users/sebas/.gradle/caches/fabric-loom/minecraftMaven/net/minecraft/minecraft-merged/1.21.11-loom.mappings.1_21_11.layered+hash.2198-v2/minecraft-merged-1.21.11-loom.mappings.1_21_11.layered+hash.2198-v2.jar\" \"net/minecraft/world/entity/player/Inventory.class\")",
+      "Bash(find /c/Users/sebas/.claude/skills/setup-store-knowledge -type f | head -100)"
     ]
   }
 }

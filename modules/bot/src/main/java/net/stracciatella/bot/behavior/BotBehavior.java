@@ -1,6 +1,7 @@
 package net.stracciatella.bot.behavior;
 
 import net.minecraft.client.Minecraft;
+import net.stracciatella.bot.BotPolicy;
 
 /**
  * A long-running, stateful strategy executed on top of the task layer.
@@ -23,6 +24,19 @@ public interface BotBehavior {
      * Unique id used to start this behavior (e.g. {@code "diamond_miner"}).
      */
     String id();
+
+    /**
+     * The safety and collection behaviour this strategy wants from the layers
+     * below it. Read once by {@link BehaviorRunner#start} and held for the
+     * whole run.
+     *
+     * <p>Deliberately abstract rather than defaulted to
+     * {@link BotPolicy#none()}: whether a strategy should abort on damage or
+     * keep digging is a decision its author has to make, and a silent default
+     * would let a new behavior inherit "no safety at all" by omission. A
+     * strategy that genuinely wants nothing says so in one line.
+     */
+    BotPolicy policy();
 
     /**
      * Called once when the behavior is started. Reset all internal state here.

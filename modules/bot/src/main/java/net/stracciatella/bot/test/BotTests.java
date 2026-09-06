@@ -5,11 +5,18 @@ import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
 import net.stracciatella.bot.BotController;
+import net.stracciatella.bot.BotPolicy;
+import net.stracciatella.bot.behavior.BehaviorRunner;
+import net.stracciatella.bot.behavior.BehaviorStatus;
+import net.stracciatella.bot.behavior.BotBehavior;
+import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
 import net.stracciatella.bot.task.ChopTreeTask;
 import net.stracciatella.bot.task.MineBlockTask;
+import net.stracciatella.bot.task.PlaceBlockTask;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
 import net.stracciatella.testing.api.TestSuite;
@@ -382,6 +389,249 @@ public class BotTests {
     }
 
     // ================================================================
+    // Test: Place a block — USE task against a support face
+    // ================================================================
+    @MinecraftTest(name = "Bot place block", timeoutTicks = 140, order = -189)
+    public void placeBlock(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1600, 30, 1000);
+        final BlockPos placePos = origin.offset(2, 0, 0);
+        final BlockPos supportPos = placePos.below();
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("give @s cobblestone 8");
+        // Survival matters here: the placement is confirmed by the block
+        // being consumed from the inventory, and creative never consumes it.
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new PlaceBlockTask(
+                placePos, supportPos, stack -> stack.is(Items.COBBLESTONE), "cobblestone")));
+        waitForBotIdle(ctx);
+
+        boolean placed = ctx.computeOnClient(mc -> mc.level.getBlockState(placePos).is(Blocks.COBBLESTONE));
+        if (!placed) {
+            throw new AssertionError("Expected cobblestone at " + placePos.toShortString()
+                    + " but found " + ctx.computeOnClient(mc -> mc.level.getBlockState(placePos).getBlock()));
+        }
+        int remaining = countItem(ctx, Items.COBBLESTONE);
+        if (remaining != 7) {
+            throw new AssertionError("Expected 7 cobblestone left after placing one, found " + remaining);
+        }
+        LOGGER.info("Place block test passed");
+    }
+
+    // ================================================================
+    // Test: Support finder — no sturdy neighbour means no task
+    // ================================================================
+    @MinecraftTest(name = "Bot place needs support", timeoutTicks = 80, order = -188)
+    public void placeNeedsSupport(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1650, 30, 1000);
+        // Two blocks above the platform, so every neighbour is air.
+        final BlockPos floating = origin.offset(2, 2, 0);
+        final BlockPos onFloor = origin.offset(2, 0, 0);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        BlockPos floatingSupport = ctx.computeOnClient(mc -> PlaceBlockTask.findSupport(mc.level, floating));
+        if (floatingSupport != null) {
+            throw new AssertionError("findSupport returned " + floatingSupport.toShortString()
+                    + " for a position surrounded by air");
+        }
+        BlockPos floorSupport = ctx.computeOnClient(mc -> PlaceBlockTask.findSupport(mc.level, onFloor));
+        if (!onFloor.below().equals(floorSupport)) {
+            throw new AssertionError("Expected the platform below " + onFloor.toShortString()
+                    + " as support, got " + floorSupport);
+        }
+        LOGGER.info("Place needs support test passed");
+    }
+
+    // ================================================================
+    // Test 10: Damage stops a behavior that asked for it
+    // ================================================================
+    @MinecraftTest(name = "Bot policy damage stop", timeoutTicks = 200, order = -187)
+    public void policyDamageStop(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1700, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        // Four blocks so the run is still going when the damage lands.
+        final List<BlockPos> blocks = List.of(
+                origin, origin.offset(1, 0, 0), origin.offset(2, 0, 0), origin.offset(3, 0, 0));
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        for (BlockPos block : blocks) {
+            ctx.runCommand("setblock " + block.getX() + " " + block.getY() + " " + block.getZ() + " stone");
+        }
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+
+        startProbe(ctx, BotPolicy.none().withDamageStop(), blocks);
+        // Only meaningful once the bot is actually working.
+        ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.INTERACTING);
+
+        ctx.runCommand("damage @s 1");
+        ctx.waitFor(mc -> !BehaviorRunner.isActive());
+
+        int remaining = ctx.computeOnClient(mc -> {
+            int count = 0;
+            for (BlockPos block : blocks) {
+                if (!mc.level.getBlockState(block).isAir()) {
+                    count++;
+                }
+            }
+            return count;
+        });
+        if (remaining == 0) {
+            throw new AssertionError("Run mined every block — the damage stop never fired");
+        }
+        ctx.runOnClient(mc -> BotController.stop());
+        LOGGER.info("Damage stop test passed ({} of {} blocks left)", remaining, blocks.size());
+    }
+
+    // ================================================================
+    // Test 11: A full inventory stops the run before it starts
+    // ================================================================
+    @MinecraftTest(name = "Bot policy inventory full stop", timeoutTicks = 200, order = -186)
+    public void policyInventoryFullStop(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1750, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        final List<BlockPos> blocks = List.of(origin);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + origin.getX() + " " + origin.getY() + " " + origin.getZ() + " stone");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+
+        // Leave exactly one empty slot, below the policy's minimum of two.
+        for (int slot = 0; slot < 35; slot++) {
+            ctx.runCommand("item replace entity @s container." + slot + " with minecraft:dirt 1");
+        }
+        int free = ctx.computeOnClient(mc -> InventoryHelper.freeSlots(mc.player));
+        if (free != 1) {
+            throw new AssertionError("Expected 1 free slot after filling the inventory, got " + free);
+        }
+
+        startProbe(ctx, BotPolicy.none().withInventoryFullStop(2), blocks);
+        ctx.waitFor(mc -> !BehaviorRunner.isActive());
+
+        boolean stillThere = ctx.computeOnClient(mc -> !mc.level.getBlockState(origin).isAir());
+        if (!stillThere) {
+            throw new AssertionError("Block was mined although the inventory was full");
+        }
+        ctx.runOnClient(mc -> BotController.stop());
+        LOGGER.info("Inventory full stop test passed");
+    }
+
+    // ================================================================
+    // Test 12: fastCollectExit — an unreachable drop must not pin COLLECTING
+    // ================================================================
+    @MinecraftTest(name = "Bot policy fast collect exit", timeoutTicks = 200, order = -185)
+    public void policyFastCollectExit(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1800, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        final List<BlockPos> blocks = List.of(origin);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + origin.getX() + " " + origin.getY() + " " + origin.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+
+        // A drop the bot has decided it will never walk to: inside the
+        // 8-block collect query, outside the 4-block vertical walk filter.
+        // NoGravity keeps it up there; without the policy flag its mere
+        // presence holds `itemsNearby` true until collectWaitMax expires.
+        ctx.runCommand("summon item " + (standPos.getX() + 0.5) + " " + (origin.getY() + 6)
+                + " " + (standPos.getZ() + 0.5)
+                + " {Item:{id:\"minecraft:dirt\",count:1},NoGravity:1b,PickupDelay:32767s}");
+        ctx.waitFor(mc -> countDecoysAbove(ctx, origin) == 1);
+
+        long startTick = ctx.computeOnClient(mc -> mc.level.getGameTime());
+        startProbe(ctx, BotPolicy.none().withFastCollectExit(), blocks);
+        ctx.waitFor(mc -> !BehaviorRunner.isActive());
+        final long elapsed = ctx.computeOnClient(mc -> mc.level.getGameTime()) - startTick;
+
+        if (countDecoysAbove(ctx, origin) != 1) {
+            throw new AssertionError("The decoy drop is gone — the test proved nothing");
+        }
+        if (ctx.computeOnClient(mc -> !mc.level.getBlockState(origin).isAir())) {
+            throw new AssertionError("Block was never mined — the run failed rather than finished");
+        }
+        // Exiting COLLECTING sooner must not mean exiting before collecting:
+        // the drop from the mined block still has to end up in the inventory.
+        if (countItem(ctx, Items.COBBLESTONE) < 1) {
+            throw new AssertionError("Left COLLECTING without picking up the drop");
+        }
+        // Mining plus collecting a single block is a few hundred ticks. Taking
+        // longer than the collect timeout alone means COLLECTING sat there
+        // until it expired, which is exactly the stall this flag removes.
+        if (elapsed >= BotController.CONFIG.collectWaitMax) {
+            throw new AssertionError("COLLECTING stalled: run took " + elapsed
+                    + " ticks, collectWaitMax is " + BotController.CONFIG.collectWaitMax);
+        }
+        ctx.runOnClient(mc -> BotController.stop());
+        LOGGER.info("Fast collect exit test passed ({} ticks, budget {})",
+                elapsed, BotController.CONFIG.collectWaitMax);
+    }
+
+    // ================================================================
+    // Test 13: opportunisticCollection — strafe toward a drop mid-break
+    // ================================================================
+    @MinecraftTest(name = "Bot policy opportunistic collection", timeoutTicks = 200, order = -184)
+    public void policyOpportunisticCollection(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1850, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        // Sideways from the bot, perpendicular to the block it will be mining,
+        // so reaching it is a pure strafe — the case the direction math exists
+        // for, and the one a turn would break.
+        final double itemX = standPos.getX() + 0.5 + 2.5;
+        final double itemZ = standPos.getZ() + 0.5;
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        // Obsidian with a diamond pickaxe: ~187 ticks of INTERACTING, long
+        // enough for the walk to be observable, and it still drops — a break
+        // that produces no drop never confirms and would end in a timeout
+        // rather than in the phase this test needs to watch.
+        ctx.runCommand("setblock " + origin.getX() + " " + origin.getY() + " " + origin.getZ() + " obsidian");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+
+        // PickupDelay keeps the drop on the ground, so the measurement is of
+        // the bot closing the distance rather than of the item vanishing.
+        ctx.runCommand("summon item " + itemX + " " + (origin.getY() + 0.2) + " " + itemZ
+                + " {Item:{id:\"minecraft:dirt\",count:1},NoGravity:1b,PickupDelay:32767s}");
+
+        // Baseline from where the test parked the bot, taken before the run.
+        // Sampling it after INTERACTING is reached races the walk itself: the
+        // bot steps on the first INTERACTING tick and stops at
+        // OPPORTUNISTIC_STOP_DISTANCE, so a baseline read a few ticks in is
+        // already most of the way down and the remaining travel is smaller
+        // than any margin worth asserting on.
+        double startDist = ctx.computeOnClient(mc -> horizDistTo(mc, itemX, itemZ));
+
+        startProbe(ctx, BotPolicy.none().withOpportunisticCollection(), List.of(origin));
+        ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.INTERACTING);
+
+        // Closing the gap has to happen *while the break runs* — that is the
+        // whole feature. Checked in one predicate rather than as a separate
+        // assertion afterwards, which would race the end of the break.
+        ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.INTERACTING
+                && horizDistTo(mc, itemX, itemZ) < startDist - 0.5);
+
+        double endDist = ctx.computeOnClient(mc -> horizDistTo(mc, itemX, itemZ));
+        // This is the only policy test that ends with the behavior still
+        // running, so stopping goes top-down: the runner aborts the behavior,
+        // which stops the controller — never the other way around.
+        ctx.runOnClient(mc -> BehaviorRunner.stop());
+        ctx.runOnClient(mc -> BotController.stop());
+        LOGGER.info("Opportunistic collection test passed (closed {} → {} blocks while mining)",
+                String.format(java.util.Locale.US, "%.2f", startDist),
+                String.format(java.util.Locale.US, "%.2f", endDist));
+    }
+
+    // ================================================================
     // Test 9: Out-of-reach failure
     // ================================================================
     @MinecraftTest(name = "Bot out-of-reach failure", timeoutTicks = 60, order = -192)
@@ -413,6 +663,93 @@ public class BotTests {
     }
 
     // --- Shared helpers ---
+
+    /**
+     * Register and start a behavior that mines {@code blocks} under the given
+     * policy. The policy layer is only reachable through a behavior — that is
+     * the whole point of it — so the guards need one to be tested at all.
+     */
+    private void startProbe(TestContext ctx, BotPolicy policy, List<BlockPos> blocks) {
+        ctx.runOnClient(mc -> {
+            BehaviorRunner.register(new PolicyProbeBehavior(policy, blocks));
+            BehaviorRunner.start(PolicyProbeBehavior.ID);
+        });
+    }
+
+    /** Horizontal distance from the player to a world point. */
+    private static double horizDistTo(net.minecraft.client.Minecraft mc, double x, double z) {
+        double dx = mc.player.getX() - x;
+        double dz = mc.player.getZ() - z;
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    /** Item entities more than 4 blocks above {@code origin} — the decoys. */
+    private int countDecoysAbove(TestContext ctx, BlockPos origin) {
+        return ctx.computeOnClient(mc -> mc.level.getEntities(
+                net.minecraft.world.entity.EntityType.ITEM,
+                new net.minecraft.world.phys.AABB(origin).inflate(12.0),
+                item -> item.getY() > origin.getY() + 4).size());
+    }
+
+    /**
+     * The smallest thing that is still a behavior: enqueue the blocks once,
+     * then report RUNNING until the controller has worked through them. Exists
+     * so {@code BehaviorRunner}'s policy handling can be tested without
+     * depending on a real strategy from another module.
+     */
+    private static final class PolicyProbeBehavior implements BotBehavior {
+
+        private static final String ID = "policy_probe";
+
+        private final BotPolicy policy;
+        private final List<BlockPos> blocks;
+        private boolean planned;
+
+        private PolicyProbeBehavior(BotPolicy policy, List<BlockPos> blocks) {
+            this.policy = policy;
+            this.blocks = blocks;
+        }
+
+        @Override
+        public String id() {
+            return ID;
+        }
+
+        @Override
+        public BotPolicy policy() {
+            return policy;
+        }
+
+        @Override
+        public void start(net.minecraft.client.Minecraft client) {
+            planned = false;
+        }
+
+        @Override
+        public void abort() {
+            BotController.stop();
+        }
+
+        @Override
+        public String statusLine() {
+            return planned ? "mining " + blocks.size() + " blocks" : "starting";
+        }
+
+        @Override
+        public BehaviorStatus tick(net.minecraft.client.Minecraft client) {
+            if (!planned) {
+                for (BlockPos block : blocks) {
+                    BotController.enqueueTask(new MineBlockTask(block));
+                }
+                planned = true;
+                return BehaviorStatus.RUNNING;
+            }
+            if (BotController.isActive() || !BotController.getTaskQueue().isEmpty()) {
+                return BehaviorStatus.RUNNING;
+            }
+            return BehaviorStatus.SUCCEEDED;
+        }
+    }
 
     private void setupTest(TestContext ctx, BlockPos origin) {
         ctx.runOnClient(mc -> BotController.stop());

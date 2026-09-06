@@ -6,14 +6,18 @@ import java.util.List;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 import net.stracciatella.bot.humanize.HumanBehavior;
 import net.stracciatella.bot.interaction.BlockInteractor;
 import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.task.BotTask;
+import net.stracciatella.bot.task.InteractionType;
 import net.stracciatella.bot.task.TaskQueue;
+import net.stracciatella.camera.AngleUtil;
 import net.stracciatella.camera.CameraController;
 import net.stracciatella.pathfinding.ChunkCoordinate;
 import net.stracciatella.pathfinding.logic.MeshManager;
@@ -35,6 +39,12 @@ public class BotController {
 
     public static final BotConfig CONFIG = new BotConfig();
     private static final TaskQueue taskQueue = new TaskQueue();
+
+    // What the currently running behavior asked the execution layer to do
+    // differently. Pushed in by BehaviorRunner on start and reset on stop;
+    // none() for tasks issued straight from /bot commands, which keeps their
+    // behaviour byte-identical to before policies existed.
+    private static BotPolicy policy = BotPolicy.none();
 
     // State machine
     private static Phase phase = Phase.IDLE;
@@ -77,6 +87,17 @@ public class BotController {
     private static final double APPROACH_CLOSE_DISTANCE = 2.0;
     private static final int WRONG_HIT_STREAK_TICKS = 8;
 
+    // Opportunistic collection (policy-gated, INTERACTING only). The range is
+    // deliberately short: a drop further than this can't be fetched and
+    // returned from without the break suffering, and COLLECTING gets it anyway.
+    private static final double OPPORTUNISTIC_ITEM_RANGE = 3.0;
+    // Vanilla's pickup radius. Inside it, walking closer only overshoots.
+    private static final double OPPORTUNISTIC_STOP_DISTANCE = 1.5;
+    // How far ahead a step is projected when testing whether it is safe. One
+    // block is about four ticks of walking — far enough that the check sees
+    // the hazard before the bot is standing in it.
+    private static final double STEP_LOOKAHEAD = 1.0;
+
     // Deferred-action mechanism: when a phase decides to transition, it can
     // request a Gaussian-distributed reaction delay first. During the delay
     // the current phase's tick logic is skipped (the bot "freezes" briefly,
@@ -106,20 +127,24 @@ public class BotController {
     // exits once items have been absent for a sustained window (not just a
     // single transient tick between pickup and next spawn/sync).
     private static int lastItemSeenTick = 0;
-    // Interaction state — how many consecutive ticks the current target block
-    // has been observed as air. We require a sustained window to ensure the
-    // server confirmed the break (not just client-side prediction, which gets
-    // reverted if the server rejects the break under accelerated ticks).
-    private static int airConfirmTicks = 0;
+    // Interaction state — how many consecutive ticks the current target has
+    // been observed in its completed state (air for mining, a solid block for
+    // placing). We require a sustained window to ensure the server confirmed
+    // the interaction (not just client-side prediction, which gets reverted
+    // if the server rejects it under accelerated ticks). The window length is
+    // CONFIG.airConfirmTicks, named for its original mining-only purpose.
+    private static int stateConfirmTicks = 0;
     // Latched true when a drop entity has been observed near the target at
     // any point during this break. The drop must be polled every tick: when
     // the bot stands right next to the block (gallery mining, re-approach),
     // vanilla pickup inhales the drop before a once-after-air-confirm query
     // would ever see it.
     private static boolean dropSeenThisBreak = false;
-    // Total main-inventory item count at break start. A pickup raises it —
-    // a server-authoritative break signal for exactly the inhaled-drop case.
-    private static int breakStartInventoryCount = 0;
+    // Total main-inventory item count when the interaction started. A pickup
+    // raises it — a server-authoritative break signal for exactly the
+    // inhaled-drop case; a placement lowers it by the block consumed, which
+    // is the equivalent signal for USE.
+    private static int startInventoryCount = 0;
 
     public enum Phase {
         IDLE,
@@ -142,6 +167,18 @@ public class BotController {
         HumanBehavior.rollSessionSkill();
     }
 
+    /**
+     * Install the active behavior's policy. Passing {@code null} restores
+     * {@link BotPolicy#none()} — the plain, pre-policy execution.
+     */
+    public static void setPolicy(BotPolicy newPolicy) {
+        policy = newPolicy != null ? newPolicy : BotPolicy.none();
+    }
+
+    public static BotPolicy policy() {
+        return policy;
+    }
+
     public static void enqueueTask(BotTask task) {
         taskQueue.addLast(task);
         if (phase == Phase.IDLE && !paused) {
@@ -160,7 +197,7 @@ public class BotController {
         lastMinedPos = null;
         itemsSeenThisCollect = false;
         lastItemSeenTick = 0;
-        airConfirmTicks = 0;
+        stateConfirmTicks = 0;
         walkAfterCollect = false;
         deferredAction = null;
         deferredActionDelay = 0;
@@ -342,7 +379,7 @@ public class BotController {
             // Failure-only diagnostics: where the bot stood, which face it
             // aimed for, and what the crosshair raycast actually hit.
             BlockPos t = currentTask.targetPos();
-            net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, t);
+            net.minecraft.core.Direction face = aimFace(client, currentTask);
             HitResult hr = client.hitResult;
             String hit = hr instanceof BlockHitResult bhr
                     ? bhr.getBlockPos().toShortString() + " (" + bhr.getDirection() + ")"
@@ -377,9 +414,15 @@ public class BotController {
             // camera turn. By the time the hit-result gate fires, the server
             // has had the entire LOOKING duration to apply them, and
             // INTERACTING can attack on its first tick without a separate
-            // tool-settle pause.
+            // tool-settle pause. A task that names its own item (placement)
+            // gets that instead of the fastest tool for the clicked block.
             if (client.level != null) {
-                InventoryHelper.selectBestTool(player, client.level.getBlockState(target));
+                var required = currentTask.requiredItem();
+                if (required != null) {
+                    InventoryHelper.selectItem(player, required);
+                } else {
+                    InventoryHelper.selectBestTool(player, client.level.getBlockState(target));
+                }
             }
             toolSelected = true;
             releaseMovementKeys();
@@ -395,7 +438,7 @@ public class BotController {
         // face, so a raycast aimed at the center actually lands on the
         // neighbor. Aiming at the exposed face guarantees the raycast clears
         // intermediate blocks and lands on the target.
-        net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, target);
+        net.minecraft.core.Direction face = aimFace(client, currentTask);
         double tx = target.getX() + 0.5 + face.getStepX() * 0.5;
         double ty = target.getY() + 0.5 + face.getStepY() * 0.5;
         double tz = target.getZ() + 0.5 + face.getStepZ() * 0.5;
@@ -420,7 +463,7 @@ public class BotController {
         // looking at it": when an obstacle blocks the line of sight the
         // raycast lands on the obstacle and the gate holds (lookTimeout
         // fails the task cleanly if it never clears).
-        boolean aimedHit = isHitResultOnTarget(client, target);
+        boolean aimedHit = isHitResultOnTarget(client, target, currentTask.preferredFace());
         if (!aimedHit) {
             // Early re-approach: the camera has settled on its aim point but
             // the crosshair keeps resting on the same other block — the
@@ -476,19 +519,40 @@ public class BotController {
      * INTERACTING — prevents the bot from starting to attack a block the
      * camera is only angularly close to (but not actually pointing at, e.g.
      * because an obstacle sits in the line of sight).
+     * <p>
+     * When {@code requiredFace} is non-null the raycast must also land on that
+     * face. Mining passes null (any face of the right block will break it),
+     * placement passes the face it must build off — clicking the wrong side of
+     * the support block would put the new block somewhere else entirely.
      */
-    private static boolean isHitResultOnTarget(Minecraft client, BlockPos target) {
+    private static boolean isHitResultOnTarget(Minecraft client, BlockPos target,
+                                               net.minecraft.core.Direction requiredFace) {
         HitResult hr = client.hitResult;
         if (!(hr instanceof BlockHitResult bhr)) {
             return false;
         }
-        return bhr.getBlockPos().equals(target);
+        if (!bhr.getBlockPos().equals(target)) {
+            return false;
+        }
+        return requiredFace == null || bhr.getDirection() == requiredFace;
+    }
+
+    /**
+     * The face of the task's target block to aim at and interact with: the
+     * task's own choice when it has one (placement dictates its face), else
+     * the face most directly visible from the bot's eye.
+     */
+    private static net.minecraft.core.Direction aimFace(Minecraft client, BotTask task) {
+        net.minecraft.core.Direction preferred = task.preferredFace();
+        return preferred != null ? preferred : BlockInteractor.faceTowardPlayer(client, task.targetPos());
     }
 
     private static void tickInteracting(Minecraft client, LocalPlayer player) {
         if (phaseTicks > CONFIG.maxBreakTicks) {
             BlockInteractor.stopInteraction();
-            failCurrentTask("Block break timeout");
+            releaseMovementKeys();
+            failCurrentTask(currentTask.interactionType() == InteractionType.USE
+                    ? "Block place timeout" : "Block break timeout");
             return;
         }
 
@@ -501,9 +565,9 @@ public class BotController {
         // airConfirmTicks on the first tick (LOOKING may be re-entered for
         // sub-targets like sequential tree logs).
         if (phaseTicks == 1) {
-            airConfirmTicks = 0;
+            stateConfirmTicks = 0;
             dropSeenThisBreak = false;
-            breakStartInventoryCount = countMainInventory(player);
+            startInventoryCount = countMainInventory(player);
             // Defensive re-send in case the packet was dropped while turning.
             InventoryHelper.resendCarriedItem(player);
             // Sustained aim during mining is when "frozen gaze" reads as bot.
@@ -520,7 +584,7 @@ public class BotController {
         // Offsets along the face normal are zeroed for the same reason
         // LOOKING does it (see comment there).
         if (camera != null) {
-            net.minecraft.core.Direction face = BlockInteractor.faceTowardPlayer(client, target);
+            net.minecraft.core.Direction face = aimFace(client, currentTask);
             double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
             double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
             double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
@@ -530,11 +594,23 @@ public class BotController {
                     target.getZ() + 0.5 + face.getStepZ() * 0.5 + offZ);
         }
 
-        // Start mining if not already. Pass the explicit target so the
-        // destroy packet always lands on the intended block — bypasses the
-        // stale-hitResult race on the first tick of INTERACTING.
+        // Step toward drops without interrupting the break — the camera above
+        // has already been committed to the target this tick, so this can only
+        // move the body. Placement is excluded: there is nothing to collect and
+        // a placement's aim is pinned to one face, which a step would spoil.
+        boolean placing = currentTask.interactionType() == InteractionType.USE;
+        if (policy.opportunisticCollection() && !placing) {
+            tickOpportunisticCollection(client, player, target);
+        }
+
+        // Start interacting if not already. Pass the explicit target so the
+        // packet always lands on the intended block — bypasses the
+        // stale-hitResult race on the first tick of INTERACTING. The face is
+        // null for mining (re-derived per tick as the bot moves) and pinned
+        // for placement.
         if (!BlockInteractor.isInteracting()) {
-            BlockInteractor.startInteraction(currentTask.interactionType(), target);
+            BlockInteractor.startInteraction(currentTask.interactionType(), target,
+                    currentTask.preferredFace());
         }
 
         // Check if block is broken. Under accelerated ticks the client can
@@ -555,30 +631,45 @@ public class BotController {
         //      pickup itself, also server-driven via slot sync). Without the
         //      latch+inventory path the bot kept attacking the already-broken
         //      block for the full maxBreakTicks — "punching air".
-        // If the server reverts, the air check fails and we keep mining.
-        boolean isAir = currentTask.isCurrentTargetComplete(level);
-        if (isAir) {
-            airConfirmTicks++;
+        // If the server reverts, the state check fails and we keep going.
+        //
+        // Placement needs the same two signals, mirrored: the destination
+        // holds a solid block for a sustained window, and the main inventory
+        // has *shrunk* by the block that was consumed. A client-predicted
+        // placement the server rejects never moves the item count.
+        if (currentTask.isCurrentTargetComplete(level)) {
+            stateConfirmTicks++;
         } else {
-            airConfirmTicks = 0;
+            stateConfirmTicks = 0;
         }
-        if (!dropSeenThisBreak) {
-            net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
-                    target.getX() - 2, target.getY() - 2, target.getZ() - 2,
-                    target.getX() + 3, target.getY() + 3, target.getZ() + 3);
-            dropSeenThisBreak = !client.level.getEntities(
-                    net.minecraft.world.entity.EntityType.ITEM, box, e -> true).isEmpty();
+        boolean artifact;
+        if (placing) {
+            // Creative never consumes the block, so the item count can't be
+            // the signal there — the sustained-state window alone confirms it.
+            artifact = player.getAbilities().instabuild
+                    || countMainInventory(player) < startInventoryCount;
+        } else {
+            if (!dropSeenThisBreak) {
+                net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+                        target.getX() - 2, target.getY() - 2, target.getZ() - 2,
+                        target.getX() + 3, target.getY() + 3, target.getZ() + 3);
+                dropSeenThisBreak = !client.level.getEntities(
+                        net.minecraft.world.entity.EntityType.ITEM, box, e -> true).isEmpty();
+            }
+            artifact = dropSeenThisBreak || countMainInventory(player) > startInventoryCount;
         }
-        boolean breakArtifact = dropSeenThisBreak
-                || countMainInventory(player) > breakStartInventoryCount;
-        if (airConfirmTicks >= CONFIG.airConfirmTicks && breakArtifact) {
+        if (stateConfirmTicks >= CONFIG.airConfirmTicks && artifact) {
             BlockInteractor.stopInteraction();
+            // A step from opportunistic collection must not survive the phase
+            // change — transitionTo does not touch the movement keys.
+            releaseMovementKeys();
 
             if (CONFIG.debugEnabled) {
-                LOGGER.info("Block broken at {} in {} ticks", target, phaseTicks);
+                LOGGER.info("{} at {} in {} ticks", placing ? "Block placed" : "Block broken",
+                        target, phaseTicks);
             }
 
-            // airConfirmTicks resets on re-entry via the toolSelect branch above.
+            // stateConfirmTicks resets on re-entry via the phaseTicks==1 branch above.
             //
             // Reaction beat between "the block broke" and the next phase —
             // a human glances at the result for a moment before moving on.
@@ -589,6 +680,13 @@ public class BotController {
             if (currentTask.advanceToNextTarget()) {
                 lookRetryUsed = false;
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
+                return;
+            }
+
+            // A placement drops nothing, so there is nothing to collect —
+            // take the next task straight after the reaction beat.
+            if (placing) {
+                scheduleAction(BotController::completeCurrentTask);
                 return;
             }
 
@@ -620,6 +718,150 @@ public class BotController {
         }
     }
 
+    /**
+     * Walk toward a drop while the break continues, without letting the camera
+     * or the break itself suffer for it. A human mining a corridor scoops up
+     * what fell next to them mid-swing rather than stopping, walking over and
+     * coming back — with the drop in the corner of the eye, so it comes out as
+     * a strafe rather than a turn.
+     * <p>
+     * The camera is committed to the mining target by the caller, so the walk
+     * direction is expressed in the 8 view-relative key directions (the same
+     * quantization {@code PathWalker.applyCounterBrake} uses to brake without
+     * turning). All four horizontal keys are driven every tick so a step
+     * decided last tick cannot leak into a tick that decided against moving.
+     * <p>
+     * Three things have to hold before a foot moves, because a break in
+     * progress is worth more than one dropped item:
+     * <ol>
+     *   <li>the step must keep the target inside reach and still leave a clear
+     *       line to the face being mined — otherwise the server rejects the
+     *       break packets and the task times out;
+     *   <li>the destination must be a cell the bot can stand in, floor
+     *       included: stepping into the hole it just dug is exactly the fall
+     *       the bot is supposed to avoid;
+     *   <li>the drop must be close enough to reach within the break
+     *       ({@code OPPORTUNISTIC_ITEM_RANGE}) and not already inside the
+     *       vanilla pickup radius, which collects it without moving at all.
+     * </ol>
+     * COLLECTING still runs afterwards and picks up whatever this declined.
+     */
+    private static void tickOpportunisticCollection(Minecraft client, LocalPlayer player,
+                                                    BlockPos target) {
+        net.minecraft.world.entity.item.ItemEntity nearest = null;
+        double nearestDistSq = Double.MAX_VALUE;
+        var box = player.getBoundingBox().inflate(OPPORTUNISTIC_ITEM_RANGE);
+        for (var item : client.level.getEntities(
+                net.minecraft.world.entity.EntityType.ITEM, box, e -> true)) {
+            double dx = item.getX() - player.getX();
+            double dy = item.getY() - player.getY();
+            double dz = item.getZ() - player.getZ();
+            double distSq = dx * dx + dy * dy + dz * dz;
+            // Already inside the pickup radius: vanilla will inhale it, and
+            // walking further would only overshoot.
+            if (distSq <= OPPORTUNISTIC_STOP_DISTANCE * OPPORTUNISTIC_STOP_DISTANCE) {
+                continue;
+            }
+            if (distSq > OPPORTUNISTIC_ITEM_RANGE * OPPORTUNISTIC_ITEM_RANGE) {
+                continue;
+            }
+            if (distSq < nearestDistSq) {
+                nearestDistSq = distSq;
+                nearest = item;
+            }
+        }
+        if (nearest == null) {
+            releaseMovementKeys();
+            return;
+        }
+
+        // Quantize the direction to the drop into the 8 key directions,
+        // relative to the view the camera is holding on the mined block.
+        float moveYaw = (float) Math.toDegrees(
+                Math.atan2(-(nearest.getX() - player.getX()), nearest.getZ() - player.getZ()));
+        float rel = AngleUtil.wrapDegrees(moveYaw - player.getYRot());
+        float a = Math.abs(rel);
+        boolean forward = a <= 67.5f;
+        boolean backward = a >= 112.5f;
+        int strafeDir = (a > 22.5f && a < 157.5f) ? (rel > 0 ? 1 : -1) : 0;
+
+        // Where that key combination actually pushes the body, which is the
+        // quantized direction — not the direction of the item. Forward for yaw
+        // θ is (−sin θ, cos θ); the player's right, which strafeDir > 0 means,
+        // is that turned 90° clockwise: (−cos θ, −sin θ).
+        double yawRad = Math.toRadians(player.getYRot());
+        double fx = -Math.sin(yawRad);
+        double fz = Math.cos(yawRad);
+        double pushX = (forward ? fx : backward ? -fx : 0.0) - strafeDir * fz;
+        double pushZ = (forward ? fz : backward ? -fz : 0.0) + strafeDir * fx;
+        double pushLen = Math.sqrt(pushX * pushX + pushZ * pushZ);
+        if (pushLen < 1.0e-6) {
+            releaseMovementKeys();
+            return;
+        }
+        double stepX = player.getX() + pushX / pushLen * STEP_LOOKAHEAD;
+        double stepZ = player.getZ() + pushZ / pushLen * STEP_LOOKAHEAD;
+
+        if (!isStepSafe(client, player, target, stepX, stepZ)) {
+            releaseMovementKeys();
+            return;
+        }
+
+        client.options.keyUp.setDown(forward);
+        client.options.keyDown.setDown(backward);
+        client.options.keyLeft.setDown(strafeDir < 0);
+        client.options.keyRight.setDown(strafeDir > 0);
+        client.options.keySprint.setDown(false);
+    }
+
+    /**
+     * Whether a step to {@code (stepX, stepZ)} keeps the bot able to finish the
+     * break and lands it somewhere it can stand.
+     */
+    private static boolean isStepSafe(Minecraft client, LocalPlayer player, BlockPos target,
+                                      double stepX, double stepZ) {
+        double dx = stepX - (target.getX() + 0.5);
+        double dy = player.getY() - (target.getY() + 0.5);
+        double dz = stepZ - (target.getZ() + 0.5);
+        if (dx * dx + dy * dy + dz * dz > CONFIG.reachDistance * CONFIG.reachDistance) {
+            return false;
+        }
+
+        // Line of sight from where the eye would be. The break packets are
+        // reach- and visibility-checked server-side; stepping behind a pillar
+        // stalls the task until maxBreakTicks with no visible cause.
+        Vec3 eye = new Vec3(stepX, player.getEyeY(), stepZ);
+        Vec3 aim = Vec3.atCenterOf(target);
+        BlockHitResult clip = client.level.clip(new ClipContext(
+                eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+        if (clip.getType() != HitResult.Type.BLOCK || !clip.getBlockPos().equals(target)) {
+            return false;
+        }
+
+        BlockPos feet = BlockPos.containing(stepX, player.getY(), stepZ);
+        return isStandable(client.level, feet);
+    }
+
+    /**
+     * Whether the bot can stand at {@code feet}: a sturdy floor under it and
+     * two fluid-free, collision-free cells for the body. No drop is tolerated
+     * at all — this is a single sideways step during a break, and even a
+     * one-block fall pulls the target out of the aim the camera is holding.
+     */
+    private static boolean isStandable(Level level, BlockPos feet) {
+        BlockPos below = feet.below();
+        if (!level.getBlockState(below).isFaceSturdy(level, below, net.minecraft.core.Direction.UP)) {
+            return false;
+        }
+        for (BlockPos pos : new BlockPos[] {feet, feet.above()}) {
+            var state = level.getBlockState(pos);
+            if (!state.getCollisionShape(level, pos).isEmpty() || !state.getFluidState().isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static void tickCollecting() {
         Minecraft client = Minecraft.getInstance();
         LocalPlayer player = client.player;
@@ -643,11 +885,6 @@ public class BotController {
             net.minecraft.world.phys.AABB searchBox = player.getBoundingBox().inflate(8.0);
             var items = client.level.getEntities(
                     net.minecraft.world.entity.EntityType.ITEM, searchBox, e -> true);
-            itemsNearby = !items.isEmpty();
-            if (itemsNearby) {
-                itemsSeenThisCollect = true;
-                lastItemSeenTick = phaseTicks;
-            }
 
             // Pick the nearest item by 3D distance (not just horizontal).
             // Items frequently bounce into the dug-out hole below the bot or
@@ -672,6 +909,29 @@ public class BotController {
                     nearestHorizDistSq = dx * dx + dz * dz;
                     nearest = item;
                 }
+            }
+
+            // Presence is measured on the same set the walk above uses. An
+            // item the loop rejected (>4 blocks up or down) is one the bot has
+            // decided it will never approach — counting it as "nearby" pins
+            // itemsNearby true forever, the exit gate can never fire, and the
+            // phase burns the full collectWaitMax. Behaviors that don't opt in
+            // keep the original unfiltered test.
+            itemsNearby = policy.fastCollectExit() ? nearest != null : !items.isEmpty();
+            if (itemsNearby) {
+                itemsSeenThisCollect = true;
+                lastItemSeenTick = phaseTicks;
+            }
+
+            // Other half of the same stall: when the bot stands on top of the
+            // block, vanilla pickup can inhale the drop before any tick
+            // observes it, so itemsSeenThisCollect — which the exit gate
+            // requires — never becomes true. Inventory growth since the break
+            // started is the same server-authoritative proof the break gate
+            // already accepts, and it also covers a pickup during INTERACTING.
+            if (policy.fastCollectExit() && !itemsSeenThisCollect
+                    && countMainInventory(player) > startInventoryCount) {
+                itemsSeenThisCollect = true;
             }
 
             // Vanilla pickup radius is ~1.5 blocks (3D). Stop walking once

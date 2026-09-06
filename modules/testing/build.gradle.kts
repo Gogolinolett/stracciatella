@@ -35,19 +35,23 @@ dependencies {
 
 // Convenience task — launches the game client with auto-test flag.
 // Creates/joins a flat test world automatically, runs all tests, prints results.
-// Usage: ./gradlew runMinecraftTests
+// Usage: ./gradlew runMinecraftTests [-PtickSpeed=N] [-Psuites=bot,miner]
 gradle.taskGraph.whenReady {
     if (allTasks.any { it.name == "runMinecraftTests" }) {
         val tickSpeed = providers.gradleProperty("tickSpeed").getOrElse("10")
+        val suites = providers.gradleProperty("suites").getOrElse("")
         allTasks.filterIsInstance<JavaExec>().filter { it.name == "runStracciatellaLight" }.forEach {
             it.jvmArgs("-Dstracciatella.testing.autorun=true")
             it.jvmArgs("-Dstracciatella.testing.tickMultiplier=$tickSpeed")
+            it.jvmArgs("-Dstracciatella.testing.suites=$suites")
         }
     }
 }
 
 tasks.register("runMinecraftTests") {
     group = "verification"
-    description = "Launches the Minecraft client with auto-test mode enabled. Use -PtickSpeed=N to set tick multiplier (default 7)."
+    description = "Launches the Minecraft client with auto-test mode enabled. " +
+        "-PtickSpeed=N sets the tick multiplier (default 10); " +
+        "-Psuites=a,b runs only suites whose name contains one of the given substrings."
     dependsOn(":runStracciatellaLight")
 }

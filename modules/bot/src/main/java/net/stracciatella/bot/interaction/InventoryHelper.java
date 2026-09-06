@@ -1,5 +1,7 @@
 package net.stracciatella.bot.interaction;
 
+import java.util.function.Predicate;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
@@ -51,15 +53,72 @@ public class InventoryHelper {
             }
         }
 
+        return equip(player, bestSlot);
+    }
+
+    /**
+     * Select the slot holding the largest stack matching {@code matcher},
+     * swapping it into the hotbar the same way {@link #selectBestTool} does.
+     * Returns the hotbar slot now holding it, or -1 if nothing matches.
+     * <p>
+     * Used by USE tasks, which need a specific item in hand rather than the
+     * fastest tool for a block. Largest stack wins so the bot keeps using the
+     * pile it is carrying instead of burning through singles.
+     */
+    public static int selectItem(LocalPlayer player, Predicate<ItemStack> matcher) {
+        Inventory inv = player.getInventory();
+        int bestSlot = -1;
+        int bestCount = 0;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty() || !matcher.test(stack)) {
+                continue;
+            }
+            if (stack.getCount() > bestCount) {
+                bestCount = stack.getCount();
+                bestSlot = i;
+            }
+        }
+
+        return equip(player, bestSlot);
+    }
+
+    /**
+     * Number of completely empty slots in the 36 main-inventory slots.
+     * <p>
+     * Empty slots, not free space: a mining run fills partial stacks constantly,
+     * so counting remaining stack capacity would report "room left" right up to
+     * the moment a new block type drops and has nowhere to go. Empty slots are
+     * what actually decides whether the next unknown drop fits.
+     */
+    public static int freeSlots(LocalPlayer player) {
+        Inventory inv = player.getInventory();
+        int free = 0;
+        for (int i = 0; i < 36; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                free++;
+            }
+        }
+        return free;
+    }
+
+    /**
+     * Bring the item in {@code bestSlot} into the player's hand and tell the
+     * server about it. Returns the resulting hotbar slot, or -1 when
+     * {@code bestSlot} is negative (nothing to equip).
+     */
+    private static int equip(LocalPlayer player, int bestSlot) {
         if (bestSlot < 0) {
             return -1;
         }
 
+        Inventory inv = player.getInventory();
         int hotbarSlot;
         if (bestSlot < 9) {
             hotbarSlot = bestSlot;
         } else {
-            // Tool is in storage — swap it into the currently selected hotbar
+            // Item is in storage — swap it into the currently selected hotbar
             // slot via a container-click packet. `bestSlot` doubles as the
             // menu slot index in InventoryMenu (storage rows map 1:1 to menu
             // slots 9–35). The hotbar key `button` for SWAP is the

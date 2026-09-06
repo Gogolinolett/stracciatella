@@ -16,6 +16,7 @@ net.stracciatella.bot
 ├── BotModule.java                  # Entry point (@Task STARTED), registers tick/commands/tests
 ├── BotController.java              # Static tick-driven state machine (like PathWalker)
 ├── BotConfig.java                  # GSON-persisted config (bot.json), humanization knobs
+├── BotPolicy.java                  # Record: per-behavior safety/collection opt-ins
 ├── BotCommands.java                # /bot subcommands
 ├── task/
 │   ├── BotTask.java                # Interface: targetPos, interactionType, isComplete
@@ -24,14 +25,19 @@ net.stracciatella.bot
 │   ├── InteractionType.java        # Enum: ATTACK, USE
 │   ├── MineBlockTask.java          # Mine single block (complete when → air)
 │   ├── ChopTreeTask.java           # Mine tree logs top-to-bottom (multi-target)
+│   ├── PlaceBlockTask.java         # Place a block against a support face (USE)
 │   └── GatherAreaTask.java         # Meta-task: scan + enqueue mine/chop subtasks
 ├── behavior/
-│   ├── BotBehavior.java            # Interface for long-running strategies (id, start, tick, abort, statusLine)
+│   ├── BotBehavior.java            # Interface for long-running strategies (id, policy, start, tick, abort, statusLine)
 │   ├── BehaviorStatus.java         # Enum: RUNNING, SUCCEEDED, FAILED
-│   └── BehaviorRunner.java         # Static registry + executor, one active behavior, ticked before BotController
+│   └── BehaviorRunner.java         # Static registry + executor, one active behavior, owns the policy + stop guards
+├── safety/
+│   └── BotAlarm.java               # Latches damage / player-attack events for the runner
+├── mixin/
+│   └── ClientPacketListenerMixin.java  # Damage + attack-sound packets → BotAlarm
 ├── interaction/
 │   ├── BlockInteractor.java        # Simulates attack/use key hold
-│   └── InventoryHelper.java        # Reads hotbar, selects best tool
+│   └── InventoryHelper.java        # Reads hotbar, selects best tool, counts free slots
 ├── scan/
 │   ├── BlockScanner.java           # Finds blocks by predicate within radius
 │   ├── TreeDetector.java           # Detects tree structures (base, trunk, height)
@@ -133,6 +139,69 @@ Tool selection now happens in LOOKING (tick 1), not INTERACTING. The carried-ite
 
 A short `preAttackHesitation` (default 1–3 ticks) is held between the LOOKING gate firing and the transition to INTERACTING. This is **not** the old `settleDelay` (a timing buffer for the server) — packet sync is already done by parallel tool selection above. The hesitation is purely humanness: the visible "I see it, I click" beat between locking on and clicking. Micro-saccades enable at the start of the hesitation so the gaze trembles slightly during the commit moment.
 
+### Placing (`PlaceBlockTask`, `InteractionType.USE`)
+
+Placement is **not** the mirror image of mining. You cannot aim at the position where the block should go — a raycast passes straight through it — so a block is placed on the side of an existing block you click. `PlaceBlockTask` therefore takes a **support** block adjacent to the destination, and `targetPos()` returns the *support*, not the destination. The entire LOOKING pipeline (aim, hit-result gate, re-approach, timeouts) then works unchanged; `placePos()` exposes the destination for callers. `PlaceBlockTask.findSupport(level, pos)` picks a neighbour whose face toward `pos` is sturdy (`BlockState.isFaceSturdy`), returning null when the position is unreachable from any angle — the caller should then skip it instead of enqueuing a task that can only time out.
+
+Two `BotTask` default methods carry the USE-specific data, so no existing task changed:
+
+- `requiredItem()` — the item to hold. LOOKING calls `InventoryHelper.selectItem` (largest matching stack, same hotbar-swap + carried-item packet as `selectBestTool`) instead of picking the fastest tool, which would be nonsense for a placement.
+- `preferredFace()` — the face to click. Mining returns null and re-derives the most visible face every tick as the bot moves; placement pins it, because the face decides where the block ends up. When non-null the LOOKING hit-result gate **also** requires `bhr.getDirection()` to match — clicking the wrong side of the support would put the block somewhere else entirely.
+
+`BlockInteractor` sends one `useItemOn` against that face and then retries every `USE_RETRY_TICKS` (15) until the controller confirms or the task times out. There is no "continue" packet for placement the way there is for mining: a use either places or it doesn't, and a human who clicks and sees nothing happen clicks again. The retry also covers a dropped use packet.
+
+Confirmation mirrors the break gate exactly: the destination must hold a solid, fluid-free block for `airConfirmTicks` consecutive ticks **and** the main inventory must have *shrunk* by the consumed block. A client-predicted placement the server rejects never moves the item count. In creative the block is never consumed, so `instabuild` substitutes for the inventory signal — without that clause every creative placement would silently burn the full interaction timeout.
+
+A placement drops nothing, so the post-interaction path skips COLLECTING entirely and takes the next task after the usual reaction beat.
+
+The counter formerly called `airConfirmTicks` is now `stateConfirmTicks` — it counts ticks in the *completed* state, which is air for mining and a solid block for placing. The config knob keeps its original name (`CONFIG.airConfirmTicks`) because it is persisted in `bot.json`.
+
+## Policy layer (`BotPolicy`)
+
+Safety and collection behaviour is **opted into per behavior**, never configured globally. `BotBehavior.policy()` is abstract on purpose: whether a strategy should abort on damage or keep digging is a decision its author has to make, and a default would let a new behavior inherit "no safety at all" by omission. `DiamondMinerBehavior` returns `BotPolicy.none()` in one line — its timing was validated without any of this, and mob *defence* rather than stopping is the right answer for a strip miner.
+
+`BehaviorRunner` reads the policy once at start, pushes it into `BotController`, enforces the stop guards itself, and resets both on stop. Tasks issued straight from `/bot` commands run under `none()`, i.e. exactly the pre-policy execution. There is no `/bot safety` command and no global setting.
+
+| Flag | Effect |
+|------|--------|
+| `stopOnDamage` | Any health decrease ends the run |
+| `stopOnPlayerAttack` | A player swinging at the bot ends the run, damage or not |
+| `stopWhenInventoryFull` + `minFreeSlots` | Ends the run once fewer than N main slots are empty |
+| `opportunisticCollection` | INTERACTING steps toward nearby drops without dropping the break |
+| `fastCollectExit` | Closes the two COLLECTING stalls below |
+
+### Detection: packets, not polling
+
+Two `ClientPacketListener` injections feed `BotAlarm`; the runner consumes both latches every tick and applies only the ones its policy asked for (a trigger nobody wanted must not stay set and fire at the start of the next run).
+
+- `handleDamageEvent` where `entityId == mc.player.getId()` — the bot took damage.
+- `handleSoundEvent` where the sound is `PLAYER_ATTACK_NODAMAGE`. **A zero-damage hit produces no damage event at all** — this sound is the only signal that reaches the bot's client. It is broadcast at the *attacker's* position, so proximity stands in for "aimed at me": within 5 blocks counts, within 0.5 does not, because `Player.attack` broadcasts with a `null` source player and the bot would otherwise stop itself the first time it swung at anything. A neighbouring whiff at an unrelated target is an accepted false positive — stopping too often is cheap, missing a hit is not.
+
+Both inject at **TAIL, not HEAD**: these handlers open with `PacketUtils.ensureRunningOnSameThread`, which runs once on the netty thread (throwing to reschedule) and once on the client thread, so a HEAD injection would read `Minecraft.player` off-thread.
+
+### Stopping and the alert
+
+Every abnormal stop — a guard firing or the behavior returning `FAILED` — plays three `NOTE_BLOCK_PLING` beeps (spaced 5 ticks via `SoundManager.playDelayed`, so they read as three beeps rather than one) and prints a red chat line naming the reason plus the behavior's own `statusLine()` summary. A clean `SUCCEEDED` gets one soft `NOTE_BLOCK_BELL` and a grey line. The supervising player may be chunks away, so "it's done" and "it gave up" must be distinguishable without watching chat. Note `SimpleSoundInstance.forUI` takes **(pitch, volume)**, not the usual (volume, pitch).
+
+### Opportunistic collection
+
+With the flag on, INTERACTING walks toward a drop *while the break continues* — a human mining a corridor scoops up what fell next to them mid-swing. The camera is already committed to the mined block by the time this runs, so the walk direction is expressed in the 8 view-relative key directions (the quantization `PathWalker.applyCounterBrake` uses to brake without turning); the result is a strafe, not a turn. All four horizontal keys are driven every tick, and INTERACTING releases them on both its exits — `transitionTo` does not.
+
+Three guardrails, because a break in progress is worth more than one dropped item:
+
+1. The projected step must keep the target inside `reachDistance` **and** leave a clear `level.clip` line from the would-be eye to the block. The server reach/visibility-checks the break packets; stepping behind a pillar stalls the task until `maxBreakTicks` with no visible cause.
+2. The destination must be standable — sturdy floor, two fluid- and collision-free cells. No drop is tolerated at all: even a one-block fall pulls the target out of the aim.
+3. Only drops between 1.5 and 3 blocks away. Inside 1.5 vanilla pickup handles it; beyond 3 the trip costs more than the item.
+
+COLLECTING still runs afterwards and picks up whatever this declined.
+
+### The two COLLECTING stalls (`fastCollectExit`)
+
+Both are pre-existing and both burn the full `collectWaitMax`. They are fixed behind a flag rather than globally because `/bot mine` and the diamond miner were tuned around today's timing.
+
+1. **Inhaled drop.** Standing on top of the block, vanilla pickup can take the drop before any tick observes it, so `itemsSeenThisCollect` — which the exit gate requires — never becomes true. Fix: inventory growth since the break started also counts, the same server-authoritative proof the break gate already accepts (and it covers a pickup during INTERACTING too).
+2. **Unreachable drop.** `itemsNearby` was computed from the *unfiltered* entity list while the walk loop skips anything more than 4 blocks above or below. An item the bot has explicitly decided never to approach kept `itemsNearby` true forever, so `doneCollecting` could never fire. Fix: measure presence on the same filtered set the walk uses.
+
 ## Test setup: waiting on gamemode sync
 
 A separate race used to produce the same "block broken, no drop" symptom: the test runs `/gamemode survival` and then immediately enqueues a mining task on the client. On the heavily-loaded accelerated-tick server, `/gamemode` can be queued behind other command packets. When the bot starts attacking, the server still has the player in creative — block breaks are instant client-side and drop nothing. `BotTests.switchToSurvivalAt` now waits on `!mc.player.getAbilities().instabuild` (the server→client ack of the mode change) before starting the bot, which eliminates the whole class of failure without any timing tuning.
@@ -201,4 +270,11 @@ Phases / timing:
 Tests in `test/BotTests.java`, registered via `TestRunner.instance().registerSuite(BotTests.class)`.
 Run via `./gradlew runMinecraftTests`. Each test builds its environment with `/fill` + `/setblock`.
 
-Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure.
+Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection.
+
+The four policy tests drive a `PolicyProbeBehavior` defined inside `BotTests` — the policy layer is only reachable through a behavior, so the guards need one to be testable at all.
+
+- **fast collect exit** summons a `NoGravity` item 6 blocks up (inside the 8-block collect query, outside the 4-block walk filter) and asserts the run finishes in fewer than `collectWaitMax` ticks with the decoy still present, the block actually mined, and the cobblestone in the inventory. Without the flag the decoy's mere presence pins the phase until the timeout; the last two assertions exist so "exits sooner" can't quietly become "exits without collecting".
+- **opportunistic collection** puts a drop 2.5 blocks to the bot's *side* — perpendicular to the block being mined, so reaching it is a pure strafe — and asserts the bot closes at least 0.5 blocks **while still in INTERACTING**. This is what pins down the view-relative sign convention, which has no other coverage. It mines **obsidian with a diamond pickaxe**: ~187 ticks of INTERACTING, long enough to observe the walk, and it still drops. Mining bare-handed for a slow break does not work — stone without a pickaxe drops nothing, so the break never produces an artifact, never confirms, and ends in a `maxBreakTicks` timeout instead of the phase the test needs to watch.
+
+**The player-attack path has no in-game test** — it needs a second player swinging at the bot. Its two real failure modes (never firing, firing on the bot's own swing) are covered by plain JUnit in `src/test/.../safety/BotAlarmTest.java`, which is why `BotAlarm.isAttackerInRange` takes bare doubles instead of Minecraft types. Run with `./gradlew :modules:bot:test`.

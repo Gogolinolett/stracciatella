@@ -52,6 +52,12 @@ During automated test runs, `TestRunner` accelerates both client and server tick
 
 Configurable via Gradle: `./gradlew runMinecraftTests -PtickSpeed=N` (default 10). The value is passed as `-Dstracciatella.testing.tickMultiplier=N`.
 
+## Suite filter
+
+`./gradlew runMinecraftTests -Psuites=bot,miner` runs only suites whose name contains one of the comma-separated substrings (case-insensitive); no value runs everything. Passed through as `-Dstracciatella.testing.suites=...` and applied in `TestRunner.runAll`.
+
+Substrings rather than exact names so `-Psuites=bot` finds "Bot Tests" without anyone having to remember the exact title. Use it for every run during development and take the unfiltered run only once at the end — a full run takes minutes and mixes in suites unrelated to the change, whose own known flakiness then reads as a regression.
+
 Note: `/tick rate` alone does NOT speed up `Minecraft.tick()` on the client — only the server. The mixin-based extra ticks are required for actual client speedup.
 
 ## Player death handling

@@ -63,6 +63,7 @@ stracciatella/
 │   ├── pathfinding/               # Pathfinding module — autonomous movement & parkour
 │   ├── bot/                       # Bot module — task execution + behavior layer
 │   ├── miner/                     # Miner module — specialized mining behaviors (diamond strip miner)
+│   ├── gui/                       # Gui module — in-game UI framework, root menu, /gui
 │   ├── testing/                   # Testing framework — in-game integration tests
 │   ├── fullscreen/                # Fullscreen module — config and utilities
 │   └── anonymous-modlist/         # Anonymous mod list module
@@ -93,7 +94,8 @@ modules/<name>/
 | **bot** | Human-like task execution (mine/chop/gather) + behavior layer for strategies | Yes |
 | **camera** | Human-like camera movement (yaw/pitch smoothing, angle utilities) | Yes |
 | **core** | Shared state management, core mixins | No |
-| **miner** | Specialized mining behaviors on the bot's behavior layer (diamond strip miner) | Yes |
+| **gui** | In-game UI framework: page registry, root menu, key binding, `/gui` | Yes |
+| **miner** | Specialized mining behaviors on the bot's behavior layer (diamond strip miner, chunk miner) | Yes |
 | **pathfinding** | Autonomous player movement, mesh generation, A* pathfinding, parkour | Yes |
 | **testing** | In-game integration test framework with annotations and test runner | Yes |
 | **fullscreen** | Fullscreen configuration and utilities | No |
@@ -117,6 +119,7 @@ modules/<name>/
 
 **Miner**:
 - `DiamondMinerBehavior.java` — Diamond strip miner (LOCATE → DESCEND → TUNNEL), plans `MineBlockTask` batches on the BotController
+- `ChunkMinerBehavior.java` — Chunk miner (SELECT_SLAB → DESCEND → CLEAR), serpentine 2-layer slabs, resumes by reading the world rather than saving a cursor
 
 **Testing**:
 - `TestRunner.java` — Singleton test execution engine
@@ -135,9 +138,29 @@ modules/<name>/
 # Run automated in-game tests (default 10x speed, use 20x for fastest runs)
 ./gradlew runMinecraftTests
 
+# Run only the suites of the module you are changing (substring match on suite name)
+./gradlew runMinecraftTests -Psuites=bot,miner
+
 # Build a single module
 ./gradlew :modules:<name>:build
 ```
+
+## Testing-Workflow (PFLICHT)
+
+**Während der Entwicklung nur die Suites der geänderten Module laufen lassen**
+(`-Psuites=<teil-des-suite-namens>`, kommasepariert). Den vollständigen Lauf
+ohne `-Psuites` erst am Ende einmal, um Regressionen in anderen Modulen zu
+finden. Grund: ein Komplettlauf dauert Minuten und mischt Suites bei, die mit
+der Änderung nichts zu tun haben — deren bekannte Flakiness sieht dann wie eine
+Regression aus.
+
+Nur zwei Signale zählen als Testergebnis:
+
+- Der `TEST RESULTS`-Block in `run/logs/latest.log`. **Exit-Code 0 von Gradle
+  bedeutet NICHT, dass die Tests bestanden haben.**
+- Nie einen zweiten Testlauf starten, solange der erste noch läuft (siehe
+  TOOL-002): der zweite Gradle-Aufruf endet mit Exit 1 ohne Client, und die
+  Zusatzlast verfälscht den laufenden Lauf.
 
 ## Logs
 - Located in `run/logs/`, mainly use the newest one (`latest.log`)

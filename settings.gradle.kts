@@ -33,6 +33,7 @@ includeModule("pathfinding")
 includeModule("testing")
 includeModule("bot")
 includeModule("miner")
+includeModule("gui")
 
 fun includeModule(path: String) {
     include("modules:$path")

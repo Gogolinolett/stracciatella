@@ -3,7 +3,11 @@ package net.stracciatella.bot.interaction;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 import net.stracciatella.bot.task.InteractionType;
 
 /**
@@ -19,29 +23,48 @@ import net.stracciatella.bot.task.InteractionType;
  */
 public class BlockInteractor {
 
+    /**
+     * Ticks between repeated use attempts while a placement has not been
+     * confirmed. A human who clicks and sees nothing happen clicks again; it
+     * also covers a dropped use packet without stalling for the full
+     * interaction timeout.
+     */
+    private static final int USE_RETRY_TICKS = 15;
+
     private static boolean interacting = false;
     private static InteractionType currentType = null;
     private static boolean started = false;
     private static BlockPos targetPos = null;
+    // Face to interact with, or null to re-derive the most visible one each
+    // tick. Mining passes null (the best face can change as the bot moves);
+    // placement pins the face, because it decides where the block ends up.
+    private static Direction fixedFace = null;
+    private static int useCooldown = 0;
 
     /**
-     * Begin block interaction against an explicit target. The destroy packets
-     * are sent from {@link #tickInteraction()} which must run each tick.
+     * Begin block interaction against an explicit target. The interaction
+     * packets are sent from {@link #tickInteraction()} which must run each
+     * tick.
+     *
+     * @param face the face to interact with, or {@code null} to re-derive the
+     *             most visible face every tick (mining)
      */
-    public static void startInteraction(InteractionType type, BlockPos target) {
+    public static void startInteraction(InteractionType type, BlockPos target, Direction face) {
         interacting = true;
         currentType = type;
         started = false;
         targetPos = target;
+        fixedFace = face;
+        useCooldown = 0;
     }
 
     /**
-     * Called at START_CLIENT_TICK (before handleKeybinds) to drive the mining.
-     * Sends destroy packets against the explicit target position we captured
-     * in {@link #startInteraction(InteractionType, BlockPos)}.
+     * Called at START_CLIENT_TICK (before handleKeybinds) to drive the
+     * interaction. Sends packets against the explicit target position we
+     * captured in {@link #startInteraction(InteractionType, BlockPos, Direction)}.
      */
     public static void tickInteraction() {
-        if (!interacting || currentType != InteractionType.ATTACK) {
+        if (!interacting) {
             return;
         }
         Minecraft mc = Minecraft.getInstance();
@@ -49,15 +72,35 @@ public class BlockInteractor {
             return;
         }
 
-        Direction face = faceTowardPlayer(mc, targetPos);
+        Direction face = fixedFace != null ? fixedFace : faceTowardPlayer(mc, targetPos);
 
-        if (!started) {
-            mc.missTime = 0;
-            mc.gameMode.startDestroyBlock(targetPos, face);
-            started = true;
-        } else {
-            mc.gameMode.continueDestroyBlock(targetPos, face);
+        if (currentType == InteractionType.ATTACK) {
+            if (!started) {
+                mc.missTime = 0;
+                mc.gameMode.startDestroyBlock(targetPos, face);
+                started = true;
+            } else {
+                mc.gameMode.continueDestroyBlock(targetPos, face);
+            }
+            return;
         }
+
+        // USE — place the held block against `face` of the target. Unlike
+        // mining there is no "continue" packet: one use either places or does
+        // not, so retry on a slow cadence until the controller confirms the
+        // placement or times the task out.
+        if (started && ++useCooldown < USE_RETRY_TICKS) {
+            return;
+        }
+        useCooldown = 0;
+        Vec3 hitVec = Vec3.atCenterOf(targetPos)
+                .add(face.getStepX() * 0.5, face.getStepY() * 0.5, face.getStepZ() * 0.5);
+        InteractionResult result = mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND,
+                new BlockHitResult(hitVec, face, targetPos, false));
+        if (result.consumesAction()) {
+            mc.player.swing(InteractionHand.MAIN_HAND);
+        }
+        started = true;
     }
 
     public static void stopInteraction() {
@@ -72,6 +115,8 @@ public class BlockInteractor {
         currentType = null;
         started = false;
         targetPos = null;
+        fixedFace = null;
+        useCooldown = 0;
     }
 
     public static boolean isInteracting() {

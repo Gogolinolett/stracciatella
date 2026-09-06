@@ -15,6 +15,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.stracciatella.bot.BotController;
+import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorStatus;
 import net.stracciatella.bot.behavior.BotBehavior;
 import net.stracciatella.bot.scan.BlockScanner;
@@ -110,6 +111,18 @@ public class DiamondMinerBehavior implements BotBehavior {
     @Override
     public String id() {
         return "diamond_miner";
+    }
+
+    /**
+     * No policy. The strip miner's timing and collection behaviour was tuned
+     * without any of these, and its own fail-fast hazard checks already abort
+     * the run before most of what the policy guards would catch. Mob defence
+     * (fighting back rather than stopping) is the answer for this behavior and
+     * is not implemented yet.
+     */
+    @Override
+    public BotPolicy policy() {
+        return BotPolicy.none();
     }
 
     @Override

@@ -1,6 +1,9 @@
 package net.stracciatella.miner;
 
 import net.stracciatella.bot.behavior.BehaviorRunner;
+import net.stracciatella.gui.GuiRegistry;
+import net.stracciatella.miner.gui.BlacklistPage;
+import net.stracciatella.miner.test.ChunkMinerTests;
 import net.stracciatella.miner.test.MinerTests;
 import net.stracciatella.testing.runner.TestRunner;
 
@@ -20,6 +23,7 @@ public final class MinerSetup {
 
     public static final MinerConfig CONFIG = new MinerConfig();
     private static DiamondMinerBehavior diamondMiner;
+    private static ChunkMinerBehavior chunkMiner;
 
     private MinerSetup() {
     }
@@ -28,11 +32,19 @@ public final class MinerSetup {
         return diamondMiner;
     }
 
+    public static ChunkMinerBehavior chunkMiner() {
+        return chunkMiner;
+    }
+
     static void init() {
         CONFIG.applyFrom(MinerConfig.load());
         diamondMiner = new DiamondMinerBehavior(CONFIG);
+        chunkMiner = new ChunkMinerBehavior(CONFIG);
         BehaviorRunner.register(diamondMiner);
+        BehaviorRunner.register(chunkMiner);
         MinerCommands.register();
+        GuiRegistry.register(new BlacklistPage(CONFIG));
         TestRunner.instance().registerSuite(MinerTests.class);
+        TestRunner.instance().registerSuite(ChunkMinerTests.class);
     }
 }

@@ -12,6 +12,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 public class TestRunner {
@@ -129,10 +130,38 @@ public class TestRunner {
     }
 
     /**
+     * Whether {@code suiteName} is covered by the {@code stracciatella.testing.suites}
+     * filter — a comma-separated list of case-insensitive substrings, empty or
+     * absent meaning "run everything".
+     * <p>
+     * A full run takes minutes and mixes in suites that have nothing to do with
+     * the change being worked on, which makes their own known flakiness look
+     * like a regression. Iterating on one module's suite and running everything
+     * once at the end is both faster and easier to read. Substrings rather than
+     * exact names so {@code -Psuites=bot} finds "Bot Tests" without anyone
+     * having to remember the exact suite title.
+     */
+    private static boolean suiteSelected(String suiteName) {
+        String filter = System.getProperty("stracciatella.testing.suites", "");
+        if (filter.isBlank()) {
+            return true;
+        }
+        for (String wanted : filter.split(",")) {
+            String trimmed = wanted.trim();
+            if (!trimmed.isEmpty()
+                    && suiteName.toLowerCase(Locale.ROOT).contains(trimmed.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Run all registered tests synchronously on the calling thread.
      */
     private void runAll(TestContext ctx) {
         List<RegisteredTest> tests = new ArrayList<>(registeredTests);
+        tests.removeIf(t -> !suiteSelected(t.suiteName()));
         tests.sort(Comparator.comparingInt(t -> t.annotation().order()));
         results.clear();
 
