@@ -132,8 +132,11 @@ modules/<name>/
 # Build everything
 ./gradlew build
 
-# Run Minecraft client (light mod set)
-./gradlew runClient
+# Run the client with all mods AND every Stracciatella module
+./gradlew runStracciatella
+
+# Same, but only the light third-party mod set (what the in-game tests use)
+./gradlew runStracciatellaLight
 
 # Run automated in-game tests (default 10x speed, use 20x for fastest runs)
 ./gradlew runMinecraftTests
@@ -144,6 +147,36 @@ modules/<name>/
 # Build a single module
 ./gradlew :modules:<name>:build
 ```
+
+**One client, enforced in the build.** Loom registers `runClient`, `runServer` and
+`runClientRenderDoc` in every project that applies it — root, `loader`,
+`loader:test3module` and all nine modules — so an unqualified `gradlew runClient` used to
+start twelve at once. Only the root run configurations are real; the module copies have no
+merged loader jar, no classTweaker remapped into the `named` namespace and no jol-core on
+the game classpath, so each died in loader init behind its own Fabric error window
+(`ClassTweakerFormatException` / `NoClassDefFoundError: org/openjdk/jol/datamodel/DataModel`).
+The root `build.gradle.kts` therefore sets `enabled = isRootProject` on every `RunGameTask`,
+so only the root one ever executes.
+
+Do not re-enable them to run a single module: those tasks cannot work, and their crash
+happens *before* a log is written, so `run/logs/latest.log` shows one healthy startup while
+eleven error windows sit on screen — the failure is invisible in the log. To exercise one
+module, run the full client and use that module's commands.
+
+**`runClient` is not the Stracciatella client.** It is Loom's bare `client` run
+configuration: the game and Fabric start, but no module is on the classpath, so
+`ModuleManager` walks its lifecycle without a single `Loading module` line and every module
+command (`/miner`, `/bot`, `/path`, `/gui`) comes back as *Unknown or incomplete command*.
+Only `runStracciatella` (full mod list, 86 mods) and `runStracciatellaLight` (light list)
+add the module classpath, via `registerStracciatellaTask` + `GenerateClasspath` in
+`StracciatellaRootPlugin`. `runStracciatella` inherits from `runStracciatellaLight`, which
+inherits from Loom's `client`.
+
+**Only one client at a time.** A second instance dies at loader init with
+`FileSystemException: stracciatella\system_injections\injected.jar: ... used by another
+process` (from `KnotClassLoaderHack.hack`), plus `Unable to delete file run/logs/latest.log`.
+Close the running client before launching another — the message names a file lock, not a
+code fault.
 
 ## Testing-Workflow (PFLICHT)
 

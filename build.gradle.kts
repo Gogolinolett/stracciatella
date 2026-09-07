@@ -60,10 +60,20 @@ tasks {
 }
 
 allprojects {
+    val isRootProject = this == rootProject
     tasks {
         withType<RunGameTask>().configureEach {
             maxHeapSize = "8G"
             workingDir(rootProject.projectDir)
+            // Loom registers runClient/runServer/runClientRenderDoc in every
+            // project that applies it, so an unqualified `gradlew runClient`
+            // starts one per project — twelve at once. Only the root project's
+            // run configurations are real: the module copies have no merged
+            // loader jar, no classTweaker remapped into the named namespace and
+            // no jol-core on the game classpath, so each one dies in loader init
+            // behind its own Fabric error window. They can never do anything
+            // useful, so they are disabled rather than merely documented.
+            enabled = isRootProject
         }
     }
     pluginManager.apply {
