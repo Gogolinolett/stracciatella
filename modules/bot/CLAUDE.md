@@ -37,7 +37,7 @@ net.stracciatella.bot
 │   ├── ClientPacketListenerMixin.java  # Damage + attack-sound + block-ack packets
 │   └── ClientLevelAccessor.java    # @Invoker for the package-private prediction handler
 ├── interaction/
-│   ├── BlockInteractor.java        # Simulates attack/use key hold
+│   ├── BlockInteractor.java        # Drives destroy/use via gameMode with an explicit target
 │   ├── InventoryHelper.java        # Reads hotbar, selects best tool, counts free slots
 │   └── ServerBlockSync.java        # Highest block-prediction sequence the server has settled
 ├── scan/
@@ -72,8 +72,10 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block. After a failed look (`forceApproach`) it walks to close range (2.0) instead of reach distance — the re-approach exists to change the viewpoint | `positionTimeout` |
 | **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — the crosshair touching the block is when a human clicks; no angular convergence required (the camera keeps easing toward its aim point during INTERACTING). A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. Continuing a seam skips the hesitation and keeps the previous camera. | `lookTimeout` |
-| **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
+| **INTERACTING** | Calls `gameMode.startDestroyBlock`/`continueDestroyBlock` on the explicit target and swings the arm each tick like vanilla, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
+
+**COLLECTING is the one phase that walks on raw key presses** — no PathWalker under it, unlike NAVIGATING, and no reach/line-of-sight gate, unlike the opportunistic step during INTERACTING. `walkToward` points the gaze at the drop, holds `keyUp`, and adds `keySprint` past two blocks; direction comes from the gaze and nothing else. A drop lies wherever it rolled, including over the lip of the shaft the bot just dug, so it needs its own floor check: `hasFloorWithinOneBlock` looks `STEP_LOOKAHEAD` (1.0) ahead along the gaze and releases the keys when there is no sturdy face under that cell or one below it. Without it the bot sprinted off its own platform and died of the fall. It is deliberately weaker than `isStandable`, which the opportunistic step uses: requiring head room and a collision-free cell made the bot refuse a drop lying against the face it had just mined, and it then stood still for the whole collect window. Walking into a wall costs nothing — only falling does.
 
 ### Smart transitions after block break
 
@@ -106,7 +108,9 @@ Exit gates depend on whether another walked task is queued:
   3. `phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — sustained absence window. Avoids exiting on a transient absence tick between sequentially picking up multiple drops.
 - **Another task queued** — only conditions 1 and 2 are required; the sustained-absence wait is skipped. Straggler drops are picked up via the vanilla pickup box during the `NAVIGATING` walk toward the next target. Eliminates the visible "pause after pickup" in multi-task flows.
 - **`fastCollectExit` opted in** — likewise conditions 1 and 2 only. A behavior that plans one block at a time never has a task queued at this point (it plans the next one only once the controller is idle), so the clause above can never fire for it and the 60-tick window is paid for *every block*: measured on the chunk miner, ~20 ticks of work per block against ~90 elapsed.
-- **Hand-off** (`fastCollectExit` **and** `opportunisticCollection`, with a task queued) — leaves *immediately*, before conditions 1 and 2, drops still on the ground. This is the one exit that does not finish collecting, and it is only sound because the two flags together promise the walk still happens: `opportunisticCollection` strafes toward those same drops during the next break, so the walk overlaps the mining instead of replacing it. In a corridor the drops lie between the bot and the column it is about to dig, so that step *is* the corridor advance — the bot never walks anywhere it wasn't going. Without it a continuously-planning behavior pays one full stop-and-fetch per column: "mine, stand, walk, mine".
+There is no fourth exit that leaves before conditions 1 and 2 with drops still on the ground. One existed — a hand-off, taken when `fastCollectExit` and `opportunisticCollection` were both set and a task was queued — on the promise that the opportunistic strafe would collect those drops during the next break. It is gone: the strafe is a nudge, not a walk (measured closing 1.9 blocks to 1.6 over an entire break, against a 1.425 pickup box), and when it fell short nothing ever came back for the drop. It also bought nothing, because the case it was meant to speed up is the one condition 2 already leaves on tick 1 — vanilla pickup inhales the drop during the break, so the inventory has grown and no item is left nearby.
+
+`itemsNearby` is measured on the same filtered set the walk uses, not on the raw 8-block query: an item more than 4 blocks above or below, or one the bot has walked at for `itemAbsenceTicks` without getting closer, is one it has decided never to approach. Counting those as "nearby" pins the flag true forever and the phase burns the full `collectWaitMax` — 1200 ticks of the bot standing still, which reads as it having quit. The give-up takes no opt-in: it applies to plain `/bot` tasks as much as to behaviors, because sixty ticks of walking without getting closer means the same thing whoever queued the task.
 
 While no items are visible yet, the bot walks toward `lastMinedPos` so the drop enters the AABB query as soon as the server syncs it. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
 
@@ -134,7 +138,13 @@ On top of the jitter the aim point slides across the face toward the **next** qu
 
 ### Mining
 
-Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls.
+Mining does **not** hold `options.keyAttack`. `BlockInteractor` calls `mc.gameMode.startDestroyBlock` / `continueDestroyBlock` directly with the task's target position, from a START_CLIENT_TICK hook. That is deliberate: `Minecraft.continueAttack` mines whatever `mc.hitResult` points at, so a held key would chew through everything the crosshair crosses during a camera sweep — instant-break blocks and blacklisted ones included — and a single tick of the crosshair leaving the block calls `stopDestroyBlock()`, which wipes the break progress. An explicit target has neither failure mode.
+
+The catch is that `continueAttack` is also where vanilla does everything *besides* the game-mode call, and driving the game mode alone reproduced none of it: `player.swing(MAIN_HAND)` and `level.addBreakingBlockEffect(pos, face)` live only there, and `LocalPlayer.swing` is what sends `ServerboundSwingPacket`. The bot broke blocks with a motionless arm and without one swing packet — to the server and to anyone watching, a player whose blocks dissolve while he stands still. `BlockInteractor` now swings on every tick the game-mode call returns true, which is vanilla's own guard; vanilla really does send 20 swing packets a second while mining.
+
+The particle call is deliberately **not** mirrored. It only adds the chips flying off the face — the crack overlay that reads as "being mined" comes from `continueDestroyBlock` via `destroyBlockProgress` — and it is local cosmetics that reach neither the server nor another player, at the price of a shape query and a particle allocation on every tick of every break. That price is real: with it in, the client fell far enough behind that item spawns synced too late for COLLECTING and the chunk miner left the corridor's cobblestone on the ground. Measured, not guessed — the corridor test failed the full suite with it and passed without, everything else unchanged.
+
+Vanilla is meanwhile still running `continueAttack(false)` → `stopDestroyBlock()` every tick, and it is a no-op only by accident: `stopDestroyBlock` is guarded by `isDestroying`, which `continueDestroyBlock` never sets — only `startDestroyBlock` does — while `sameDestroyTarget` checks position and held item but *not* `isDestroying`. So the first tick of each block sends one stray `ABORT_DESTROY_BLOCK` and zeroes the client's progress, and from the second tick on `isDestroying` is false, vanilla stops interfering and the progress accumulates. Per block the wire sees START → ABORT → n ticks of silence → STOP. Worth knowing before touching this: the "silence" is normal (survival sends no continue packets), the ABORT is not, and it costs one tick of progress.
 
 Break detection has a fast path and a fallback. The fast path is the **server acknowledgement**: breaking is a sequenced client prediction, and `ClientboundBlockChangedAckPacket` carries the sequence the server has settled — after which `endPredictionsUpTo` has reverted anything the server disagreed with, so the client's view of that block *is* the server's view. `ServerBlockSync` (fed by the packet mixin) tracks the highest acked sequence; INTERACTING samples `BlockStatePredictionHandler.currentSequence()` the first tick the target looks finished and exits as soon as that sequence is settled. `ClientLevel.getBlockStatePredictionHandler()` is package-private, hence the `ClientLevelAccessor` `@Invoker`.
 
@@ -186,7 +196,7 @@ Safety and collection behaviour is **opted into per behavior**, never configured
 | `stopOnPlayerAttack` | A player swinging at the bot ends the run, damage or not |
 | `stopWhenInventoryFull` + `minFreeSlots` | Ends the run once fewer than N main slots are empty |
 | `opportunisticCollection` | INTERACTING steps toward nearby drops without dropping the break |
-| `fastCollectExit` | Closes the COLLECTING stalls below; together with `opportunisticCollection` also enables the hand-off |
+| `fastCollectExit` | Closes the COLLECTING stalls below: leaves as soon as the ground is clear, without waiting out the absence window |
 
 ### Detection: packets, not polling
 

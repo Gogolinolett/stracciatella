@@ -2,7 +2,10 @@ package net.stracciatella.miner.test;
 
 import java.util.List;
 
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.util.Mth;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.miner.MinerSetup;
@@ -192,13 +195,14 @@ public class ChunkMinerTests {
      * corridor loop never runs: with nothing left to plan, the controller
      * collects to completion and the run ends. This one digs four columns in
      * a row, so the miner plans the next column while the last one's drops are
-     * still on the ground and COLLECTING hands off instead of finishing.
+     * still on the ground — the steady-state loop, where collecting and
+     * planning overlap.
      *
      * <p>It asserts the cobblestone count, not just that the blocks are gone.
-     * The hand-off deliberately leaves COLLECTING before the drops are in,
-     * betting that opportunistic collection strafes to them during the next
-     * break — and a bet on drops being picked up later is worth nothing
-     * unless something counts them.
+     * Everything that makes the loop fast — the opportunistic strafe during a
+     * break, leaving COLLECTING as soon as the ground is clear — trades
+     * against picking the drops up at all, and nothing else in the suite would
+     * notice a corridor mined clean with the cobblestone left lying in it.
      */
     @MinecraftTest(name = "Chunk miner clears a corridor", timeoutTicks = 3000, order = 17)
     public void clearsCorridor(TestContext ctx) {
@@ -222,6 +226,455 @@ public class ChunkMinerTests {
         int collected = ctx.computeOnClient(
                 mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
         LOGGER.info("Chunk miner corridor test passed ({} cobblestone)", collected);
+    }
+
+    // ================================================================
+    // Test 9: the whole run — dig down into the hole, keep mining, hold the aim
+    // ================================================================
+
+    /**
+     * Every test above asks the same question — is the block gone at the end? —
+     * and none of them can fail on a bot that breaks one block, stares at a
+     * wall for a thousand ticks and breaks the next. The annotation timeout
+     * does not catch that either: {@code TestRunner} multiplies it by the tick
+     * multiplier, so the corridor test's nominal 3000 ticks is a 30000-tick
+     * budget for eight blocks, and the bot may idle 99% of it. Three
+     * regressions walked past the suite through that hole — no arm swing while
+     * breaking, drops abandoned on the floor, and a column scan that
+     * ping-ponged the aim through 150 degrees between neighbouring blocks.
+     *
+     * <p>So this test measures the run rather than its result. It samples the
+     * tick thread once per tick (via the {@code waitFor} predicate, which is
+     * evaluated there anyway — logging per tick is not an option, it perturbs
+     * the run enough to flip the corridor test) and turns four properties into
+     * hard assertions:
+     *
+     * <ul>
+     *   <li><b>Budget.</b> Its own limit in game ticks, derived from the block
+     *       count, not the annotation. Stalling fails by timeout.
+     *   <li><b>Duty cycle.</b> The share of ticks between the first and last
+     *       swing in which the player is swinging its arm. That is the literal
+     *       form of the requirement — the bot must hold left click — and it is
+     *       vanilla state we only ever set through the vanilla call:
+     *       {@code BlockInteractor} swings exactly when
+     *       {@code continueDestroyBlock} reports it is still breaking, so
+     *       before the swing was mirrored from {@code Minecraft.continueAttack}
+     *       this number was flat zero for a whole run.
+     *       <p>{@code MultiPlayerGameMode.isDestroying()} would look like the
+     *       more direct sensor and is useless here: measured over 482 ticks of
+     *       a passing run it was never once set. Vanilla's
+     *       {@code handleKeybinds} calls {@code continueAttack(false)} every
+     *       tick — no key is down in a test client — which calls
+     *       {@code stopDestroyBlock} and clears the flag, and only
+     *       {@code startDestroyBlock} ever sets it, never
+     *       {@code continueDestroyBlock}. The flag survives one tick per block.
+     *   <li><b>Gaps.</b> A break is allowed to be interrupted — a drop that
+     *       landed out of reach has to be walked to, and
+     *       {@code randomBreatherTicks} pauses 12-25 ticks with 4% probability
+     *       per column by design. What is not allowed is that happening often.
+     *   <li><b>Aim.</b> Degrees of yaw travelled per block mined, as a coarse
+     *       guard — see {@link #holdsItsAim} for what that number can and
+     *       cannot tell apart. A raw "never turn more than N degrees" would be
+     *       wrong: the serpentine legitimately reverses at the end of a row.
+     * </ul>
+     *
+     * <p>The range spans two slabs so the run has to dig through its own floor
+     * and walk into the hole, which is where it failed in a real world.
+     */
+    @MinecraftTest(name = "Chunk miner mines without stalling", timeoutTicks = 4000, order = 18)
+    public void minesWithoutStalling(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 1, STAND_DX + TRACE_COLUMNS + 1, STAND_DZ, STAND_DZ);
+        // Something to land on once the lower slab's head layer — the floor the
+        // corridor is standing on — has been mined away.
+        fill(ctx, STAND_DX - 1, Y - 3, STAND_DZ,
+                STAND_DX + TRACE_COLUMNS + 1, Y - 3, STAND_DZ, "stone");
+        for (int dx = 1; dx <= TRACE_COLUMNS; dx++) {
+            setBlock(ctx, stand.offset(dx, 0, 0), "stone");
+            setBlock(ctx, stand.offset(dx, 1, 0), "stone");
+        }
+        // Upper slab: the corridor, two layers deep. Lower slab: the floor
+        // strip, which is that slab's head layer and the only work left in it.
+        final int floorBlocks = TRACE_COLUMNS + 3;
+        final int blocks = TRACE_COLUMNS * 2 + floorBlocks;
+
+        MiningTrace trace = traceChunkMiner(ctx, Y + 1, Y - 2, blocks);
+
+        for (int dx = 1; dx <= TRACE_COLUMNS; dx++) {
+            assertAir(ctx, stand.offset(dx, 0, 0), "corridor floor block " + dx);
+            assertAir(ctx, stand.offset(dx, 1, 0), "corridor head block " + dx);
+        }
+        assertAir(ctx, stand.below(), "the block the bot dug through to descend");
+        assertNotAir(ctx, stand.below(3), "the landing floor below the working range");
+
+        // Walking into the hole is the point of the two-slab range: digging it
+        // and then standing on the rim is the failure seen in a real world.
+        if (trace.maxFeetY() > Y || trace.minFeetY() < Y - 2) {
+            throw new AssertionError("Bot left the working range vertically: feet spanned y="
+                    + trace.minFeetY() + ".." + trace.maxFeetY() + ", expected " + (Y - 2)
+                    + ".." + Y + " — " + trace);
+        }
+        int feetY = ctx.computeOnClient(mc -> mc.player.blockPosition().getY());
+        if (feetY > Y - 2) {
+            throw new AssertionError("Bot never entered the hole it dug: feet at y=" + feetY
+                    + ", expected y=" + (Y - 2) + " — " + trace);
+        }
+        assertMiningQuality(trace, blocks);
+        LOGGER.info("Chunk miner stall test passed: {}", trace);
+    }
+
+    // ================================================================
+    // Test 10: a run started mid-slab picks that slab back up
+    // ================================================================
+
+    /**
+     * The behaviour keeps no cursor: {@code tickSelectSlab} re-derives the
+     * working slab from the world every time it runs, taking the topmost one
+     * that still holds something diggable. This test starts a run in a world
+     * that looks like an interrupted one — upper slab cleared, the bot standing
+     * in the lower slab with part of it already open — and asserts that the run
+     * picks up where that bot stands.
+     *
+     * <p>The decisive measurement is the number of ticks before the first
+     * break. Descending, re-surveying from the top or walking off to some other
+     * column all cost far more than aiming at the block in front of the bot,
+     * so a resume that is not a resume cannot pass this by accident. The feet
+     * bound catches the same thing from the other side: the layer must not
+     * change at all during the run.
+     */
+    @MinecraftTest(name = "Chunk miner resumes the layer it stands in",
+            timeoutTicks = 2000, order = 19)
+    public void resumesCurrentLayer(TestContext ctx) {
+        // The floor strip is the lower slab's head layer, and after the two
+        // columns below the bot are opened it is exactly RESUME_REMAINING long.
+        prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 1, STAND_DX + RESUME_REMAINING, STAND_DZ, STAND_DZ);
+        fill(ctx, STAND_DX - 1, Y - 3, STAND_DZ,
+                STAND_DX + RESUME_REMAINING, Y - 3, STAND_DZ, "stone");
+        // Open the part of the lower slab the interrupted run had already done,
+        // and drop the bot into it. What is left is the strip ahead of it.
+        fill(ctx, STAND_DX - 1, Y - 1, STAND_DZ, STAND_DX, Y - 1, STAND_DZ, "air");
+        final BlockPos lowStand = new BlockPos(BASE_X + STAND_DX, Y - 2, BASE_Z + STAND_DZ);
+        ctx.waitFor(mc -> mc.level.getBlockState(lowStand.above()).isAir());
+        standAt(ctx, lowStand);
+
+        MiningTrace trace = traceChunkMiner(ctx, Y + 1, Y - 2, RESUME_REMAINING);
+
+        if (trace.ticksToFirstBreak() < 0 || trace.ticksToFirstBreak() > RESUME_FIRST_BREAK_TICKS) {
+            throw new AssertionError("Run did not resume the slab it started in: first break after "
+                    + trace.ticksToFirstBreak() + " ticks, allowed " + RESUME_FIRST_BREAK_TICKS
+                    + " — " + trace);
+        }
+        if (trace.minFeetY() != Y - 2 || trace.maxFeetY() != Y - 2) {
+            throw new AssertionError("Run left the layer it resumed: feet spanned y="
+                    + trace.minFeetY() + ".." + trace.maxFeetY() + ", expected y=" + (Y - 2)
+                    + " throughout — " + trace);
+        }
+        for (int dx = 1; dx <= RESUME_REMAINING; dx++) {
+            assertAir(ctx, lowStand.offset(dx, 1, 0), "remaining head block " + dx);
+        }
+        assertNotAir(ctx, lowStand.below(), "the landing floor below the working range");
+        LOGGER.info("Chunk miner resume test passed: {}", trace);
+    }
+
+    // ================================================================
+    // Test 11: the aim holds when every column is in reach at once
+    // ================================================================
+
+    /**
+     * The stall test digs a corridor, so the bot walks and the column it should
+     * take next is simply the one ahead — it never has to choose. This one lays
+     * a single-layer patch reaching three columns to either side, so every
+     * column is in reach and the order is the scan's own. One layer, because a
+     * two-high column hides the one behind it and {@code isAimable} then defers
+     * it, which imposes an order by itself and hides the choice.
+     *
+     * <p><b>What this does not do.</b> It was built to catch the scan that
+     * shipped — {@code nextColumn} searching outward in both directions from
+     * the bot's index, which in a real run took targets 3016, 3014, 3017 in a
+     * row with 147, 151 and 145 degree turns between them — and measurement
+     * says it does not. On this patch the broken scan costs 98 degrees per
+     * block and the fixed one 81, against a run-to-run spread of about 11%.
+     * No threshold separates those. A ring of eight columns was tried first and
+     * was worse still: a circle costs a full turn in any order, 61 degrees per
+     * block on both. So the assertion here is a coarse guard against an aim
+     * that goes wild, not a regression test for column ordering; what actually
+     * pins that behaviour down is the tick budget and the duty cycle.
+     */
+    @MinecraftTest(name = "Chunk miner holds its aim", timeoutTicks = 3000, order = 20)
+    public void holdsItsAim(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        int blocks = 0;
+        for (int dx = -AIM_REACH; dx <= AIM_REACH; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                setBlock(ctx, stand.offset(dx, 0, dz), "stone");
+                blocks++;
+            }
+        }
+
+        MiningTrace trace = traceChunkMiner(ctx, Y + 1, Y, blocks);
+
+        for (int dx = -AIM_REACH; dx <= AIM_REACH; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                assertAir(ctx, stand.offset(dx, 0, dz), "patch block " + dx + "/" + dz);
+            }
+        }
+        double yawPerBlock = trace.yawTravel() / blocks;
+        if (yawPerBlock > MAX_YAW_PER_BLOCK) {
+            throw new AssertionError("Aim was not steady: " + Math.round(yawPerBlock)
+                    + " degrees of yaw per block, allowed " + Math.round(MAX_YAW_PER_BLOCK)
+                    + " — " + trace);
+        }
+        LOGGER.info("Chunk miner aim test passed ({} deg/block): {}",
+                Math.round(yawPerBlock), trace);
+    }
+
+    // --- Run quality ---
+
+    /** Corridor length for the stall test — long enough for a steady state. */
+    private static final int TRACE_COLUMNS = 5;
+    /** Blocks left standing ahead of the bot in the resume test. */
+    private static final int RESUME_REMAINING = 4;
+    /**
+     * How far to either side the aim test's patch reaches. Three columns out
+     * plus one row off the axis is 3.16 blocks away, inside the 4.0 reach, so
+     * the bot never has to take a step to finish the patch.
+     */
+    private static final int AIM_REACH = 3;
+
+    /**
+     * Game ticks a block may cost end to end. Stone under a diamond pickaxe
+     * breaks in six; the rest is the aim, the break confirmation, the step to
+     * the next column and picking the drop up. Measured over a full run of
+     * this test: 27 ticks per block, and 33 in the shorter resume run where
+     * the start-up is spread over four blocks instead of eighteen.
+     */
+    private static final int TICK_BUDGET_PER_BLOCK = 60;
+    /**
+     * Share of the mining window the bot must actually be swinging in.
+     * Measured at 70% over the corridor and 76% over the shorter resume run.
+     */
+    private static final double MIN_DUTY_CYCLE = 0.50;
+    /**
+     * A gap longer than this counts as an interruption rather than a beat.
+     * Ordinary gaps measure 16 to 24 ticks, and on top of one of those
+     * {@code randomBreatherTicks} may add up to 25 more — by design, on 4% of
+     * columns. The floor therefore has to clear 49, or roughly one run in
+     * twenty-five would fail on a pause the behaviour is supposed to take.
+     */
+    private static final int LONG_GAP_TICKS = 50;
+    /**
+     * How many such interruptions a whole run may contain. Not zero: a drop
+     * that landed out of reach has to be walked to, and that is the one break
+     * in mining the miner is allowed to take.
+     */
+    private static final int MAX_LONG_GAPS = 1;
+    /**
+     * Yaw a block may cost. Measured at 71-88 degrees over the corridor and 81
+     * over the aim patch. The bound is a guard against an aim that goes wild,
+     * not a detector for column ordering — {@link #holdsItsAim} carries the
+     * measurement that rules that out.
+     */
+    private static final double MAX_YAW_PER_BLOCK = 130.0;
+    /** Ticks a resumed run may spend before its first swing at a block. */
+    private static final int RESUME_FIRST_BREAK_TICKS = 400;
+    /**
+     * Share of the mined blocks whose drop must be in the inventory when the
+     * run ends. Not all of them: the requirement is that the bot keeps mining,
+     * and a drop that landed out of reach is explicitly allowed to be left
+     * behind rather than mined around. Measured at 16 of 18 over the corridor
+     * and 4 of 4 over the resume run — the two missing ones fall into the hole
+     * during the descent. Demanding all of them is what makes the corridor
+     * test flaky.
+     */
+    private static final double MIN_COLLECTED_FRACTION = 0.75;
+
+    private void assertMiningQuality(MiningTrace trace, int blocks) {
+        if (trace.dutyCycle() < MIN_DUTY_CYCLE) {
+            throw new AssertionError("Bot was not mining often enough: duty cycle "
+                    + percent(trace.dutyCycle()) + ", required " + percent(MIN_DUTY_CYCLE)
+                    + " — " + trace);
+        }
+        if (trace.longGaps() > MAX_LONG_GAPS) {
+            throw new AssertionError("Bot stopped mining too often: " + trace.longGaps()
+                    + " gaps over " + LONG_GAP_TICKS + " ticks, allowed " + MAX_LONG_GAPS
+                    + " — " + trace);
+        }
+        double yawPerBlock = trace.yawTravel() / blocks;
+        if (yawPerBlock > MAX_YAW_PER_BLOCK) {
+            throw new AssertionError("Aim was not steady: " + Math.round(yawPerBlock)
+                    + " degrees of yaw per block, allowed " + Math.round(MAX_YAW_PER_BLOCK)
+                    + " — " + trace);
+        }
+        int required = (int) Math.ceil(blocks * MIN_COLLECTED_FRACTION);
+        if (trace.collected < required) {
+            throw new AssertionError("Bot left its drops behind: collected " + trace.collected
+                    + " of " + blocks + " mined, required " + required + " — " + trace);
+        }
+    }
+
+    private static String percent(double fraction) {
+        return Math.round(fraction * 100) + "%";
+    }
+
+    /**
+     * Start a run and record what the bot does on every tick of it, under a
+     * tick budget of the test's own. The annotation timeout is not a budget:
+     * {@code TestRunner} scales it by the tick multiplier, so it is ten times
+     * looser than it reads and exists to stop a hung suite, not to judge a run.
+     */
+    private MiningTrace traceChunkMiner(TestContext ctx, int fromY, int toY, int blocks) {
+        final MiningTrace trace = new MiningTrace();
+        final int budget = blocks * TICK_BUDGET_PER_BLOCK;
+        startChunkMiner(ctx, fromY, toY);
+        try {
+            ctx.waitFor(mc -> {
+                trace.sample(mc);
+                return !BehaviorRunner.isActive();
+            }, budget);
+        } catch (AssertionError e) {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+            });
+            String message = e.getMessage();
+            if (message == null || !message.startsWith("Timed out")) {
+                throw e;
+            }
+            throw new AssertionError("Chunk miner did not finish " + blocks + " blocks in "
+                    + budget + " ticks (" + TICK_BUDGET_PER_BLOCK + " per block) — " + trace);
+        }
+        // Counted before the bot is stopped, and never waited for afterwards:
+        // a stopped bot cannot walk to a drop, so anything that arrives later
+        // arrived by luck. What the run collected by the time it ended is the
+        // number the miner is actually accountable for.
+        trace.collected = ctx.computeOnClient(
+                mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
+        ctx.runOnClient(mc -> BotController.stop());
+        if (ctx.computeOnClient(mc -> MinerSetup.chunkMiner().failed())) {
+            throw new AssertionError("Chunk miner aborted: "
+                    + ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine())
+                    + " — " + trace);
+        }
+        return trace;
+    }
+
+    /**
+     * What the bot did, tick by tick. Sampled on the tick thread and therefore
+     * kept to field arithmetic — this is the run's critical path.
+     *
+     * <p>Gaps are counted only once mining has resumed after them, so the tail
+     * of the run — collecting the last drops, the survey that ends it — is not
+     * mistaken for a stall. The stretch before the first break is not a gap
+     * either; {@link #ticksToFirstBreak()} covers it on its own.
+     */
+    private static final class MiningTrace {
+        private int ticks;
+        private int swingTicks;
+        private int firstBreakTick = -1;
+        private int lastBreakTick = -1;
+        private int gap;
+        private int maxGap;
+        private int longGaps;
+        private double yawTravel;
+        private double maxYawStep;
+        private float lastYaw;
+        private boolean yawSeen;
+        private int minFeetY = Integer.MAX_VALUE;
+        private int maxFeetY = Integer.MIN_VALUE;
+        /** Cobblestone in the inventory when the run ended. Not sampled. */
+        private int collected;
+
+        void sample(Minecraft mc) {
+            LocalPlayer player = mc.player;
+            if (player == null) {
+                return;
+            }
+            ticks++;
+            float yaw = player.getYRot();
+            if (yawSeen) {
+                double step = Math.abs(Mth.degreesDifference(lastYaw, yaw));
+                yawTravel += step;
+                maxYawStep = Math.max(maxYawStep, step);
+            }
+            lastYaw = yaw;
+            yawSeen = true;
+            int feetY = player.blockPosition().getY();
+            minFeetY = Math.min(minFeetY, feetY);
+            maxFeetY = Math.max(maxFeetY, feetY);
+
+            // The arm swing, not a phase of ours: BlockInteractor swings only
+            // on a tick where continueDestroyBlock reported the break is still
+            // running. It over-runs the last swing by the swing animation
+            // (about six ticks), which shortens gaps a little and cannot
+            // manufacture one — a bot that stops mining stops swinging.
+            if (player.swinging) {
+                swingTicks++;
+                if (firstBreakTick < 0) {
+                    firstBreakTick = ticks;
+                } else if (gap > 0) {
+                    maxGap = Math.max(maxGap, gap);
+                    if (gap > LONG_GAP_TICKS) {
+                        longGaps++;
+                    }
+                }
+                lastBreakTick = ticks;
+                gap = 0;
+            } else if (firstBreakTick >= 0) {
+                gap++;
+            }
+        }
+
+        /** Ticks from the run's start to the first tick it spent mining. */
+        int ticksToFirstBreak() {
+            return firstBreakTick;
+        }
+
+        /**
+         * Share of the mining window spent swinging. The window ends at the
+         * last swing, not at the run's end: the closing collect is work the
+         * run owes, not time the bot spent idle.
+         */
+        double dutyCycle() {
+            if (firstBreakTick < 0) {
+                return 0.0;
+            }
+            return (double) swingTicks / (lastBreakTick - firstBreakTick + 1);
+        }
+
+        int longGaps() {
+            return longGaps;
+        }
+
+        double yawTravel() {
+            return yawTravel;
+        }
+
+        int minFeetY() {
+            return minFeetY;
+        }
+
+        int maxFeetY() {
+            return maxFeetY;
+        }
+
+        @Override
+        public String toString() {
+            return "ticks=" + ticks + " swinging=" + swingTicks
+                    + " duty=" + percent(dutyCycle())
+                    + " firstSwing=" + firstBreakTick + " lastSwing=" + lastBreakTick
+                    + " maxGap=" + maxGap + " longGaps=" + longGaps
+                    + " yaw=" + Math.round(yawTravel) + "deg"
+                    + " maxYawStep=" + Math.round(maxYawStep) + "deg"
+                    + " feetY=" + minFeetY + ".." + maxFeetY
+                    + " collected=" + collected;
+        }
     }
 
     private static int countItem(net.minecraft.client.Minecraft mc,

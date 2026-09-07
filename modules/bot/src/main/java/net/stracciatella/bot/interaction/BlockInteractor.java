@@ -75,12 +75,39 @@ public class BlockInteractor {
         Direction face = fixedFace != null ? fixedFace : faceTowardPlayer(mc, targetPos);
 
         if (currentType == InteractionType.ATTACK) {
+            boolean hitting;
             if (!started) {
                 mc.missTime = 0;
-                mc.gameMode.startDestroyBlock(targetPos, face);
+                hitting = mc.gameMode.startDestroyBlock(targetPos, face);
                 started = true;
             } else {
-                mc.gameMode.continueDestroyBlock(targetPos, face);
+                hitting = mc.gameMode.continueDestroyBlock(targetPos, face);
+            }
+            // The swing is not decoration and does not follow from the call
+            // above: Minecraft.continueAttack is the only place vanilla swings
+            // while mining, and LocalPlayer.swing is what sends
+            // ServerboundSwingPacket. Driving the game mode alone therefore
+            // broke blocks with a motionless arm and without a single swing
+            // packet — to the server and to everyone watching, a player whose
+            // blocks dissolve while he stands still. Vanilla really does send
+            // one per tick for as long as the button is held, and the guard is
+            // vanilla's own: it swings only when the game-mode call reports it
+            // is chewing on the block.
+            //
+            // continueAttack also calls level.addBreakingBlockEffect here, and
+            // that one is deliberately left out. It only adds the chips flying
+            // off the face — the crack overlay that reads as "this block is
+            // being mined" comes from continueDestroyBlock via
+            // destroyBlockProgress and is already there — and it is local
+            // cosmetics: nothing about it reaches the server or another
+            // player. What it does cost is a shape query and a particle
+            // allocation on every tick of every break, and that is enough to
+            // matter: with it in, the client fell far enough behind that drops
+            // synced too late to be collected, and the chunk miner left the
+            // corridor's cobblestone lying on the ground (the corridor test
+            // caught it). Chips are not worth losing the loot for.
+            if (hitting) {
+                mc.player.swing(InteractionHand.MAIN_HAND);
             }
             return;
         }

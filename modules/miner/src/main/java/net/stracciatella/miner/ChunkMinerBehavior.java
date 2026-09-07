@@ -196,12 +196,10 @@ public class ChunkMinerBehavior implements BotBehavior {
             return fail("empty layer range " + toY + ".." + fromY);
         }
         // Planning runs on through COLLECTING instead of waiting for the
-        // controller to go idle. A queued block is what lets COLLECTING hand
-        // off, and the hand-off is the whole point: the walk to the last
-        // column's drops then happens *during* the next break, as an
-        // opportunistic strafe, rather than as a separate stop-and-fetch
-        // before it. Waiting for idle is what made the loop read as mine,
-        // stand, walk, mine.
+        // controller to go idle. With a block already queued, the moment the
+        // last column's drops are in the controller starts the next break
+        // instead of standing idle waiting to be handed one — the beat that
+        // made the loop read as mine, stand, walk, mine.
         boolean collecting = BotController.getPhase() == BotController.Phase.COLLECTING;
         if (BotController.isPaused() || !BotController.getTaskQueue().isEmpty()
                 || (BotController.isActive() && !collecting)) {
@@ -420,14 +418,24 @@ public class ChunkMinerBehavior implements BotBehavior {
      * had a line to. Resuming at the bot keeps every step of the sweep
      * adjacent to the last, which is the whole point of a serpentine.
      *
-     * <p>Which is why the scan runs outward in both directions and never wraps.
-     * Wrapping past the end of the snake is the same non-adjacent jump by
-     * another name: with the sweep finished ahead of the bot, the modulo sent
-     * it back to the far corner and it walked the row forward from there,
-     * reaching a column three over while the one right behind it still stood
-     * in the line of sight. Stepping outward — the snake's own direction first
-     * at every distance, so a full chunk is dug in exactly the old order —
-     * picks that near leftover up first instead.
+     * <p>Which is why the scan never wraps. Wrapping past the end of the snake
+     * is the same non-adjacent jump by another name: with the sweep finished
+     * ahead of the bot, the modulo sent it back to the far corner and it walked
+     * the row forward from there, reaching a column three over while the one
+     * right behind it still stood in the line of sight. Instead the scan runs
+     * the snake's own direction to the end and only then back over what was
+     * left behind, nearest first — which picks that near leftover up.
+     *
+     * <p>Running it forward *to the end* is the part that matters, and it
+     * replaced alternating forward and back at each distance. Alternating reads
+     * fine while the bot is walking, but a whole group of columns inside reach
+     * is dug without a step: {@code start} never moves, so every column dug
+     * hands the next turn to the other side and the bot ping-pongs across
+     * itself. Measured on a slab with the bot at x=3015, it dug 3016, then
+     * 3014, then 3017 — three ~150° head turns in a row, and since the pickaxe
+     * is idle for the whole of LOOKING, three gaps in the mining to match. Once
+     * one direction is exhausted the bot turns around exactly once, which is
+     * what a serpentine is for.
      *
      * <p>A column that is close enough to be occluded is deferred, because the
      * snake stepping past an empty column leaves the bot standing *diagonally*
@@ -448,25 +456,27 @@ public class ChunkMinerBehavior implements BotBehavior {
         int start = columnIndex(columns, player.blockPosition());
         BlockPos deferred = null;
         for (int i = 0; i < columns.size(); i++) {
-            for (int index : new int[] {start + i, start - i}) {
-                if (index < 0 || index >= columns.size()) {
+            int ahead = start + i;
+            int index = ahead < columns.size()
+                    ? ahead
+                    : start - 1 - (i - (columns.size() - start));
+            if (index < 0 || index >= columns.size()) {
+                continue;
+            }
+            BlockPos column = columns.get(index);
+            // Head first, matching the order tickClear plans them in: that
+            // is the block LOOKING aims at, so that is the one to test.
+            for (BlockPos pos : new BlockPos[] {column.above(), column}) {
+                if (!isInRange(pos) || !isDiggable(level.getBlockState(pos))) {
                     continue;
                 }
-                BlockPos column = columns.get(index);
-                // Head first, matching the order tickClear plans them in: that
-                // is the block LOOKING aims at, so that is the one to test.
-                for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-                    if (!isInRange(pos) || !isDiggable(level.getBlockState(pos))) {
-                        continue;
-                    }
-                    if (isAimable(player, level, pos)) {
-                        return column;
-                    }
-                    if (deferred == null) {
-                        deferred = column;
-                    }
-                    break;
+                if (isAimable(player, level, pos)) {
+                    return column;
                 }
+                if (deferred == null) {
+                    deferred = column;
+                }
+                break;
             }
         }
         return deferred;

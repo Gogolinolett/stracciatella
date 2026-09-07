@@ -965,6 +965,22 @@ public class BotController {
         return true;
     }
 
+    /**
+     * Whether a body standing with its feet at {@code feet} would have ground
+     * under it, allowing one block of drop. Deliberately weaker than
+     * {@link #isStandable}: this answers "would the bot fall", which is the
+     * only thing COLLECTING's raw-key walk has to avoid, and says nothing
+     * about whether the cell is free to occupy.
+     */
+    private static boolean hasFloorWithinOneBlock(Level level, BlockPos feet) {
+        for (BlockPos pos : new BlockPos[] {feet.below(), feet.below().below()}) {
+            if (level.getBlockState(pos).isFaceSturdy(level, pos, net.minecraft.core.Direction.UP)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static void tickCollecting() {
         Minecraft client = Minecraft.getInstance();
         LocalPlayer player = client.player;
@@ -1042,7 +1058,7 @@ public class BotController {
             // Dropping it here rather than only in the exit gate matters: the
             // walk below would otherwise keep pushing into the obstruction all
             // the way through the exit tick, leaving the movement keys down.
-            if (policy.fastCollectExit() && collectNoProgressTicks > CONFIG.itemAbsenceTicks) {
+            if (collectNoProgressTicks > CONFIG.itemAbsenceTicks) {
                 nearest = null;
             }
 
@@ -1051,8 +1067,16 @@ public class BotController {
             // unreachable) is one the bot has decided it will never approach —
             // counting it as "nearby" pins itemsNearby true forever, the exit
             // gate can never fire, and the phase burns the full collectWaitMax.
-            // Behaviors that don't opt in keep the original unfiltered test.
-            itemsNearby = policy.fastCollectExit() ? nearest != null : !items.isEmpty();
+            //
+            // This used to hold only for behaviors that opted in via
+            // fastCollectExit, and everything else kept the unfiltered test.
+            // That left the stall in place for plain /bot tasks, where it is
+            // just as wrong and, at 1200 ticks, reads as the bot having quit:
+            // it stands still, mines nothing, and eventually carries on. The
+            // give-up needs no opt-in — sixty ticks of walking without getting
+            // any closer means the item is not reachable from here, whoever
+            // queued the task.
+            itemsNearby = nearest != null;
             if (itemsNearby) {
                 itemsSeenThisCollect = true;
                 lastItemSeenTick = phaseTicks;
@@ -1149,23 +1173,26 @@ public class BotController {
         // makes, and the next block is an adjacent column the bot is standing
         // on by then.
         //
-        // The hand-off goes one step further and leaves *before* the drops are
-        // in. It applies only where the two flags together promise the walk
-        // will still happen: opportunisticCollection steps toward exactly
-        // these drops during the next break, so the walking overlaps the
-        // mining instead of replacing it. In a corridor the drops lie between
-        // the bot and the column it is about to dig, so that step is the
-        // corridor advance — the bot never walks anywhere it wasn't going.
-        // Without it the sequence is mine, stand, walk, mine; a behavior that
-        // keeps planning pays one full walk per column for nothing.
+        // There is deliberately no second, earlier exit that hands the walk off
+        // to the next break. One was tried: with a task queued it left
+        // COLLECTING outright, on the promise that opportunisticCollection
+        // would step onto the drop while mining the next block. That promise
+        // only holds for a drop the next break can actually reach — the
+        // opportunistic step is a nudge, not a walk, gated on reach, line of
+        // sight and a safe destination, and instrumenting the corridor showed
+        // it closing 1.9 blocks to 1.6 over an entire break, barely inside the
+        // 1.425 pickup box. When the nudge fell short nothing ever came back
+        // for the drop: the bot mined on down the corridor and the cobblestone
+        // stayed on the ground. It also bought nothing, because the case it
+        // was meant to speed up is the one doneCollecting already leaves on
+        // tick 1 — vanilla pickup inhales the drop during the break, so the
+        // inventory has grown and no item is left nearby.
         boolean queued = taskQueue.peek() != null;
         boolean doneCollecting = itemsSeenThisCollect && !itemsNearby
                 && (queued || policy.fastCollectExit()
                         || phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks);
-        boolean handOff = queued && policy.fastCollectExit()
-                && policy.opportunisticCollection();
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
-        if (doneCollecting || handOff || timedOut) {
+        if (doneCollecting || timedOut) {
             // Failure-only telemetry: if COLLECTING is exiting with no items
             // ever seen, log the last mined block state + surrounding area.
             // Fires once per exit; no timing impact on the happy path.
@@ -1203,6 +1230,32 @@ public class BotController {
         // the target but is capped at the ground-scan angle so the head
         // doesn't crane ever steeper as the bot closes in on a drop.
         aimCollectGaze(player, targetX, targetY, targetZ);
+
+        // Refuse a step into thin air. This drives the body forward —
+        // sprinting, once the drop is more than two blocks out — on the gaze
+        // direction alone, and a drop lies wherever it rolled: over the lip of
+        // the shaft the bot just dug as readily as on the floor in front of
+        // it. Nothing else stops it, because COLLECTING has no pathfinder
+        // under it; it is the one phase that walks on raw key presses. That is
+        // how the bot sprinted off its own platform and died of the fall.
+        //
+        // Only the floor is tested, not whether the cell is standable: walking
+        // into a wall costs nothing (the bot simply does not move), and
+        // requiring head room made it refuse to collect a drop lying against
+        // the face it had just mined — it then stood still for the whole
+        // collect window and the single-block test timed out. One block down
+        // is a normal step and stays allowed; deeper is the hole, and a drop
+        // down there is worth less than the run.
+        double yawRad = Math.toRadians(player.getYRot());
+        BlockPos ahead = BlockPos.containing(
+                player.getX() - Math.sin(yawRad) * STEP_LOOKAHEAD,
+                player.getY(),
+                player.getZ() + Math.cos(yawRad) * STEP_LOOKAHEAD);
+        if (!hasFloorWithinOneBlock(client.level, ahead)) {
+            releaseMovementKeys();
+            return;
+        }
+
         client.options.keyUp.setDown(true);
         client.options.keySprint.setDown(horizDistSq > 4.0);
     }
