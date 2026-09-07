@@ -2,9 +2,11 @@ package net.stracciatella.bot.mixin;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
 import net.minecraft.network.protocol.game.ClientboundDamageEventPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.sounds.SoundEvents;
+import net.stracciatella.bot.interaction.ServerBlockSync;
 import net.stracciatella.bot.safety.BotAlarm;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -50,5 +52,17 @@ public class ClientPacketListenerMixin {
                 player.getX(), player.getY(), player.getZ())) {
             BotAlarm.raiseAttack();
         }
+    }
+
+    /**
+     * The server settling a block prediction. TAIL again, and here it also
+     * matters for a second reason: the handler is what retires the prediction
+     * (reverting the block if the server disagreed), so only afterwards does
+     * the client's block state carry the server's answer.
+     */
+    @Inject(at = @At("TAIL"), method = "handleBlockChangedAck")
+    private void stracciatella$onBlockChangedAck(ClientboundBlockChangedAckPacket packet,
+                                                 CallbackInfo ci) {
+        ServerBlockSync.onAck(packet.sequence());
     }
 }

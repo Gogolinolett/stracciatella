@@ -183,6 +183,60 @@ public class ChunkMinerTests {
         LOGGER.info("Chunk miner lava test passed");
     }
 
+    // ================================================================
+    // Test 8: a corridor of several columns — the steady-state loop
+    // ================================================================
+
+    /**
+     * Every other test here is one column wide, which is exactly the case the
+     * corridor loop never runs: with nothing left to plan, the controller
+     * collects to completion and the run ends. This one digs four columns in
+     * a row, so the miner plans the next column while the last one's drops are
+     * still on the ground and COLLECTING hands off instead of finishing.
+     *
+     * <p>It asserts the cobblestone count, not just that the blocks are gone.
+     * The hand-off deliberately leaves COLLECTING before the drops are in,
+     * betting that opportunistic collection strafes to them during the next
+     * break — and a bet on drops being picked up later is worth nothing
+     * unless something counts them.
+     */
+    @MinecraftTest(name = "Chunk miner clears a corridor", timeoutTicks = 3000, order = 17)
+    public void clearsCorridor(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        final int columns = 4;
+        for (int dx = 1; dx <= columns; dx++) {
+            setBlock(ctx, stand.offset(dx, 0, 0), "stone");
+            setBlock(ctx, stand.offset(dx, 1, 0), "stone");
+        }
+
+        runChunkMiner(ctx, Y + 1, Y, true);
+
+        for (int dx = 1; dx <= columns; dx++) {
+            assertAir(ctx, stand.offset(dx, 0, 0), "corridor floor block " + dx);
+            assertAir(ctx, stand.offset(dx, 1, 0), "corridor head block " + dx);
+        }
+        int mined = columns * 2;
+        int timeout = 120 * net.stracciatella.testing.runner.TestRunner.getTickMultiplier();
+        ctx.waitFor(mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE) >= mined,
+                timeout);
+        int collected = ctx.computeOnClient(
+                mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
+        LOGGER.info("Chunk miner corridor test passed ({} cobblestone)", collected);
+    }
+
+    private static int countItem(net.minecraft.client.Minecraft mc,
+                                 net.minecraft.world.item.Item item) {
+        var inv = mc.player.getInventory();
+        int count = 0;
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            var stack = inv.getItem(i);
+            if (stack.is(item)) {
+                count += stack.getCount();
+            }
+        }
+        return count;
+    }
+
     // --- Setup helpers ---
 
     private BlockPos prepare(TestContext ctx, int standDx, int standDz) {

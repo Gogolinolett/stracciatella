@@ -119,11 +119,26 @@ public class HumanBehavior {
      * beat of distraction that breaks an otherwise machine-constant cadence.
      */
     public static int randomTaskSwitchDelayTicks(BotConfig config) {
+        int breather = randomBreatherTicks(config);
+        return breather > 0 ? breather : randomReactionDelayTicks(config);
+    }
+
+    /**
+     * The occasional breather on its own: a pause of
+     * {@code [longPauseMinTicks, longPauseMaxTicks]} with probability
+     * {@code longPauseChance}, and nothing the rest of the time.
+     *
+     * <p>For an action a behavior repeats thousands of times, this is the
+     * right half of {@link #randomTaskSwitchDelayTicks}. Pausing on *every*
+     * repetition is itself the machine-constant cadence the pause exists to
+     * break, and it lands in the critical path of every single one.
+     */
+    public static int randomBreatherTicks(BotConfig config) {
         ThreadLocalRandom r = ThreadLocalRandom.current();
         if (config.longPauseChance > 0 && r.nextDouble() < config.longPauseChance) {
             return randomIntInRange(config.longPauseMinTicks, config.longPauseMaxTicks);
         }
-        return randomReactionDelayTicks(config);
+        return 0;
     }
 
     private static double randomInRange(double min, double max) {

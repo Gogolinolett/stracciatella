@@ -195,8 +195,16 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (fromY < toY) {
             return fail("empty layer range " + toY + ".." + fromY);
         }
-        if (BotController.isPaused() || BotController.isActive()
-                || !BotController.getTaskQueue().isEmpty()) {
+        // Planning runs on through COLLECTING instead of waiting for the
+        // controller to go idle. A queued block is what lets COLLECTING hand
+        // off, and the hand-off is the whole point: the walk to the last
+        // column's drops then happens *during* the next break, as an
+        // opportunistic strafe, rather than as a separate stop-and-fetch
+        // before it. Waiting for idle is what made the loop read as mine,
+        // stand, walk, mine.
+        boolean collecting = BotController.getPhase() == BotController.Phase.COLLECTING;
+        if (BotController.isPaused() || !BotController.getTaskQueue().isEmpty()
+                || (BotController.isActive() && !collecting)) {
             return BehaviorStatus.RUNNING;
         }
 
@@ -220,9 +228,11 @@ public class ChunkMinerBehavior implements BotBehavior {
             }
         }
 
-        // Breather between columns. The controller already varies its own
-        // timings, but a run this long is where a perfectly even cadence
-        // between corridor steps would stand out.
+        // Occasional breather between columns — a few percent of them, not
+        // every one. A run this long is where an even cadence would stand
+        // out, but a pause on every column *is* an even cadence, and since
+        // planning is what releases COLLECTING it sat in the critical path of
+        // every column: measured at 3-6 ticks each, on top of the collect.
         if (breatherTicks > 0) {
             breatherTicks--;
             return BehaviorStatus.RUNNING;
@@ -230,6 +240,15 @@ public class ChunkMinerBehavior implements BotBehavior {
 
         if (!batchQueue.isEmpty()) {
             plan(batchQueue.poll());
+            return BehaviorStatus.RUNNING;
+        }
+
+        // Only the corridor sweep may run early. Choosing a new slab or
+        // digging down are decisions that want the finished world and the
+        // bot's final position, and SELECT_SLAB is where the run *ends* —
+        // finishing here would stop the controller in mid-collect and leave
+        // the last column's drops lying there.
+        if (collecting && phase != Phase.CLEAR) {
             return BehaviorStatus.RUNNING;
         }
 
@@ -371,7 +390,7 @@ public class ChunkMinerBehavior implements BotBehavior {
             return BehaviorStatus.RUNNING;
         }
         plan(blocks);
-        breatherTicks = HumanBehavior.randomTaskSwitchDelayTicks(BotController.CONFIG);
+        breatherTicks = HumanBehavior.randomBreatherTicks(BotController.CONFIG);
         return BehaviorStatus.RUNNING;
     }
 

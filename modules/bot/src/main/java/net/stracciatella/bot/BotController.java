@@ -14,6 +14,7 @@ import net.minecraft.world.phys.Vec3;
 import net.stracciatella.bot.humanize.HumanBehavior;
 import net.stracciatella.bot.interaction.BlockInteractor;
 import net.stracciatella.bot.interaction.InventoryHelper;
+import net.stracciatella.bot.interaction.ServerBlockSync;
 import net.stracciatella.bot.task.BotTask;
 import net.stracciatella.bot.task.InteractionType;
 import net.stracciatella.bot.task.TaskQueue;
@@ -91,12 +92,21 @@ public class BotController {
     // deliberately short: a drop further than this can't be fetched and
     // returned from without the break suffering, and COLLECTING gets it anyway.
     private static final double OPPORTUNISTIC_ITEM_RANGE = 3.0;
-    // Vanilla's pickup radius. Inside it, walking closer only overshoots.
-    private static final double OPPORTUNISTIC_STOP_DISTANCE = 1.5;
+    // Vanilla's pickup reach: Player.touch inflates the player box by 1.0
+    // horizontally, so a 0.6-wide player takes a 0.25-wide item up to
+    // 0.3 + 1.0 + 0.125 blocks out on an axis. Inside it, walking closer only
+    // overshoots — but not a hand's breadth further out, which is what the 1.5
+    // this used to hold got wrong.
+    private static final double OPPORTUNISTIC_STOP_DISTANCE = 1.425;
     // How far ahead a step is projected when testing whether it is safe. One
     // block is about four ticks of walking — far enough that the check sees
     // the hazard before the bot is standing in it.
     private static final double STEP_LOOKAHEAD = 1.0;
+    // How far across the face the aim point leans toward the next target, and
+    // how much of the face is kept clear of the rim so the raycast still lands
+    // on this block rather than its neighbour.
+    private static final double AIM_LOOKAHEAD_BIAS = 0.3;
+    private static final double AIM_EDGE_MARGIN = 0.15;
 
     // Deferred-action mechanism: when a phase decides to transition, it can
     // request a Gaussian-distributed reaction delay first. During the delay
@@ -116,7 +126,6 @@ public class BotController {
     private static boolean hasLastAim = false;
 
     // Collection state
-    private static boolean walkAfterCollect = false;
     // Position of the last mined block — COLLECTING walks toward this to pick up drops
     private static BlockPos lastMinedPos = null;
     // True once items have been observed in the 8-block AABB this COLLECTING
@@ -141,6 +150,13 @@ public class BotController {
     // if the server rejects it under accelerated ticks). The window length is
     // CONFIG.airConfirmTicks, named for its original mining-only purpose.
     private static int stateConfirmTicks = 0;
+    // Set while the bot moves from one block of a seam to the next without
+    // stepping — see continueSeam. Cleared when a fresh task starts.
+    private static boolean seamContinuation = false;
+    // Prediction sequence in effect when the target was first seen finished.
+    // Once the server has acknowledged this far, the client's view of the
+    // block is the server's view and no waiting window is needed.
+    private static int completionSequence = -1;
     // Latched true when a drop entity has been observed near the target at
     // any point during this break. The drop must be polled every tick: when
     // the bot stands right next to the block (gallery mining, re-approach),
@@ -205,7 +221,9 @@ public class BotController {
         itemsSeenThisCollect = false;
         lastItemSeenTick = 0;
         stateConfirmTicks = 0;
-        walkAfterCollect = false;
+        completionSequence = -1;
+        seamContinuation = false;
+        ServerBlockSync.reset();
         deferredAction = null;
         deferredActionDelay = 0;
         preAttackHesitationRemaining = -1;
@@ -422,8 +440,15 @@ public class BotController {
             // controller defaults to multiplier=1.0 and saccades off; we
             // immediately roll a per-target look-speed so the turn cadence
             // varies block-to-block.
-            camera = new CameraController();
-            camera.initialize(player.getYRot(), player.getXRot());
+            //
+            // A seam continuation keeps the camera it already has. Rebuilding
+            // it zeroes the spring's angular velocity, so every block of a
+            // corridor restarts the sweep from a standstill — a hand already
+            // moving does not stop between two blocks of the same seam.
+            if (camera == null || !seamContinuation) {
+                camera = new CameraController();
+                camera.initialize(player.getYRot(), player.getXRot());
+            }
             camera.setLookSpeedMultiplier(HumanBehavior.randomLookSpeedMultiplier(CONFIG));
             aimOffsetX = HumanBehavior.randomAimOffset(CONFIG);
             aimOffsetY = HumanBehavior.randomAimOffset(CONFIG);
@@ -474,6 +499,24 @@ public class BotController {
         double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
         double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
 
+        // Then slide the aim point across the face toward wherever the work
+        // goes next, so the camera is already leaning that way when the target
+        // switches. Mining a 2-high column, the two blocks sit one above the
+        // other: aiming at each face's centre swings the head through the
+        // whole angle between them, while aiming near their shared edge makes
+        // the switch a few degrees. Someone digging a corridor does the same —
+        // they look at the seam, not at two separate block centres. The bias
+        // stays inside AIM_EDGE_MARGIN of the rim, because the raycast has to
+        // keep landing on this block: past the edge it catches the neighbour
+        // and the hit-result gate never fires.
+        BotTask next = taskQueue.peekNearest(player.blockPosition());
+        if (next != null) {
+            BlockPos toward = next.targetPos();
+            offX = biasTowardNext(offX, face.getStepX(), toward.getX() - target.getX());
+            offY = biasTowardNext(offY, face.getStepY(), toward.getY() - target.getY());
+            offZ = biasTowardNext(offZ, face.getStepZ(), toward.getZ() - target.getZ());
+        }
+
         aimCameraAt(player, tx + offX, ty + offY, tz + offZ);
 
         // Single gate before transitioning to INTERACTING: the client's
@@ -523,7 +566,8 @@ public class BotController {
             // humanness. During it the camera keeps aiming and saccades
             // start (sustained aim is when frozen-gaze is most visible).
             if (preAttackHesitationRemaining < 0) {
-                preAttackHesitationRemaining = HumanBehavior.randomPreAttackHesitation(CONFIG);
+                preAttackHesitationRemaining = seamContinuation
+                        ? 0 : HumanBehavior.randomPreAttackHesitation(CONFIG);
                 camera.setMicroSaccadesEnabled(true);
             }
             if (preAttackHesitationRemaining > 0) {
@@ -601,6 +645,7 @@ public class BotController {
         // sub-targets like sequential tree logs).
         if (phaseTicks == 1) {
             stateConfirmTicks = 0;
+            completionSequence = -1;
             dropSeenThisBreak = false;
             startInventoryCount = countMainInventory(player);
             // Defensive re-send in case the packet was dropped while turning.
@@ -673,8 +718,16 @@ public class BotController {
         // has *shrunk* by the block that was consumed. A client-predicted
         // placement the server rejects never moves the item count.
         if (currentTask.isCurrentTargetComplete(level)) {
+            if (completionSequence < 0) {
+                // First tick the target looks finished, so the prediction that
+                // finished it is this sequence or an earlier one. Waiting for
+                // this one settles ours too: the ack retires everything up to
+                // the sequence it names.
+                completionSequence = ServerBlockSync.currentSequence(client.level);
+            }
             stateConfirmTicks++;
         } else {
+            completionSequence = -1;
             stateConfirmTicks = 0;
         }
         boolean artifact;
@@ -693,7 +746,14 @@ public class BotController {
             }
             artifact = dropSeenThisBreak || countMainInventory(player) > startInventoryCount;
         }
-        if (stateConfirmTicks >= CONFIG.airConfirmTicks && artifact) {
+        // The server settling the prediction is the real answer, and it beats
+        // the window below by roughly the whole window: a client that has the
+        // ack knows the block is gone, where the sustained-state count is only
+        // waiting to become confident about a guess. The window and its
+        // artifact stay as the fallback for a connection that never acks —
+        // slower, but the bot keeps working instead of burning maxBreakTicks.
+        boolean serverSettled = ServerBlockSync.isSettled(completionSequence);
+        if (serverSettled || (stateConfirmTicks >= CONFIG.airConfirmTicks && artifact)) {
             BlockInteractor.stopInteraction();
             // A step from opportunistic collection must not survive the phase
             // change — transitionTo does not touch the movement keys.
@@ -714,7 +774,7 @@ public class BotController {
             // Sub-targets remaining in same task (e.g. tree logs) — mine next next
             if (currentTask.advanceToNextTarget()) {
                 lookRetryUsed = false;
-                scheduleAction(() -> transitionTo(Phase.LOOKING));
+                continueSeam();
                 return;
             }
 
@@ -731,21 +791,15 @@ public class BotController {
             lastMinedPos = target;
             BotTask nextTask = taskQueue.peekNearest(player.blockPosition());
             if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
-                // Next target is within reach — mine it next, after the beat
-                scheduleAction(() -> {
-                    LocalPlayer p = Minecraft.getInstance().player;
-                    currentTask = p != null
-                            ? taskQueue.pollNearest(p.blockPosition())
-                            : taskQueue.poll();
-                    taskTotalTicks = 0;
-                    lookRetryUsed = false;
-                    transitionTo(Phase.LOOKING);
-                });
+                // Next target is within reach — mine it next, no beat
+                currentTask = taskQueue.pollNearest(player.blockPosition());
+                taskTotalTicks = 0;
+                lookRetryUsed = false;
+                continueSeam();
             } else {
                 // Need to walk (or nothing left) — collect drops first.
                 // Don't delay here: COLLECTING begins immediately so the bot
                 // starts pursuing drops while they're still falling.
-                walkAfterCollect = nextTask != null;
                 itemsSeenThisCollect = false;
                 lastItemSeenTick = 0;
                 transitionTo(Phase.COLLECTING);
@@ -847,6 +901,20 @@ public class BotController {
         client.options.keyLeft.setDown(strafeDir < 0);
         client.options.keyRight.setDown(strafeDir > 0);
         client.options.keySprint.setDown(false);
+    }
+
+    /**
+     * Shift one axis of the aim offset toward the next target. Axes along the
+     * face normal stay untouched (that would leave the face plane), and the
+     * result is clamped so the aim point keeps a margin to the rim.
+     */
+    private static double biasTowardNext(double offset, int faceStep, int delta) {
+        if (faceStep != 0 || delta == 0) {
+            return offset;
+        }
+        double biased = offset + Math.signum(delta) * AIM_LOOKAHEAD_BIAS;
+        double limit = 0.5 - AIM_EDGE_MARGIN;
+        return Math.max(-limit, Math.min(limit, biased));
     }
 
     /**
@@ -952,7 +1020,7 @@ public class BotController {
             // Same stall, horizontal geometry: a drop can land behind a block
             // the bot is not going to mine (a blacklisted block, bedrock, the
             // far side of a dammed liquid). It is inside the AABB and inside
-            // the walk filter, but outside the 1.5-block pickup radius and
+            // the walk filter, but outside the vanilla pickup box and
             // walled off, so walkToward pushes into the obstruction and the
             // distance never shrinks. Measured: six of fourteen collects in the
             // chunk suite burned the full collectWaitMax that way, all of them
@@ -1001,10 +1069,19 @@ public class BotController {
                 itemsSeenThisCollect = true;
             }
 
-            // Vanilla pickup radius is ~1.5 blocks (3D). Stop walking once
-            // we're inside that radius — any closer and we'd overshoot.
-            // 1.5² = 2.25.
-            if (nearest != null && nearestDistSq > 2.25) {
+            // Vanilla pickup is a box, not a radius: Player.touch queries
+            // getBoundingBox().inflate(1.0, 0.5, 1.0) and takes every item
+            // whose own box intersects it — with a 0.6-wide player and a
+            // 0.25-wide item that is 1.425 centre-to-centre on each horizontal
+            // axis. Stopping at 1.5 parked the bot *outside* it on a
+            // straight-ahead approach: whether the drop got picked up came
+            // down to how far the walk's momentum carried past the threshold,
+            // and when it didn't, the bot stood over an item it could not
+            // reach for the whole collectWaitMax (the ore-vein test leaving
+            // all three drops on the ground). One block is inside the box on
+            // every axis with room for the server seeing the walk a tick
+            // later than the client does.
+            if (nearest != null && nearestDistSq > 1.0) {
                 walkToward(client, player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ(),
                         nearestHorizDistSq);
             } else if (nearest != null) {
@@ -1058,7 +1135,7 @@ public class BotController {
         // When a further task is queued that needs walking, exit as soon as
         // items are absent — no absence-tick wait. The bot will then SCAN →
         // NAVIGATE toward the next target, and any straggler drops along the
-        // walk path get picked up by the 1.5-block radius. This eliminates the
+        // walk path get picked up by the vanilla pickup box. This eliminates the
         // visible "pause after pickup" that made multi-block flows feel choppy.
         //
         // A behavior that plans one block at a time never has a task queued at
@@ -1071,12 +1148,24 @@ public class BotController {
         // the straggler argument is the same one the queued-walk path already
         // makes, and the next block is an adjacent column the bot is standing
         // on by then.
-        boolean awaitingWalk = walkAfterCollect && taskQueue.peek() != null;
+        //
+        // The hand-off goes one step further and leaves *before* the drops are
+        // in. It applies only where the two flags together promise the walk
+        // will still happen: opportunisticCollection steps toward exactly
+        // these drops during the next break, so the walking overlaps the
+        // mining instead of replacing it. In a corridor the drops lie between
+        // the bot and the column it is about to dig, so that step is the
+        // corridor advance — the bot never walks anywhere it wasn't going.
+        // Without it the sequence is mine, stand, walk, mine; a behavior that
+        // keeps planning pays one full walk per column for nothing.
+        boolean queued = taskQueue.peek() != null;
         boolean doneCollecting = itemsSeenThisCollect && !itemsNearby
-                && (awaitingWalk || policy.fastCollectExit()
+                && (queued || policy.fastCollectExit()
                         || phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks);
+        boolean handOff = queued && policy.fastCollectExit()
+                && policy.opportunisticCollection();
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
-        if (doneCollecting || timedOut) {
+        if (doneCollecting || handOff || timedOut) {
             // Failure-only telemetry: if COLLECTING is exiting with no items
             // ever seen, log the last mined block state + surrounding area.
             // Fires once per exit; no timing impact on the happy path.
@@ -1095,28 +1184,14 @@ public class BotController {
             itemsSeenThisCollect = false;
             lastItemSeenTick = 0;
             currentTask = null;
-            if (walkAfterCollect && !taskQueue.isEmpty() && !paused) {
-                currentTask = player != null
-                        ? taskQueue.pollNearest(player.blockPosition())
-                        : taskQueue.poll();
-                taskTotalTicks = 0;
-                lookRetryUsed = false;
-                // tickCollecting walks toward the next task while items
-                // settle, so by the time we exit we may already be in reach.
-                // Skip SCANNING in that case — the human-like "look at next
-                // target before moving" cue is unnecessary when we're
-                // already standing on it.
-                if (player != null && isWithinReach(player, currentTask.targetPos())) {
-                    transitionTo(Phase.LOOKING);
-                } else {
-                    transitionTo(Phase.SCANNING);
-                }
-            } else {
-                phase = Phase.IDLE;
-                phaseTicks = 0;
-                if (!taskQueue.isEmpty() && !paused) {
-                    startNextTask();
-                }
+            transitionTo(Phase.IDLE);
+            // startNextTask already skips SCANNING for a target in reach —
+            // tickCollecting walks toward the next task while items settle, so
+            // by the time we exit the bot may be standing on it, and the
+            // human-like "look at the next target before moving" cue would be
+            // cueing a walk that isn't happening.
+            if (!taskQueue.isEmpty() && !paused) {
+                startNextTask();
             }
         }
     }
@@ -1221,6 +1296,27 @@ public class BotController {
 
     // --- State transitions ---
 
+    /**
+     * Go straight to the next block of a seam the bot is already working: the
+     * next sub-target of this task, or a queued task whose block is in reach
+     * from where the bot stands. No reaction beat, no fresh camera, and
+     * LOOKING skips the pre-attack hesitation.
+     *
+     * <p>Those three exist to model a person noticing a result, deciding, and
+     * committing — the beats between separate acts. Digging a corridor is one
+     * act: the hand stays on the button and sweeps the crosshair over, and
+     * pausing 4 ticks before every block of a 4096-block chunk is not what a
+     * human doing repetitive work looks like, it is what a machine imitating
+     * one looks like. The beats stay on every path that *is* a separate act —
+     * after a walk, after a scan, after collecting. Both call sites here are
+     * the ones the module doc has always described as "straight to LOOKING,
+     * no pause"; the reaction delay had drifted in against that.
+     */
+    private static void continueSeam() {
+        seamContinuation = true;
+        transitionTo(Phase.LOOKING);
+    }
+
     private static void transitionTo(Phase newPhase) {
         if (CONFIG.debugEnabled) {
             LOGGER.info("Phase: {} → {} (task: {})", phase, newPhase,
@@ -1277,6 +1373,7 @@ public class BotController {
         taskTotalTicks = 0;
         lookRetryUsed = false;
         forceApproach = false;
+        seamContinuation = false;
         if (CONFIG.debugEnabled) {
             LOGGER.info("Starting task: {}", currentTask.description());
         }

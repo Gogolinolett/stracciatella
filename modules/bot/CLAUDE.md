@@ -34,10 +34,12 @@ net.stracciatella.bot
 ├── safety/
 │   └── BotAlarm.java               # Latches damage / player-attack events for the runner
 ├── mixin/
-│   └── ClientPacketListenerMixin.java  # Damage + attack-sound packets → BotAlarm
+│   ├── ClientPacketListenerMixin.java  # Damage + attack-sound + block-ack packets
+│   └── ClientLevelAccessor.java    # @Invoker for the package-private prediction handler
 ├── interaction/
 │   ├── BlockInteractor.java        # Simulates attack/use key hold
-│   └── InventoryHelper.java        # Reads hotbar, selects best tool, counts free slots
+│   ├── InventoryHelper.java        # Reads hotbar, selects best tool, counts free slots
+│   └── ServerBlockSync.java        # Highest block-prediction sequence the server has settled
 ├── scan/
 │   ├── BlockScanner.java           # Finds blocks by predicate within radius
 │   ├── TreeDetector.java           # Detects tree structures (base, trunk, height)
@@ -69,7 +71,7 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
 | **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block. After a failed look (`forceApproach`) it walks to close range (2.0) instead of reach distance — the re-approach exists to change the viewpoint | `positionTimeout` |
-| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — the crosshair touching the block is when a human clicks; no angular convergence required (the camera keeps easing toward its aim point during INTERACTING). A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. | `lookTimeout` |
+| **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — the crosshair touching the block is when a human clicks; no angular convergence required (the camera keeps easing toward its aim point during INTERACTING). A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. Continuing a seam skips the hesitation and keeps the previous camera. | `lookTimeout` |
 | **INTERACTING** | Calls startAttack/continueAttack directly, polls `isAir()`, maintains camera via `aimAt` | `maxBreakTicks` |
 | **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); exit once items have been observed and are all picked up | `collectWaitMax` |
 
@@ -77,8 +79,14 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 
 - **More sub-targets** (tree logs): straight to LOOKING, no pause
 - **Next task within reach**: straight to LOOKING with new task, no pause
+
+Those first two go through `continueSeam()`, and "no pause" is meant literally: no reaction beat, no pre-attack hesitation, and LOOKING keeps the camera it already has instead of building a fresh one. All three model a person noticing a result, deciding, and committing — the beats *between* separate acts. Digging a corridor is one act: the hand stays on the button and sweeps the crosshair over. Rebuilding the camera is the same mistake in the other direction, since it zeroes the spring's angular velocity and restarts every sweep from a standstill.
+
+For a long time the code did not match this: both paths went through `scheduleAction`, which drew the ~4-tick reaction delay. It was invisible in every phase measurement, because `phaseTicks` does not advance while a deferred action is pending. Measured on the chunk miner's corridor, removing the three (with the miner's per-column breather, below) took a two-block column from ~50 ticks to ~37 and raised the share of time actually spent breaking from 60% to 81%. The beats stay on every path that *is* a separate act — after a walk, a scan, or a collect.
 - **Next task needs walking**: COLLECTING → SCANNING → NAVIGATING
 - **No more tasks**: COLLECTING → IDLE
+
+COLLECTING always leaves through IDLE and lets `startNextTask` take it from there — it already polls the nearest task, resets the per-task state (`forceApproach` included) and skips SCANNING for a target in reach. The queued-task branch that used to sit in the exit was the same logic written out a second time, minus that reset.
 
 ### Task selection: nearest from current position
 
@@ -96,10 +104,13 @@ Exit gates depend on whether another walked task is queued:
   1. `itemsSeenThisCollect` — at least one tick observed items in the 8-block AABB. Closes the server→client spawn-sync race where the block has broken but the drop entity hasn't synced.
   2. `!itemsNearby` — currently no visible drops.
   3. `phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — sustained absence window. Avoids exiting on a transient absence tick between sequentially picking up multiple drops.
-- **Walked task queued** (`walkAfterCollect && taskQueue.peek() != null`) — only conditions 1 and 2 are required; the sustained-absence wait is skipped. Straggler drops are picked up via the 1.5-block vanilla radius during the `NAVIGATING` walk toward the next target. Eliminates the visible "pause after pickup" in multi-task flows.
+- **Another task queued** — only conditions 1 and 2 are required; the sustained-absence wait is skipped. Straggler drops are picked up via the vanilla pickup box during the `NAVIGATING` walk toward the next target. Eliminates the visible "pause after pickup" in multi-task flows.
 - **`fastCollectExit` opted in** — likewise conditions 1 and 2 only. A behavior that plans one block at a time never has a task queued at this point (it plans the next one only once the controller is idle), so the clause above can never fire for it and the 60-tick window is paid for *every block*: measured on the chunk miner, ~20 ticks of work per block against ~90 elapsed.
+- **Hand-off** (`fastCollectExit` **and** `opportunisticCollection`, with a task queued) — leaves *immediately*, before conditions 1 and 2, drops still on the ground. This is the one exit that does not finish collecting, and it is only sound because the two flags together promise the walk still happens: `opportunisticCollection` strafes toward those same drops during the next break, so the walk overlaps the mining instead of replacing it. In a corridor the drops lie between the bot and the column it is about to dig, so that step *is* the corridor advance — the bot never walks anywhere it wasn't going. Without it a continuously-planning behavior pays one full stop-and-fetch per column: "mine, stand, walk, mine".
 
 While no items are visible yet, the bot walks toward `lastMinedPos` so the drop enters the AABB query as soon as the server syncs it. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
+
+**The walk stops at 1.0 blocks, not 1.5.** Vanilla pickup is a box, not a radius: `Player.touch` queries `getBoundingBox().inflate(1.0, 0.5, 1.0)` and takes every item whose own box intersects it — 1.425 centre-to-centre on each horizontal axis for a 0.6-wide player and a 0.25-wide item. Stopping at 1.5 parked the bot *outside* that on a straight-ahead approach, so whether a drop was collected came down to how far the walk's momentum carried past the threshold. When it didn't, the bot stood over an item it could not reach for the whole `collectWaitMax`: that is the `Bot mine ore vein` timeout, which leaves all three drops on the ground and predates the behaviour layer (same fingerprint in archived runs from June).
 
 If COLLECTING exits while the queue has more work, and the bot has ended up within reach of the next target (e.g. the next ore in a vein), the controller transitions directly to `LOOKING` and skips `SCANNING` — there's no movement to cue.
 
@@ -119,11 +130,17 @@ On the **first** look timeout per target the bot does not fail — it re-approac
 
 The aim point is the center of the face most directly visible from the bot's eye (via `BlockInteractor.faceTowardPlayer`), not the block center — otherwise a raycast aimed at the center of a block sitting in the middle of a stack (e.g. the top log of a tree) lands on the neighbor and the hit-result gate never satisfies. Human-aim jitter is applied only on the two axes perpendicular to the face normal; jitter along the face normal would push the aim point off the face plane and cause the ray to graze a neighbor block instead.
 
+On top of the jitter the aim point slides across the face toward the **next** queued target (`taskQueue.peekNearest`), by `AIM_LOOKAHEAD_BIAS` (0.3) per perpendicular axis. Mining a 2-high column the two blocks sit one above the other, and aiming at each face's centre swings the head through the whole angle between them; aiming near their shared edge makes the switch a few degrees, which is what someone digging a corridor actually does — they look at the seam. The bias is clamped to keep `AIM_EDGE_MARGIN` (0.15) of face between the aim point and the rim, because the raycast still has to land on *this* block: past the edge it catches the neighbour and the hit-result gate never fires. Note this buys **no measurable time** — LOOKING ends on raycast contact, not on camera convergence, and measured at 4.9 ticks mean with and without. It is a humanness/camera-motion change, not a throughput one.
+
 ### Mining
 
 Mining uses vanilla input pipeline — `options.keyAttack.setDown(true)` while camera aims at block. No direct `gameMode` calls.
 
-Break detection requires TWO authoritative signals before considering the block broken:
+Break detection has a fast path and a fallback. The fast path is the **server acknowledgement**: breaking is a sequenced client prediction, and `ClientboundBlockChangedAckPacket` carries the sequence the server has settled — after which `endPredictionsUpTo` has reverted anything the server disagreed with, so the client's view of that block *is* the server's view. `ServerBlockSync` (fed by the packet mixin) tracks the highest acked sequence; INTERACTING samples `BlockStatePredictionHandler.currentSequence()` the first tick the target looks finished and exits as soon as that sequence is settled. `ClientLevel.getBlockStatePredictionHandler()` is package-private, hence the `ClientLevelAccessor` `@Invoker`.
+
+That replaces an eight-tick wait on **every** block — roughly a third of the whole mining loop, measured on the chunk suite (INTERACTING 15.7 ticks per block, ~8 of them this window). The window below is what the ack made unnecessary: it was an approximation of exactly the fact the ack states outright. It stays as the fallback for a connection that never acks, so the bot keeps working instead of burning `maxBreakTicks`.
+
+The fallback requires TWO authoritative signals before considering the block broken:
 
 1. **Sustained-air window**: `level.getBlockState(pos).isAir()` for `CONFIG.airConfirmTicks` consecutive ticks (default 8). `getBlockState` returns the client's view which can be a sequenced-transaction prediction; the sustained window tolerates normal server-confirmation delay.
 2. **A break artifact** — either a drop entity observed within a 5×5×5 AABB around the target at any point since the break started (polled every tick and **latched**: standing next to the block, vanilla pickup inhales the drop within a tick of spawning), or growth of the main-inventory item count since break start (the pickup itself, server-driven via slot sync). Both only exist if the server completed the break.
@@ -169,7 +186,7 @@ Safety and collection behaviour is **opted into per behavior**, never configured
 | `stopOnPlayerAttack` | A player swinging at the bot ends the run, damage or not |
 | `stopWhenInventoryFull` + `minFreeSlots` | Ends the run once fewer than N main slots are empty |
 | `opportunisticCollection` | INTERACTING steps toward nearby drops without dropping the break |
-| `fastCollectExit` | Closes the two COLLECTING stalls below |
+| `fastCollectExit` | Closes the COLLECTING stalls below; together with `opportunisticCollection` also enables the hand-off |
 
 ### Detection: packets, not polling
 
@@ -192,7 +209,7 @@ Three guardrails, because a break in progress is worth more than one dropped ite
 
 1. The projected step must keep the target inside `reachDistance` **and** leave a clear `level.clip` line from the would-be eye to the block. The server reach/visibility-checks the break packets; stepping behind a pillar stalls the task until `maxBreakTicks` with no visible cause.
 2. The destination must be standable — sturdy floor, two fluid- and collision-free cells. No drop is tolerated at all: even a one-block fall pulls the target out of the aim.
-3. Only drops between 1.5 and 3 blocks away. Inside 1.5 vanilla pickup handles it; beyond 3 the trip costs more than the item.
+3. Only drops between 1.425 and 3 blocks away. Inside that, vanilla pickup handles it; beyond 3 the trip costs more than the item.
 
 COLLECTING still runs afterwards and picks up whatever this declined.
 
@@ -202,7 +219,7 @@ All pre-existing, all burning the full `collectWaitMax`. They are fixed behind a
 
 1. **Inhaled drop.** Standing on top of the block, vanilla pickup can take the drop before any tick observes it, so `itemsSeenThisCollect` — which the exit gate requires — never becomes true. Fix: inventory growth since the break started also counts, the same server-authoritative proof the break gate already accepts (and it covers a pickup during INTERACTING too).
 2. **Unreachable drop, vertically.** `itemsNearby` was computed from the *unfiltered* entity list while the walk loop skips anything more than 4 blocks above or below. An item the bot has explicitly decided never to approach kept `itemsNearby` true forever, so `doneCollecting` could never fire. Fix: measure presence on the same filtered set the walk uses.
-3. **Unreachable drop, horizontally.** The same thing one axis over, and not covered by that filter: a drop landing behind a block the bot will never mine — a blacklisted block, bedrock, the far side of a dammed liquid — sits inside the AABB and inside the walk filter, but outside the 1.5-block pickup radius and behind a wall, so `walkToward` pushes into the obstruction and the distance never shrinks. Six of fourteen collects in one chunk-suite run burned `collectWaitMax` this way. Fix: a walk-progress watchdog (nearest item's entity id, best distance reached, ticks since it improved) drops the item after `itemAbsenceTicks` without closing 0.05 blocks. It nulls `nearest` rather than only clearing `itemsNearby`, so the walk stops too — otherwise the movement keys are still down on the exit tick, and `transitionTo` does not release them. A `level.clip` line-of-sight test was rejected: it would abandon drops behind a corner that are perfectly reachable by walking around.
+3. **Unreachable drop, horizontally.** The same thing one axis over, and not covered by that filter: a drop landing behind a block the bot will never mine — a blacklisted block, bedrock, the far side of a dammed liquid — sits inside the AABB and inside the walk filter, but outside the vanilla pickup box and behind a wall, so `walkToward` pushes into the obstruction and the distance never shrinks. Six of fourteen collects in one chunk-suite run burned `collectWaitMax` this way. Fix: a walk-progress watchdog (nearest item's entity id, best distance reached, ticks since it improved) drops the item after `itemAbsenceTicks` without closing 0.05 blocks. It nulls `nearest` rather than only clearing `itemsNearby`, so the walk stops too — otherwise the movement keys are still down on the exit tick, and `transitionTo` does not release them. A `level.clip` line-of-sight test was rejected: it would abandon drops behind a corner that are perfectly reachable by walking around.
 
 ## Test setup: waiting on gamemode sync
 
@@ -214,9 +231,9 @@ The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 
 
 - Spring-damper camera smoothing (5–15 ticks to converge), with a randomised look-speed multiplier per target so successive aims don't all turn at the same rate
 - Random aim offset within block face (Gaussian, clustered near center, clamped to ±aimOffsetMax)
-- Gaussian reaction delay between phase decisions — applied at `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and the block-broken transition; mean 4 ticks (~200 ms), σ=2. During the delay the body pauses but the camera keeps easing toward its last aim point (no stop-motion freeze)
+- Gaussian reaction delay between phase decisions — applied at `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and the block-broken transition *except* when it continues a seam (see `continueSeam`); mean 4 ticks (~200 ms), σ=2. During the delay the body pauses but the camera keeps easing toward its last aim point (no stop-motion freeze)
 - Occasional long "breather" pause at `SCANNING→NAVIGATING`: with `longPauseChance` (default 4%) the standard reaction delay is replaced by a 12–25 tick pause — breaks the otherwise machine-constant cadence
-- Pre-attack commit hesitation: a 1–3 tick "I see it, I click" beat between both LOOKING gates firing and the first `startAttack`. Distinct from the old settle delay — tool sync already happens during the LOOKING camera turn, this is purely humanness
+- Pre-attack commit hesitation: a 1–3 tick "I see it, I click" beat between both LOOKING gates firing and the first `startAttack`, skipped on a seam continuation. Distinct from the old settle delay — tool sync already happens during the LOOKING camera turn, this is purely humanness
 - Micro-saccades during sustained aim (INTERACTING and COLLECTING): ±0.5° yaw, ±0.3° pitch perturbations refreshed every ~12 ticks. Avoid the "frozen gaze" look while mining and while standing over drops
 - Gaze follows the work: POSITIONING walks while smoothly looking at the target block (no hard yaw snap); COLLECTING looks at the drop being collected / the expected drop position, with the downward pitch capped at a per-phase ground-scan angle (~45° with variance) — tracking the item point directly would crane the head ever steeper on approach
 - Nearest-task routing: the next task is always the one closest to the bot's current position, not the scanner's fixed order — no zigzag routes across a gather area
