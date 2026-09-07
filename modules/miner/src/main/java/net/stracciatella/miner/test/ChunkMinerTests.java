@@ -448,27 +448,49 @@ public class ChunkMinerTests {
      */
     private static final int AIM_REACH = 3;
 
+    // The numbers below are TARGETS, not calibrations. Earlier revisions set
+    // them from what the miner happened to do, which made the suite certify
+    // the very slowness it was written to expose — a test that measures the
+    // implementation instead of the requirement can only ever agree with it.
+    // They are derived from the game's own constants and from the intended
+    // design (walk while mining, one aim angle covering both blocks of a
+    // column, collect during the break). The miner does not meet them yet;
+    // the gap each one currently shows is recorded beside it.
+
     /**
-     * Game ticks a block may cost end to end. Stone under a diamond pickaxe
-     * breaks in six; the rest is the aim, the break confirmation, the step to
-     * the next column and picking the drop up. Measured over a full run of
-     * this test: 27 ticks per block, and 33 in the shorter resume run where
-     * the start-up is spread over four blocks instead of eighteen.
+     * Game ticks a block may cost end to end. Stone has hardness 1.5 and a
+     * diamond pickaxe speed 8, so destroy progress is 8/1.5/30 per tick and a
+     * block takes <b>6 ticks of breaking</b>. A column is two of them; on the
+     * intended design the step to the next column and the aim that covers both
+     * its blocks happen while those twelve ticks are running, leaving the break
+     * confirmation as the only serial cost. Twelve ticks per block is therefore
+     * twice the floor and still generous.
+     *
+     * <p>Currently measured: 25. The budget is the whole-run gate, so this is
+     * the number that has to move.
      */
-    private static final int TICK_BUDGET_PER_BLOCK = 60;
+    private static final int TICK_BUDGET_PER_BLOCK = 12;
     /**
-     * Share of the mining window the bot must actually be swinging in.
-     * Measured at 70% over the corridor and 76% over the shorter resume run.
+     * Share of the mining window the bot must actually be swinging in. The
+     * requirement is that the bot is always mining, so the bound is set where
+     * "always" stops being a fair description rather than at what the miner
+     * manages. Note the sensor is generous already: {@code player.swinging}
+     * over-runs the last swing by the swing animation.
+     *
+     * <p>Currently measured: 67-70% over the corridor, 56% over the aim patch.
      */
-    private static final double MIN_DUTY_CYCLE = 0.50;
+    private static final double MIN_DUTY_CYCLE = 0.90;
     /**
-     * A gap longer than this counts as an interruption rather than a beat.
-     * Ordinary gaps measure 16 to 24 ticks, and on top of one of those
-     * {@code randomBreatherTicks} may add up to 25 more — by design, on 4% of
-     * columns. The floor therefore has to clear 49, or roughly one run in
-     * twenty-five would fail on a pause the behaviour is supposed to take.
+     * A gap longer than this counts as an interruption rather than a beat. The
+     * bound is the longest pause the design actually sanctions:
+     * {@code randomBreatherTicks} may hold for 25 ticks on 4% of columns, and
+     * a reaction delay may add 10. Anything past 35 is not a pause the
+     * behaviour chose, it is the bot failing to get back to work.
+     *
+     * <p>Currently measured: gaps of 16-24 in the corridor, up to 74 on the
+     * aim patch.
      */
-    private static final int LONG_GAP_TICKS = 50;
+    private static final int LONG_GAP_TICKS = 35;
     /**
      * How many such interruptions a whole run may contain. Not zero: a drop
      * that landed out of reach has to be walked to, and that is the one break
@@ -476,24 +498,37 @@ public class ChunkMinerTests {
      */
     private static final int MAX_LONG_GAPS = 1;
     /**
-     * Yaw a block may cost. Measured at 71-88 degrees over the corridor and 81
-     * over the aim patch. The bound is a guard against an aim that goes wild,
-     * not a detector for column ordering — {@link #holdsItsAim} carries the
-     * measurement that rules that out.
+     * Yaw a block may cost. The design is one aim angle per column that reaches
+     * both its blocks, and a serpentine that turns once per row rather than per
+     * column — so a column costs one turn to the next column's centre, and a
+     * block costs half of that. Forty-five degrees per block allows a full
+     * ninety-degree reorientation for every column, which is already the
+     * corner case rather than the rule.
+     *
+     * <p>Currently measured: 71-92 over the corridor, 81-92 over the aim patch.
+     * The bound is not a detector for column ordering — {@link #holdsItsAim}
+     * carries the measurement that rules that out.
      */
-    private static final double MAX_YAW_PER_BLOCK = 130.0;
-    /** Ticks a resumed run may spend before its first swing at a block. */
-    private static final int RESUME_FIRST_BREAK_TICKS = 400;
+    private static final double MAX_YAW_PER_BLOCK = 45.0;
+    /**
+     * Ticks a resumed run may spend before its first swing at a block. The
+     * block is already in front of the bot, so the honest cost is one reaction
+     * delay (10 at most) plus the aim — nothing that justifies a wait measured
+     * in hundreds. Currently measured: 9-10.
+     */
+    private static final int RESUME_FIRST_BREAK_TICKS = 40;
     /**
      * Share of the mined blocks whose drop must be in the inventory when the
-     * run ends. Not all of them: the requirement is that the bot keeps mining,
-     * and a drop that landed out of reach is explicitly allowed to be left
-     * behind rather than mined around. Measured at 16 of 18 over the corridor
-     * and 4 of 4 over the resume run — the two missing ones fall into the hole
-     * during the descent. Demanding all of them is what makes the corridor
-     * test flaky.
+     * run ends. Not all of them — a drop that landed out of reach is expressly
+     * allowed to be left rather than mined around — but "very rare" is the
+     * wording of the requirement, so roughly one in ten is the outer edge of
+     * it. Demanding every single one is what makes the corridor test flaky.
+     *
+     * <p>Currently measured: 16-17 of 18 over the corridor, 4 of 4 over the
+     * resume run. The ones that go missing fall into the hole during the
+     * descent.
      */
-    private static final double MIN_COLLECTED_FRACTION = 0.75;
+    private static final double MIN_COLLECTED_FRACTION = 0.90;
 
     private void assertMiningQuality(MiningTrace trace, int blocks) {
         if (trace.dutyCycle() < MIN_DUTY_CYCLE) {
@@ -539,6 +574,11 @@ public class ChunkMinerTests {
                 return !BehaviorRunner.isActive();
             }, budget);
         } catch (AssertionError e) {
+            // Counted before stopping here too. Reporting collected=0 on a
+            // timeout would read as "picked nothing up" when it only means
+            // "never got as far as counting".
+            trace.collected = ctx.computeOnClient(
+                    mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
             ctx.runOnClient(mc -> {
                 BehaviorRunner.stop();
                 BotController.stop();
@@ -590,6 +630,12 @@ public class ChunkMinerTests {
         private int maxFeetY = Integer.MIN_VALUE;
         /** Cobblestone in the inventory when the run ended. Not sampled. */
         private int collected;
+        /**
+         * Ticks spent in each controller phase. This is what makes a budget
+         * failure actionable: "too slow" is not a finding, "nineteen of every
+         * twenty-five ticks went somewhere other than INTERACTING" is.
+         */
+        private final int[] phaseTicks = new int[BotController.Phase.values().length];
 
         void sample(Minecraft mc) {
             LocalPlayer player = mc.player;
@@ -608,6 +654,7 @@ public class ChunkMinerTests {
             int feetY = player.blockPosition().getY();
             minFeetY = Math.min(minFeetY, feetY);
             maxFeetY = Math.max(maxFeetY, feetY);
+            phaseTicks[BotController.getPhase().ordinal()]++;
 
             // The arm swing, not a phase of ours: BlockInteractor swings only
             // on a tick where continueDestroyBlock reported the break is still
@@ -673,7 +720,23 @@ public class ChunkMinerTests {
                     + " yaw=" + Math.round(yawTravel) + "deg"
                     + " maxYawStep=" + Math.round(maxYawStep) + "deg"
                     + " feetY=" + minFeetY + ".." + maxFeetY
-                    + " collected=" + collected;
+                    + " collected=" + collected
+                    + " phases=" + phaseHistogram();
+        }
+
+        private String phaseHistogram() {
+            StringBuilder sb = new StringBuilder("[");
+            for (BotController.Phase p : BotController.Phase.values()) {
+                int spent = phaseTicks[p.ordinal()];
+                if (spent == 0) {
+                    continue;
+                }
+                if (sb.length() > 1) {
+                    sb.append(' ');
+                }
+                sb.append(p).append('=').append(spent);
+            }
+            return sb.append(']').toString();
         }
     }
 
