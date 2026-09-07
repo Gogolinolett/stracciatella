@@ -59,7 +59,7 @@ Empties one chunk between two layers, the way a person would: walk a 1-wide, 2-h
 | Phase | Behavior |
 |-------|----------|
 | **SELECT_SLAB** | Pick the topmost layer pair inside the range that still holds a diggable block. No progress is stored anywhere — see below. |
-| **DESCEND** | Get the feet down to that slab by digging through the bot's own column, one block per batch, so it drops a single level at a time. |
+| **DESCEND** | Get the feet down to that slab by digging through the bot's own column, one block per batch, so it drops a single level at a time. "Its own column" is the one holding the bot up, not the one its centre is over: `blockPosition()` rounds the centre while the hitbox is 0.6 wide, so with the cell below already open the box can still rest on a neighbour. Waiting for a drop that then never comes froze the run silently — no task queued, so the whole game logged nothing. The wait is bounded and fails loudly. |
 | **CLEAR** | Walk the slab's 256 columns in serpentine order, one column per batch (head block before foot block). |
 
 **Resume is the absence of state.** The current slab is derived from the world every time one is needed, so stopping a run — deliberately, by a policy guard, or by losing the client — resumes exactly where it left off, and no saved cursor can ever disagree with what is actually still standing.
@@ -67,6 +67,10 @@ Empties one chunk between two layers, the way a person would: walk a 1-wide, 2-h
 `SerpentinePlan` orders the columns: along a row, step over, back along the next, with the first row alternating per slab so a finished slab hands the next one a start next to where it stopped. It is deliberately free of Minecraft types so its two load-bearing properties (every column visited once; consecutive columns adjacent) are unit-testable.
 
 Columns are never batched together. The controller runs the task nearest the player, which in a straight corridor means it can target a block two columns ahead that the near column still hides — the same lesson the diamond miner's batch sequencing encodes.
+
+`nextColumn` guards the same hazard for the sweep itself: it resumes at the column the bot stands in and steps *outward in both directions*, never wrapping. A forward-only scan with wraparound looks like it keeps the sweep adjacent, but once the work ahead is done the modulo throws the bot to the far corner and it walks back — reaching a column three over while the one right behind it still blocks the line of sight, and the run dies on a look timeout. The snake's own direction is tried first at every distance, so a full chunk is dug in exactly the order it always was.
+
+It also defers a column that is **in reach and occluded**. Skipping an empty column leaves the bot standing diagonally to the next one with the orthogonal neighbour still up, and nothing walks it clear: the controller only navigates to targets out of reach, and the post-timeout re-approach closes to two blocks, which the bot already beats. The occluder is itself a column of this sweep, so digging it first opens the sight line, and since the miner keeps no cursor the deferred column simply comes back. Out of reach counts as visible — the controller walks to those, and where it ends up is not knowable at planning time. If only the occluded column is left it is returned anyway, so a genuinely unbreakable block still fails the run.
 
 ### Policy
 

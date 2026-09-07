@@ -13,13 +13,19 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.util.Mth;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorStatus;
@@ -57,6 +63,8 @@ public class ChunkMinerBehavior implements BotBehavior {
     private static final int MAX_SEALABLE_SOURCES = 5;
     /** Deepest drop the bot is allowed to open under its own feet. */
     private static final int MAX_SAFE_DROP = 2;
+    /** Ticks to wait for the bot to fall into an opened cell before giving up. */
+    private static final int MAX_DROP_WAIT_TICKS = 100;
 
     private enum Phase {
         SELECT_SLAB,
@@ -89,6 +97,7 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     private int blocksMined;
     private String failReason;
+    private int dropWaitTicks;
 
     public ChunkMinerBehavior(MinerConfig config) {
         this.config = config;
@@ -138,6 +147,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         breatherTicks = 0;
         blocksMined = 0;
         failReason = null;
+        dropWaitTicks = 0;
 
         LocalPlayer player = client.player;
         if (player == null) {
@@ -258,9 +268,24 @@ public class ChunkMinerBehavior implements BotBehavior {
         BlockPos feet = player.blockPosition();
         if (feet.getY() <= slabFeetY) {
             phase = Phase.CLEAR;
+            dropWaitTicks = 0;
             return BehaviorStatus.RUNNING;
         }
         BlockPos under = feet.below();
+        if (level.getBlockState(under).isAir() && player.onGround()) {
+            // The cell under the bot is open but the bot is not falling. That
+            // is not a contradiction: blockPosition() rounds the player's
+            // centre while the hitbox is 0.6 wide, so with the centre over the
+            // opened cell the box can still rest on the neighbouring column.
+            // The wait below then never ends — measured as 150 s in which the
+            // whole game logged nothing, not one line even at DEBUG, because
+            // no task is ever enqueued. Dig whatever is actually holding the
+            // bot up; on a slab being cleared that block is work anyway.
+            BlockPos support = standingSupport(player, level, under.getY());
+            if (support != null) {
+                under = support;
+            }
+        }
         if (!chunk.equals(new ChunkPos(under))) {
             return fail("standing outside the target chunk at " + shortPos(feet));
         }
@@ -274,14 +299,43 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         BlockState state = level.getBlockState(under);
         if (state.isAir()) {
-            // Already open — the drop happens on its own next tick.
+            // Already open — the drop happens on its own next tick. Bounded,
+            // because "on its own" is an assumption about physics and a wrong
+            // one here costs the whole run silently: this branch enqueues no
+            // task, so a bot that never drops freezes the behaviour with the
+            // game logging nothing at all, at any level. A fall of one layer
+            // takes a handful of ticks; anything past this is a state worth
+            // reporting rather than sitting in.
+            if (++dropWaitTicks > MAX_DROP_WAIT_TICKS) {
+                return fail("stuck at " + shortPos(feet) + " with " + shortPos(under)
+                        + " open — not dropping into the slab");
+            }
             return BehaviorStatus.RUNNING;
         }
+        dropWaitTicks = 0;
         if (!isDiggable(state)) {
             return fail("cannot dig down through " + blockName(state) + " at " + shortPos(under));
         }
         plan(List.of(under));
         return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * The first non-air block at {@code y} under the player's hitbox, or null
+     * if nothing there holds it up. Used to find what the bot is really
+     * standing on when that is not the column its centre is over.
+     */
+    private static BlockPos standingSupport(LocalPlayer player, Level level, int y) {
+        AABB box = player.getBoundingBox();
+        for (int x = Mth.floor(box.minX); x <= Mth.floor(box.maxX - 1.0E-7); x++) {
+            for (int z = Mth.floor(box.minZ); z <= Mth.floor(box.maxZ - 1.0E-7); z++) {
+                BlockPos pos = new BlockPos(x, y, z);
+                if (!level.getBlockState(pos).isAir()) {
+                    return pos;
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -346,19 +400,74 @@ public class ChunkMinerBehavior implements BotBehavior {
      * were skipped: the look times out and the run dies on a block it never
      * had a line to. Resuming at the bot keeps every step of the sweep
      * adjacent to the last, which is the whole point of a serpentine.
+     *
+     * <p>Which is why the scan runs outward in both directions and never wraps.
+     * Wrapping past the end of the snake is the same non-adjacent jump by
+     * another name: with the sweep finished ahead of the bot, the modulo sent
+     * it back to the far corner and it walked the row forward from there,
+     * reaching a column three over while the one right behind it still stood
+     * in the line of sight. Stepping outward — the snake's own direction first
+     * at every distance, so a full chunk is dug in exactly the old order —
+     * picks that near leftover up first instead.
+     *
+     * <p>A column that is close enough to be occluded is deferred, because the
+     * snake stepping past an empty column leaves the bot standing *diagonally*
+     * to the next one with the orthogonal neighbour still up: measured in a
+     * real world at surface height, target -16,110,-6 with the head block
+     * -15,111,-6 in the line and the bot 1.75 blocks away. Nothing walks it
+     * clear — the controller only navigates to targets out of reach, and the
+     * post-timeout re-approach closes to two blocks, which it already beats —
+     * so LOOKING times out twice and the whole run dies on a block that is
+     * merely hidden for the moment. Deferring costs nothing: the occluder is
+     * itself a column of this sweep and is dug next, and since the miner keeps
+     * no cursor and re-derives from the world, the skipped column simply comes
+     * back once it is visible. The deferred one is still returned if it is all
+     * that is left, so a genuinely unbreakable block fails the run as before.
      */
     private BlockPos nextColumn(LocalPlayer player, Level level) {
         List<BlockPos> columns = slabColumns(slabFeetY);
         int start = columnIndex(columns, player.blockPosition());
+        BlockPos deferred = null;
         for (int i = 0; i < columns.size(); i++) {
-            BlockPos column = columns.get((start + i) % columns.size());
-            for (BlockPos pos : new BlockPos[] {column, column.above()}) {
-                if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
-                    return column;
+            for (int index : new int[] {start + i, start - i}) {
+                if (index < 0 || index >= columns.size()) {
+                    continue;
+                }
+                BlockPos column = columns.get(index);
+                // Head first, matching the order tickClear plans them in: that
+                // is the block LOOKING aims at, so that is the one to test.
+                for (BlockPos pos : new BlockPos[] {column.above(), column}) {
+                    if (!isInRange(pos) || !isDiggable(level.getBlockState(pos))) {
+                        continue;
+                    }
+                    if (isAimable(player, level, pos)) {
+                        return column;
+                    }
+                    if (deferred == null) {
+                        deferred = column;
+                    }
+                    break;
                 }
             }
         }
-        return null;
+        return deferred;
+    }
+
+    /**
+     * Whether the bot could aim at {@code pos} from where it stands. Out of
+     * reach counts as aimable: the controller walks to those, and where it
+     * ends up is not knowable from here.
+     */
+    private boolean isAimable(LocalPlayer player, Level level, BlockPos pos) {
+        Vec3 eye = player.getEyePosition();
+        Vec3 aim = Vec3.atCenterOf(pos);
+        double reach = BotController.CONFIG.reachDistance;
+        if (eye.distanceToSqr(aim) > reach * reach) {
+            return true;
+        }
+        BlockHitResult clip = level.clip(new ClipContext(
+                eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+        return clip.getType() != HitResult.Type.BLOCK || clip.getBlockPos().equals(pos);
     }
 
     /** Index of the bot's own column in the sweep, or 0 if it stands outside. */

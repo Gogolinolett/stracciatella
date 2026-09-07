@@ -127,6 +127,13 @@ public class BotController {
     // exits once items have been absent for a sustained window (not just a
     // single transient tick between pickup and next spawn/sync).
     private static int lastItemSeenTick = 0;
+    // Walk-progress watchdog for the item the bot is currently closing on:
+    // its entity id, the closest it has ever been, and how long it has been
+    // since that got any closer. See the unreachable-drop note in
+    // tickCollecting.
+    private static int collectNearestId = -1;
+    private static double collectBestDistSq = Double.MAX_VALUE;
+    private static int collectNoProgressTicks = 0;
     // Interaction state — how many consecutive ticks the current target has
     // been observed in its completed state (air for mining, a solid block for
     // placing). We require a sustained window to ensure the server confirmed
@@ -330,6 +337,21 @@ public class BotController {
             if (isWithinReach(player, currentTask.targetPos())) {
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
             } else {
+                // Failure-only diagnostics: without them this message says only
+                // that the walk did not finish, which is the one thing already
+                // known. Where the bot ended up and what it was standing in is
+                // what separates "boxed into its own hole" from "path ran out".
+                BlockPos t = currentTask.targetPos();
+                BlockPos feet = player.blockPosition();
+                LOGGER.warn("Position timeout diagnostics: target={} dist={} player=({}, {}, {})"
+                        + " feet={} under={} head={} onGround={} pathActive={}",
+                        t.toShortString(), String.format("%.2f", Math.sqrt(
+                                player.distanceToSqr(Vec3.atCenterOf(t)))),
+                        String.format("%.2f", player.getX()), String.format("%.2f", player.getY()),
+                        String.format("%.2f", player.getZ()), feet.toShortString(),
+                        client.level.getBlockState(feet.below()),
+                        client.level.getBlockState(feet.above()), player.onGround(),
+                        PathWalker.isActive());
                 failCurrentTask("Could not get within reach of target");
             }
             return;
@@ -551,6 +573,19 @@ public class BotController {
         if (phaseTicks > CONFIG.maxBreakTicks) {
             BlockInteractor.stopInteraction();
             releaseMovementKeys();
+            // Failure-only diagnostics. The three ways a break can burn the
+            // full timeout look identical from the message alone: the server
+            // rejecting it out of reach, the wrong item in hand, or the block
+            // never having been breakable. All three are in here.
+            BlockPos t = currentTask.targetPos();
+            HitResult hr = client.hitResult;
+            LOGGER.warn("Interaction timeout diagnostics: target={} state={} dist={}"
+                    + " player=({}, {}, {}) held={} hitResult={}",
+                    t.toShortString(), client.level.getBlockState(t),
+                    String.format("%.2f", Math.sqrt(player.distanceToSqr(Vec3.atCenterOf(t)))),
+                    String.format("%.2f", player.getX()), String.format("%.2f", player.getY()),
+                    String.format("%.2f", player.getZ()), player.getMainHandItem(),
+                    hr instanceof BlockHitResult bhr ? bhr.getBlockPos().toShortString() : hr);
             failCurrentTask(currentTask.interactionType() == InteractionType.USE
                     ? "Block place timeout" : "Block break timeout");
             return;
@@ -879,6 +914,9 @@ public class BotController {
                 camera.setMicroSaccadesEnabled(true);
                 // Roll this collect's ground-scan angle (~45° with variance).
                 collectGazePitch = HumanBehavior.randomCollectGazePitch(CONFIG);
+                collectNearestId = -1;
+                collectBestDistSq = Double.MAX_VALUE;
+                collectNoProgressTicks = 0;
             }
 
             // Find nearby item entities within 8 blocks
@@ -911,12 +949,41 @@ public class BotController {
                 }
             }
 
+            // Same stall, horizontal geometry: a drop can land behind a block
+            // the bot is not going to mine (a blacklisted block, bedrock, the
+            // far side of a dammed liquid). It is inside the AABB and inside
+            // the walk filter, but outside the 1.5-block pickup radius and
+            // walled off, so walkToward pushes into the obstruction and the
+            // distance never shrinks. Measured: six of fourteen collects in the
+            // chunk suite burned the full collectWaitMax that way, all of them
+            // a drop two blocks out with one standing block in between.
+            // COLLECTING deliberately does not pathfind, so the answer is to
+            // notice the lack of progress and leave it: itemAbsenceTicks of
+            // walking without getting a single 0.05 closer is nothing a
+            // reachable drop looks like.
+            if (nearest == null || nearest.getId() != collectNearestId) {
+                collectNearestId = nearest == null ? -1 : nearest.getId();
+                collectBestDistSq = nearestDistSq;
+                collectNoProgressTicks = 0;
+            } else if (nearestDistSq < collectBestDistSq - 0.05) {
+                collectBestDistSq = nearestDistSq;
+                collectNoProgressTicks = 0;
+            } else {
+                collectNoProgressTicks++;
+            }
+            // Dropping it here rather than only in the exit gate matters: the
+            // walk below would otherwise keep pushing into the obstruction all
+            // the way through the exit tick, leaving the movement keys down.
+            if (policy.fastCollectExit() && collectNoProgressTicks > CONFIG.itemAbsenceTicks) {
+                nearest = null;
+            }
+
             // Presence is measured on the same set the walk above uses. An
-            // item the loop rejected (>4 blocks up or down) is one the bot has
-            // decided it will never approach — counting it as "nearby" pins
-            // itemsNearby true forever, the exit gate can never fire, and the
-            // phase burns the full collectWaitMax. Behaviors that don't opt in
-            // keep the original unfiltered test.
+            // item the loop rejected (>4 blocks up or down, or given up on as
+            // unreachable) is one the bot has decided it will never approach —
+            // counting it as "nearby" pins itemsNearby true forever, the exit
+            // gate can never fire, and the phase burns the full collectWaitMax.
+            // Behaviors that don't opt in keep the original unfiltered test.
             itemsNearby = policy.fastCollectExit() ? nearest != null : !items.isEmpty();
             if (itemsNearby) {
                 itemsSeenThisCollect = true;
@@ -993,9 +1060,21 @@ public class BotController {
         // NAVIGATE toward the next target, and any straggler drops along the
         // walk path get picked up by the 1.5-block radius. This eliminates the
         // visible "pause after pickup" that made multi-block flows feel choppy.
+        //
+        // A behavior that plans one block at a time never has a task queued at
+        // this point — it only plans the next one once the controller is idle,
+        // so the queue is empty on every exit and the window above is paid for
+        // every single block. Measured on the chunk miner: ~20 ticks of actual
+        // work per block against ~90 elapsed, the difference being almost
+        // entirely this wait with the drop already in the inventory. Behaviors
+        // that opted into fastCollectExit therefore skip the window outright;
+        // the straggler argument is the same one the queued-walk path already
+        // makes, and the next block is an adjacent column the bot is standing
+        // on by then.
         boolean awaitingWalk = walkAfterCollect && taskQueue.peek() != null;
         boolean doneCollecting = itemsSeenThisCollect && !itemsNearby
-                && (awaitingWalk || phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks);
+                && (awaitingWalk || policy.fastCollectExit()
+                        || phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks);
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
         if (doneCollecting || timedOut) {
             // Failure-only telemetry: if COLLECTING is exiting with no items

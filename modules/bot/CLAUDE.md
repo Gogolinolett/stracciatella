@@ -97,6 +97,7 @@ Exit gates depend on whether another walked task is queued:
   2. `!itemsNearby` — currently no visible drops.
   3. `phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks` (default 60) — sustained absence window. Avoids exiting on a transient absence tick between sequentially picking up multiple drops.
 - **Walked task queued** (`walkAfterCollect && taskQueue.peek() != null`) — only conditions 1 and 2 are required; the sustained-absence wait is skipped. Straggler drops are picked up via the 1.5-block vanilla radius during the `NAVIGATING` walk toward the next target. Eliminates the visible "pause after pickup" in multi-task flows.
+- **`fastCollectExit` opted in** — likewise conditions 1 and 2 only. A behavior that plans one block at a time never has a task queued at this point (it plans the next one only once the controller is idle), so the clause above can never fire for it and the 60-tick window is paid for *every block*: measured on the chunk miner, ~20 ticks of work per block against ~90 elapsed.
 
 While no items are visible yet, the bot walks toward `lastMinedPos` so the drop enters the AABB query as soon as the server syncs it. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
 
@@ -195,12 +196,13 @@ Three guardrails, because a break in progress is worth more than one dropped ite
 
 COLLECTING still runs afterwards and picks up whatever this declined.
 
-### The two COLLECTING stalls (`fastCollectExit`)
+### The COLLECTING stalls (`fastCollectExit`)
 
-Both are pre-existing and both burn the full `collectWaitMax`. They are fixed behind a flag rather than globally because `/bot mine` and the diamond miner were tuned around today's timing.
+All pre-existing, all burning the full `collectWaitMax`. They are fixed behind a flag rather than globally because `/bot mine` and the diamond miner were tuned around today's timing.
 
 1. **Inhaled drop.** Standing on top of the block, vanilla pickup can take the drop before any tick observes it, so `itemsSeenThisCollect` — which the exit gate requires — never becomes true. Fix: inventory growth since the break started also counts, the same server-authoritative proof the break gate already accepts (and it covers a pickup during INTERACTING too).
-2. **Unreachable drop.** `itemsNearby` was computed from the *unfiltered* entity list while the walk loop skips anything more than 4 blocks above or below. An item the bot has explicitly decided never to approach kept `itemsNearby` true forever, so `doneCollecting` could never fire. Fix: measure presence on the same filtered set the walk uses.
+2. **Unreachable drop, vertically.** `itemsNearby` was computed from the *unfiltered* entity list while the walk loop skips anything more than 4 blocks above or below. An item the bot has explicitly decided never to approach kept `itemsNearby` true forever, so `doneCollecting` could never fire. Fix: measure presence on the same filtered set the walk uses.
+3. **Unreachable drop, horizontally.** The same thing one axis over, and not covered by that filter: a drop landing behind a block the bot will never mine — a blacklisted block, bedrock, the far side of a dammed liquid — sits inside the AABB and inside the walk filter, but outside the 1.5-block pickup radius and behind a wall, so `walkToward` pushes into the obstruction and the distance never shrinks. Six of fourteen collects in one chunk-suite run burned `collectWaitMax` this way. Fix: a walk-progress watchdog (nearest item's entity id, best distance reached, ticks since it improved) drops the item after `itemAbsenceTicks` without closing 0.05 blocks. It nulls `nearest` rather than only clearing `itemsNearby`, so the walk stops too — otherwise the movement keys are still down on the exit tick, and `transitionTo` does not release them. A `level.clip` line-of-sight test was rejected: it would abandon drops behind a corner that are perfectly reachable by walking around.
 
 ## Test setup: waiting on gamemode sync
 
