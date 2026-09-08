@@ -21,7 +21,9 @@ import org.slf4j.LoggerFactory;
  * nothing to dig, so a sparse chunk exercises the same code path as a full
  * one in a fraction of the ticks. The layer range is pinned to one slab (two
  * for the descent test) so a run has a defined end instead of eating its way
- * down to bedrock.
+ * down to bedrock. {@link #resumesCurrentLayer} is the exception: it requests
+ * no range, because where an argument-less run puts the top of its range is
+ * the thing it tests.
  *
  * <p>Liquids are always placed on the bot's own side of the block being
  * mined. Sealing one means clicking the face of its neighbour *through* the
@@ -298,7 +300,7 @@ public class ChunkMinerTests {
         final int floorBlocks = TRACE_COLUMNS + 3;
         final int blocks = TRACE_COLUMNS * 2 + floorBlocks;
 
-        MiningTrace trace = traceChunkMiner(ctx, Y + 1, Y - 2, blocks);
+        MiningTrace trace = traceChunkMiner(ctx, true, Y + 1, Y - 2, blocks);
 
         for (int dx = 1; dx <= TRACE_COLUMNS; dx++) {
             assertAir(ctx, stand.offset(dx, 0, 0), "corridor floor block " + dx);
@@ -341,6 +343,15 @@ public class ChunkMinerTests {
      * so a resume that is not a resume cannot pass this by accident. The feet
      * bound catches the same thing from the other side: the layer must not
      * change at all during the run.
+     *
+     * <p>It starts <b>without a requested range</b>, which every other test in
+     * this file hands in, and that is the point: the range is what anchors the
+     * slab grid, and deriving it from the bot is the half of the resume the
+     * other tests skip. Handed {@code Y+1} the grid lined up whatever the
+     * behaviour did with the bot's own position, so this test passed while
+     * {@code /miner chunk start} — the only way a person starts a run — took
+     * the feet layer as the top of the range, anchored the grid a level too
+     * low and descended out of every half-finished slab it was restarted in.
      */
     @MinecraftTest(name = "Chunk miner resumes the layer it stands in",
             timeoutTicks = 2000, order = 19)
@@ -358,7 +369,18 @@ public class ChunkMinerTests {
         ctx.waitFor(mc -> mc.level.getBlockState(lowStand.above()).isAir());
         standAt(ctx, lowStand);
 
-        MiningTrace trace = traceChunkMiner(ctx, Y + 1, Y - 2, RESUME_REMAINING);
+        // The bottom of an argument-less run is the config's, and the run has
+        // to end for the trace to close, so it is pinned to this fixture's one
+        // slab the way the other tests pin their range. Only the bottom: the
+        // top is what is under test and must keep coming from the bot.
+        final int configuredBottom = MinerSetup.CONFIG.chunkMinerBottomY;
+        MinerSetup.CONFIG.chunkMinerBottomY = Y - 2;
+        final MiningTrace trace;
+        try {
+            trace = traceChunkMiner(ctx, false, 0, 0, RESUME_REMAINING);
+        } finally {
+            MinerSetup.CONFIG.chunkMinerBottomY = configuredBottom;
+        }
 
         if (trace.ticksToFirstBreak() < 0 || trace.ticksToFirstBreak() > RESUME_FIRST_BREAK_TICKS) {
             throw new AssertionError("Run did not resume the slab it started in: first break after "
@@ -415,7 +437,7 @@ public class ChunkMinerTests {
             }
         }
 
-        MiningTrace trace = traceChunkMiner(ctx, Y + 1, Y, blocks);
+        MiningTrace trace = traceChunkMiner(ctx, true, Y + 1, Y, blocks);
 
         for (int dx = -AIM_REACH; dx <= AIM_REACH; dx++) {
             for (int dz = -1; dz <= 1; dz++) {
@@ -581,10 +603,11 @@ public class ChunkMinerTests {
      * {@code TestRunner} scales it by the tick multiplier, so it is ten times
      * looser than it reads and exists to stop a hung suite, not to judge a run.
      */
-    private MiningTrace traceChunkMiner(TestContext ctx, int fromY, int toY, int blocks) {
+    private MiningTrace traceChunkMiner(TestContext ctx, boolean ranged, int fromY, int toY,
+                                        int blocks) {
         final MiningTrace trace = new MiningTrace();
         final int budget = Math.ceilDiv(blocks * REFERENCE_BUDGET_TICKS, REFERENCE_BLOCKS);
-        startChunkMiner(ctx, fromY, toY);
+        startChunkMiner(ctx, ranged, fromY, toY);
         try {
             ctx.waitFor(mc -> {
                 trace.sample(mc);
@@ -912,13 +935,19 @@ public class ChunkMinerTests {
     }
 
     private void runChunkMiner(TestContext ctx, int fromY, int toY, boolean expectSuccess) {
-        startChunkMiner(ctx, fromY, toY);
+        startChunkMiner(ctx, true, fromY, toY);
         awaitChunkMiner(ctx, expectSuccess);
     }
 
-    private void startChunkMiner(TestContext ctx, int fromY, int toY) {
+    /**
+     * Start a run, with or without a requested range. {@code ranged} is what
+     * {@code /miner chunk start} passes: without it the behavior derives the
+     * range from where the bot stands, which is a different code path and the
+     * one a person actually uses.
+     */
+    private void startChunkMiner(TestContext ctx, boolean ranged, int fromY, int toY) {
         ctx.runOnClient(mc -> {
-            MinerSetup.chunkMiner().setRequestedRange(true, fromY, toY);
+            MinerSetup.chunkMiner().setRequestedRange(ranged, fromY, toY);
             BehaviorRunner.start(MinerSetup.chunkMiner().id());
         });
     }
@@ -949,7 +978,7 @@ public class ChunkMinerTests {
     private void startAgainstLiquid(TestContext ctx, BlockPos liquid, String block) {
         ctx.runCommand("tick freeze");
         setBlock(ctx, liquid, block);
-        startChunkMiner(ctx, Y + 1, Y);
+        startChunkMiner(ctx, true, Y + 1, Y);
         ctx.runCommand("tick unfreeze");
     }
 

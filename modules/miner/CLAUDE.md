@@ -68,6 +68,8 @@ Empties one chunk between two layers, the way a person would: walk a 1-wide, 2-h
 
 **Resume is the absence of state.** The current slab is derived from the world every time one is needed, so stopping a run — deliberately, by a policy guard, or by losing the client — resumes exactly where it left off, and no saved cursor can ever disagree with what is actually still standing.
 
+Which only works because the range top is the bot's **head** layer. `fromY` is the head layer of the topmost slab — `isInRange` caps there and the slab grid starts at `fromY - 1` — so an argument-less start takes `feetY + 1`. Taking the feet layer anchored the grid one level too low: the layer pair the bot occupies could never be selected, so a run restarted inside a half-cleared slab descended out of it and left the rest of that slab's head layer above the range for good.
+
 `SerpentinePlan` orders the columns: along a row, step over, back along the next, with the first row alternating per slab so a finished slab hands the next one a start next to where it stopped. It is deliberately free of Minecraft types so its two load-bearing properties (every column visited once; consecutive columns adjacent) are unit-testable.
 
 Columns are batched only as far as the pickup box reaches (`CHAIN_DISTANCE`), and the batch is executed **in the order it was planned** — `policy()` opts into `withOrderedTasks()`. The controller's default is to run the task nearest the player, which in a straight corridor targets a block two columns ahead that the near column still hides — the same lesson the diamond miner's batch sequencing encodes, and the reason batching used to be forbidden here outright. The serpentine already *is* a safe order, so insertion order is both the faster and the correct one.
@@ -114,7 +116,7 @@ Unlike the diamond miner, the chunk miner opts into **every** guard the bot modu
 | Command | Description |
 |---------|-------------|
 | `/miner diamond start [tunnelLength]` | Start the diamond miner (default length from config) |
-| `/miner chunk start [fromY] [toY]` | Mine out the chunk the player stands in; no arguments means from the player's feet down to `chunkMinerBottomY` |
+| `/miner chunk start [fromY] [toY]` | Mine out the chunk the player stands in; no arguments means from the layer pair the player stands in (feet and head) down to `chunkMinerBottomY` |
 | `/miner chunk blacklist add\|remove <block>` | Edit the blacklist; a bare name is accepted and `minecraft:` filled in |
 | `/miner chunk blacklist list\|clear` | Show or empty the blacklist |
 | `/miner stop` | Stop the behavior (equivalent to the behavior part of `/bot stop`) |
@@ -132,7 +134,7 @@ Persisted to `stracciatella/miner.json`:
 - `maxStepRetries` — re-enqueues per step before giving up (default 2)
 - `chunkMinerBlacklist` — block ids the chunk miner leaves standing. **Ids only, no block states**: a blacklist the player edits by name is worth more than one that can tell a facing apart, and no realistic entry needs the distinction.
 - `fillerBlocks` — what the chunk miner places to seal or dam, in order of preference; the first one it actually carries is used
-- `chunkMinerBottomY` — lowest layer for an argument-less `/miner chunk start` (default -59, the first layer that is never bedrock in a vanilla overworld; clamped to the world floor)
+- `chunkMinerBottomY` — lowest layer for an argument-less `/miner chunk start` (default -59, the first layer that is never bedrock in a vanilla overworld; clamped to the world floor). Only the bottom is configured — the top of an argument-less range always comes from the bot, and `resumes the layer it stands in` pins this one so that run has an end.
 - `chunkMinerMinFreeSlots` — the run stops below this many empty slots (default 2)
 
 ## Dependencies
@@ -151,7 +153,7 @@ Persisted to `stracciatella/miner.json`:
 - **Miner tunnels at depth** — player starts in a pocket at tunnel height; tunnel 5 slices, one ore in the path; expects 1 diamond and a fully dug tunnel.
 - **Miner descends and mines diamonds** — player starts 3 levels above tunnel height; staircase descent, 6 slices, one path ore plus one side-wall ore (mined via the ore scan, not the slices); expects 2 diamonds.
 
-**Chunk Miner Tests** run against a chunk that is empty apart from the few blocks each test cares about. The behavior skips columns with nothing to dig, so a sparse chunk exercises the same code as a full one in a fraction of the ticks; the layer range is pinned to one slab (two for the descent test) so a run has a defined end instead of eating its way to bedrock. Covers: clearing a slab, blacklist, bedrock, the chunk boundary, descending, capping a water source, damming lava, a corridor, and three that measure the run rather than its result.
+**Chunk Miner Tests** run against a chunk that is empty apart from the few blocks each test cares about. The behavior skips columns with nothing to dig, so a sparse chunk exercises the same code as a full one in a fraction of the ticks; the layer range is pinned to one slab (two for the descent test) so a run has a defined end instead of eating its way to bedrock. **`resumes the layer it stands in` is the one exception** — it requests no range at all, because deriving the range from the bot is exactly what it tests; only `chunkMinerBottomY` is pinned, to give the run an end. Covers: clearing a slab, blacklist, bedrock, the chunk boundary, descending, capping a water source, damming lava, a corridor, and three that measure the run rather than its result.
 
 Those three — **mines without stalling**, **resumes the layer it stands in**, **holds its aim** — exist because the other eight cannot fail on a bot that breaks one block, stares at a wall for a thousand ticks and breaks the next. `TestRunner` multiplies `timeoutTicks` by the tick multiplier, so the corridor test's nominal 3000 ticks is a 30000-tick budget for eight blocks. They therefore carry **their own budget** in game ticks, `blocks * TICK_BUDGET_PER_BLOCK` passed to `waitFor`, and sample the tick thread once per tick through the `waitFor` predicate (which is evaluated there anyway — per-tick *logging* perturbs the corridor test enough to flip it, so the sampler stays field arithmetic).
 

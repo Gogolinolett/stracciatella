@@ -106,7 +106,7 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     /**
      * Layer range for the next start. Pass {@code false} to fall back to "from
-     * the player's feet down to the configured bottom".
+     * the layer pair the player is standing in down to the configured bottom".
      */
     public void setRequestedRange(boolean requested, int newFromY, int newToY) {
         this.rangeRequested = requested;
@@ -168,7 +168,16 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         chunk = new ChunkPos(player.blockPosition());
         int worldFloor = client.level != null ? client.level.getMinY() : Integer.MIN_VALUE;
-        fromY = rangeRequested ? requestedFromY : player.blockPosition().getY();
+        // "From here down" reaches from the bot's head, not from its feet. The
+        // top of the range is the *head* layer of the topmost slab — isInRange
+        // caps there and tickSelectSlab starts the grid at fromY - 1 — so
+        // taking the feet layer anchored the whole grid one level too low: the
+        // slab the bot occupies could never be picked, and every start
+        // descended before mining anything. On a resumed run that is the whole
+        // bug. The bot stands in the slab it was clearing, so starting again
+        // walked away from the half-finished level, dug one deeper, and left
+        // the rest of that level's head layer above the range for good.
+        fromY = rangeRequested ? requestedFromY : player.blockPosition().getY() + 1;
         toY = rangeRequested ? requestedToY : config.chunkMinerBottomY;
         if (toY < worldFloor) {
             toY = worldFloor;
