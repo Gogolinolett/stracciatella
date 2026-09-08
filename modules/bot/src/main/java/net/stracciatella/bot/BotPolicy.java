@@ -23,10 +23,11 @@ public record BotPolicy(
         boolean stopWhenInventoryFull,
         int minFreeSlots,
         boolean opportunisticCollection,
-        boolean fastCollectExit) {
+        boolean fastCollectExit,
+        boolean orderedTasks) {
 
     private static final BotPolicy NONE =
-            new BotPolicy(false, false, false, 0, false, false);
+            new BotPolicy(false, false, false, 0, false, false, false);
 
     /**
      * Everything off — the execution layer behaves exactly as it did before
@@ -39,19 +40,19 @@ public record BotPolicy(
     /** Stop the run on any health decrease. */
     public BotPolicy withDamageStop() {
         return new BotPolicy(true, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit);
+                opportunisticCollection, fastCollectExit, orderedTasks);
     }
 
     /** Stop the run when a player attacks the bot, even for zero damage. */
     public BotPolicy withPlayerAttackStop() {
         return new BotPolicy(stopOnDamage, true, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit);
+                opportunisticCollection, fastCollectExit, orderedTasks);
     }
 
     /** Stop the run once fewer than {@code minFreeSlots} main slots are empty. */
     public BotPolicy withInventoryFullStop(int minFreeSlots) {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, true, minFreeSlots,
-                opportunisticCollection, fastCollectExit);
+                opportunisticCollection, fastCollectExit, orderedTasks);
     }
 
     /**
@@ -60,7 +61,7 @@ public record BotPolicy(
      */
     public BotPolicy withOpportunisticCollection() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                true, fastCollectExit);
+                true, fastCollectExit, orderedTasks);
     }
 
     /**
@@ -70,6 +71,31 @@ public record BotPolicy(
      */
     public BotPolicy withFastCollectExit() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, true);
+                opportunisticCollection, true, orderedTasks);
+    }
+
+    /**
+     * Take queued tasks in the order they were enqueued instead of nearest
+     * first.
+     *
+     * <p>Nearest-first is the right default: a person works an area closest
+     * first from wherever they stand, and replaying a scanner's fixed order
+     * produces visible zigzag routes. It is wrong for a behavior that has
+     * already decided the order, and a sweep is exactly that. Handed a choice
+     * between the column in front of the bot and one behind it, nearest-first
+     * can take the far one while the near column still hides it — the raycast
+     * lands on the near block, LOOKING's hit-result gate never fires, and the
+     * task burns a look timeout and a re-approach. Measured on the chunk
+     * miner: 19.1 ticks per block became 62.0, with 136 of 248 ticks in
+     * LOOKING, the moment more than one column was queued at a time.
+     *
+     * <p>It also restores head-before-feet within a column, which the miner
+     * plans for and nearest-first quietly undid: standing on the floor, the
+     * foot block is one block away and the head block 1.41, so the nearer of
+     * the two is always the one whose upward face is still covered.
+     */
+    public BotPolicy withOrderedTasks() {
+        return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
+                opportunisticCollection, fastCollectExit, true);
     }
 }

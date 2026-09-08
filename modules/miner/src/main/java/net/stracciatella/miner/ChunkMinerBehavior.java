@@ -31,6 +31,7 @@ import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorStatus;
 import net.stracciatella.bot.behavior.BotBehavior;
 import net.stracciatella.bot.humanize.HumanBehavior;
+import net.stracciatella.bot.task.BotTask;
 import net.stracciatella.bot.task.MineBlockTask;
 import net.stracciatella.bot.task.PlaceBlockTask;
 import org.slf4j.Logger;
@@ -133,7 +134,12 @@ public class ChunkMinerBehavior implements BotBehavior {
                 .withPlayerAttackStop()
                 .withInventoryFullStop(config.chunkMinerMinFreeSlots)
                 .withOpportunisticCollection()
-                .withFastCollectExit();
+                .withFastCollectExit()
+                // The serpentine already is the order, and it is the one thing
+                // about this behaviour that must not be second-guessed: every
+                // step of it is adjacent, which is what keeps the bot from
+                // aiming at a column the one in front still hides.
+                .withOrderedTasks();
     }
 
     @Override
@@ -210,19 +216,27 @@ public class ChunkMinerBehavior implements BotBehavior {
         // last column's drops are in the controller starts the next break
         // instead of standing idle waiting to be handed one — the beat that
         // made the loop read as mine, stand, walk, mine.
-        // Planning does NOT run on through INTERACTING, and the reason is
-        // measured rather than cautious. Topping the queue up mid-break is the
-        // only moment that would remove the collect round entirely —
-        // continueSeam looks for a queued task at the tick the break confirms
-        // — but it hands pollNearest a choice while the near column still
-        // stands, and it picks a block behind it: the corridor test failed
-        // outright ("cannot break"), and the stalling test fell from 19.1 to
-        // 62.0 ticks per block with 136 of 248 ticks in LOOKING and 71 in
-        // POSITIONING. Whatever removes the collect has to keep the ordering,
-        // and topping up does not.
-        boolean collecting = BotController.getPhase() == BotController.Phase.COLLECTING;
+        // ... and on through INTERACTING as well, which is the only moment
+        // that removes the collect round rather than shortening it.
+        // continueSeam — the path that skips both the collect and the reaction
+        // beat — looks for a queued task at the tick a break confirms, so a
+        // plan that arrives after the controller has left INTERACTING is one
+        // phase too late however promptly it comes.
+        //
+        // This needs BotPolicy.withOrderedTasks and does not work without it:
+        // handed a choice mid-break, pollNearest took a block behind the column
+        // still standing in front of the bot, and the corridor test failed
+        // outright while the stalling test fell from 19.1 to 62.0 ticks per
+        // block. Restricted to the corridor sweep with no placement
+        // outstanding — verifyPlacement would otherwise see its block still
+        // missing and enqueue a second placement on top of the one in flight.
+        BotController.Phase controllerPhase = BotController.getPhase();
+        boolean collecting = controllerPhase == BotController.Phase.COLLECTING;
+        boolean topUp = collecting
+                || (controllerPhase == BotController.Phase.INTERACTING
+                        && pendingPlacement == null && phase == Phase.CLEAR);
         if (BotController.isPaused() || !BotController.getTaskQueue().isEmpty()
-                || (BotController.isActive() && !collecting)) {
+                || (BotController.isActive() && !topUp)) {
             return BehaviorStatus.RUNNING;
         }
 
@@ -387,6 +401,26 @@ public class ChunkMinerBehavior implements BotBehavior {
             phase = Phase.SELECT_SLAB;
             return BehaviorStatus.RUNNING;
         }
+        // Groundwork is planned one thing at a time and takes the plan with it
+        // (planPlacement clears it), so it must not start while the previous
+        // batch still has a block under the pick: that block would drop out of
+        // the plan while the controller keeps mining it, and nothing would ever
+        // see it finish. Wait the one block out — the seam is worth skipping
+        // where a cap, a dam or a floor is due anyway.
+        if (!plannedBlocks.isEmpty() && !needsNoGroundwork(level, column)) {
+            return BehaviorStatus.RUNNING;
+        }
+        // Planning mid-break reaches no further than the pickup box either.
+        // Past it the bot mines a column whose cobble lands where it is not
+        // standing, and nothing comes back for it: the collect round being
+        // skipped is the thing that would have. Skipping it all the way down a
+        // corridor cost five of fifteen drops and left the corridor test's
+        // eight blocks mined with the cobble still on the floor. Letting the
+        // round happen here is the whole point — the bot collects, walks, and
+        // plans again from where it lands.
+        if (!plannedBlocks.isEmpty() && !withinChainDistance(player, column)) {
+            return BehaviorStatus.RUNNING;
+        }
         BehaviorStatus liquid = handleLiquidsAround(player, level, column);
         if (liquid != null) {
             return liquid;
@@ -451,7 +485,8 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     private void addColumn(Level level, BlockPos column, List<BlockPos> into) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-            if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
+            if (isInRange(pos) && !plannedBlocks.contains(pos)
+                    && isDiggable(level.getBlockState(pos))) {
                 into.add(pos);
             }
         }
@@ -507,6 +542,19 @@ public class ChunkMinerBehavior implements BotBehavior {
      * the snake's own direction to the end and only then back over what was
      * left behind, nearest first — which picks that near leftover up.
      *
+     * <p>The bot enters a slab wherever it descended, so its own row is the one
+     * row the snake cannot hand it whole: running forward leaves a stub behind
+     * it, and the back pass only reaches that stub after every other row. Logged
+     * on the aim patch with the bot entering at index 120 — it dug 121, 122, 123,
+     * crossed into the next row for 132 through 138, and came back for 119, 118,
+     * 117 a row later; in a full chunk that stub is up to half a row. Sweeping
+     * the row's own leftovers first was tried and reverted: it turns the entry
+     * row into one clean there-and-back, but the walk back over the stub cost
+     * 0.7-3.4 ticks per block and ~500 degrees of yaw across three runs of the
+     * aim test. It is a fixed cost per slab — under 1% of a 256-column slab, a
+     * fifth of a 20-column fixture — so the tests cannot settle it, and the
+     * order was left as it is rather than spend measured pace on it.
+     *
      * <p>Running it forward *to the end* is the part that matters, and it
      * replaced alternating forward and back at each distance. Alternating reads
      * fine while the bot is walking, but a whole group of columns inside reach
@@ -548,7 +596,11 @@ public class ChunkMinerBehavior implements BotBehavior {
             // Head first, matching the order tickClear plans them in: that
             // is the block LOOKING aims at, so that is the one to test.
             for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-                if (!isInRange(pos) || !isDiggable(level.getBlockState(pos))) {
+                // A position already in the plan is not work left to find: the
+                // block still under the pick would otherwise be handed back
+                // and the sweep would never move past its own column.
+                if (!isInRange(pos) || plannedBlocks.contains(pos)
+                        || !isDiggable(level.getBlockState(pos))) {
                     continue;
                 }
                 if (isAimable(player, level, pos)) {
@@ -820,7 +872,16 @@ public class ChunkMinerBehavior implements BotBehavior {
      * reflects the outcome), or a terminal status.
      */
     private BehaviorStatus verifyPlannedBlocks(Level level) {
+        // The position the controller has under the pick right now has not
+        // failed to break — it has not finished being tried. Planning runs
+        // during INTERACTING to keep the queue stocked, so verify sees that
+        // block still standing on every batch; counting it as a retry would
+        // enqueue a second task for the block already being mined and spend a
+        // stepRetry each time round.
+        BotTask current = BotController.getCurrentTask();
+        BlockPos inFlight = current != null ? current.targetPos() : null;
         List<BlockPos> remaining = new ArrayList<>();
+        boolean onlyInFlight = true;
         for (BlockPos pos : plannedBlocks) {
             BlockState state = level.getBlockState(pos);
             if (state.isAir()) {
@@ -834,11 +895,23 @@ public class ChunkMinerBehavior implements BotBehavior {
                 return null;
             }
             remaining.add(pos);
+            if (!pos.equals(inFlight)) {
+                onlyInFlight = false;
+            }
         }
         blocksMined += plannedBlocks.size() - remaining.size();
         if (remaining.isEmpty()) {
             plannedBlocks.clear();
             stepRetries = 0;
+            return null;
+        }
+        if (onlyInFlight) {
+            // Nothing to retry and nothing to give up on: the batch is done
+            // but for the block being broken. Keep it in the plan so its break
+            // is still counted, and let the caller plan the next batch around
+            // it — that plan is the whole point of running this early.
+            plannedBlocks.clear();
+            plannedBlocks.addAll(remaining);
             return null;
         }
         if (stepRetries < config.maxStepRetries) {
@@ -851,8 +924,13 @@ public class ChunkMinerBehavior implements BotBehavior {
         return fail("cannot break " + shortPos(remaining.get(0)));
     }
 
+    /**
+     * Add a batch to the plan. Appends rather than replaces: the next batch is
+     * planned while the previous one's last block is still under the pick, so
+     * clearing here would drop a position the controller is still working on
+     * and nothing would ever see it finish.
+     */
     private void plan(List<BlockPos> blocks) {
-        plannedBlocks.clear();
         plannedBlocks.addAll(blocks);
         stepRetries = 0;
         enqueue(blocks);

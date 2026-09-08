@@ -509,7 +509,7 @@ public class BotController {
         // stays inside AIM_EDGE_MARGIN of the rim, because the raycast has to
         // keep landing on this block: past the edge it catches the neighbour
         // and the hit-result gate never fires.
-        BotTask next = taskQueue.peekNearest(player.blockPosition());
+        BotTask next = peekNextTask(player);
         if (next != null) {
             BlockPos toward = next.targetPos();
             offX = biasTowardNext(offX, face.getStepX(), toward.getX() - target.getX());
@@ -637,6 +637,8 @@ public class BotController {
 
         Level level = client.level;
         BlockPos target = currentTask.targetPos();
+        boolean placing = currentTask.interactionType() == InteractionType.USE;
+        boolean targetDone = currentTask.isCurrentTargetComplete(level);
 
         // Tool was selected in LOOKING — the carried-item packet has already
         // had the entire camera-convergence window to be applied server-side,
@@ -663,22 +665,41 @@ public class BotController {
         // entering INTERACTING and the raycast could land on a neighbor).
         // Offsets along the face normal are zeroed for the same reason
         // LOOKING does it (see comment there).
+        //
+        // Once the client has already removed the block, aim at whatever comes
+        // next instead. As far as the arm is concerned the break is over —
+        // vanilla's continueDestroyBlock returns false on air, so nothing
+        // swings — and what is left is waiting for the server to settle the
+        // prediction, which no camera angle can influence. A person's mouse is
+        // travelling by then; standing in the finished hole until the ack lands
+        // pays LOOKING's turn *after* the wait instead of through it. Only for
+        // a task with nothing left of its own: a tree's next log is a
+        // sub-target, not a queue entry, and turning to a queued task there
+        // would be a wrong turn rather than an early one.
+        BotTask aimTask = currentTask;
+        if (!placing && targetDone && currentTask.isFullyComplete()) {
+            BotTask ahead = peekNextTask(player);
+            if (ahead != null && ahead.interactionType() == InteractionType.ATTACK
+                    && isWithinReach(player, ahead.targetPos())) {
+                aimTask = ahead;
+            }
+        }
         if (camera != null) {
-            net.minecraft.core.Direction face = aimFace(client, currentTask);
+            BlockPos aimPos = aimTask.targetPos();
+            net.minecraft.core.Direction face = aimFace(client, aimTask);
             double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
             double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
             double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
             aimCameraAt(player,
-                    target.getX() + 0.5 + face.getStepX() * 0.5 + offX,
-                    target.getY() + 0.5 + face.getStepY() * 0.5 + offY,
-                    target.getZ() + 0.5 + face.getStepZ() * 0.5 + offZ);
+                    aimPos.getX() + 0.5 + face.getStepX() * 0.5 + offX,
+                    aimPos.getY() + 0.5 + face.getStepY() * 0.5 + offY,
+                    aimPos.getZ() + 0.5 + face.getStepZ() * 0.5 + offZ);
         }
 
         // Step toward drops without interrupting the break — the camera above
         // has already been committed to the target this tick, so this can only
         // move the body. Placement is excluded: there is nothing to collect and
         // a placement's aim is pinned to one face, which a step would spoil.
-        boolean placing = currentTask.interactionType() == InteractionType.USE;
         if (policy.opportunisticCollection() && !placing) {
             tickOpportunisticCollection(client, player, target);
         }
@@ -717,7 +738,7 @@ public class BotController {
         // holds a solid block for a sustained window, and the main inventory
         // has *shrunk* by the block that was consumed. A client-predicted
         // placement the server rejects never moves the item count.
-        if (currentTask.isCurrentTargetComplete(level)) {
+        if (targetDone) {
             if (completionSequence < 0) {
                 // First tick the target looks finished, so the prediction that
                 // finished it is this sequence or an earlier one. Waiting for
@@ -793,10 +814,10 @@ public class BotController {
             // The "next" task is always the one nearest to the player, not
             // the queue head (see startNextTask).
             lastMinedPos = target;
-            BotTask nextTask = taskQueue.peekNearest(player.blockPosition());
+            BotTask nextTask = peekNextTask(player);
             if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
                 // Next target is within reach — mine it next, no beat
-                currentTask = taskQueue.pollNearest(player.blockPosition());
+                currentTask = pollNextTask(player);
                 taskTotalTicks = 0;
                 lookRetryUsed = false;
                 continueSeam();
@@ -1414,14 +1435,30 @@ public class BotController {
         releaseMovementKeys();
     }
 
+    /**
+     * The task to work next, without taking it. Nearest to where the bot
+     * stands by default — a human works an area closest-first from wherever
+     * they are, and replaying the queue's fixed scan order produces visible
+     * zigzag routes. A behavior that has already decided the order says so
+     * with {@link BotPolicy#orderedTasks()} and gets the queue's order back;
+     * see that method for what nearest-first costs a sweep.
+     */
+    private static BotTask peekNextTask(LocalPlayer player) {
+        return policy.orderedTasks() || player == null
+                ? taskQueue.peek()
+                : taskQueue.peekNearest(player.blockPosition());
+    }
+
+    /** {@link #peekNextTask}, and take it. */
+    private static BotTask pollNextTask(LocalPlayer player) {
+        return policy.orderedTasks() || player == null
+                ? taskQueue.poll()
+                : taskQueue.pollNearest(player.blockPosition());
+    }
+
     private static void startNextTask() {
         LocalPlayer player = Minecraft.getInstance().player;
-        // Take the task nearest to where the bot currently stands. A human
-        // works an area closest-first from wherever they are — replaying the
-        // queue's fixed scan order instead produces visible zigzag routes.
-        currentTask = player != null
-                ? taskQueue.pollNearest(player.blockPosition())
-                : taskQueue.poll();
+        currentTask = pollNextTask(player);
         if (currentTask == null) {
             phase = Phase.IDLE;
             return;

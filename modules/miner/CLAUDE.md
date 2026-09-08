@@ -23,7 +23,7 @@ net.stracciatella.miner
 
 The module never touches input or the camera. `DiamondMinerBehavior` plans steps as batches of `MineBlockTask`s on the bot module's `BotController`, waits until the controller is idle (task executed, drops collected), verifies the result, and plans the next step. All human-like mechanics (camera, timing, tool selection, collection) come from the task layer for free.
 
-`ChunkMinerBehavior` waits for idle too, with one exception: the corridor sweep also plans while the controller is **COLLECTING**. Waiting for idle there means the controller sees an empty queue at the end of every column, reads that as "nothing left to do" and collects to completion before anyone can hand it the next block — the loop the user sees as *mine, stand, walk, mine*. Planning early puts a block in the queue, so the moment the drops are in the controller starts the next break instead of standing idle waiting to be handed one. Only `CLEAR` runs early: `SELECT_SLAB` is where a run ends, and finishing there would stop the controller mid-collect and leave the last column's drops on the ground; `DESCEND` wants the bot's final position.
+`ChunkMinerBehavior` waits for idle too, with one exception: the corridor sweep also plans while the controller is **COLLECTING**, and — since the pace work — while it is still **INTERACTING**. Waiting for idle means the controller sees an empty queue at the end of every column, reads that as "nothing left to do" and collects to completion before anyone can hand it the next block — the loop the user sees as *mine, stand, walk, mine*. Planning early puts a block in the queue, so the moment the drops are in the controller starts the next break instead of standing idle waiting to be handed one; planning during the break puts one there before the collect round is ever entered, which is what `continueSeam` needs to skip it (see *Why the collect round is hard to remove*). Only `CLEAR` runs early: `SELECT_SLAB` is where a run ends, and finishing there would stop the controller mid-collect and leave the last column's drops on the ground; `DESCEND` wants the bot's final position.
 
 The per-column breather draws from `HumanBehavior.randomBreatherTicks`, not `randomTaskSwitchDelayTicks`: the occasional long pause only, nothing the rest of the time. Pausing on *every* column is itself the machine-constant cadence a breather exists to break — and because planning is what releases COLLECTING, it sat in the critical path of every column, measured at 3–6 ticks on top of the collect.
 
@@ -70,9 +70,25 @@ Empties one chunk between two layers, the way a person would: walk a 1-wide, 2-h
 
 `SerpentinePlan` orders the columns: along a row, step over, back along the next, with the first row alternating per slab so a finished slab hands the next one a start next to where it stopped. It is deliberately free of Minecraft types so its two load-bearing properties (every column visited once; consecutive columns adjacent) are unit-testable.
 
-Columns are never batched together. The controller runs the task nearest the player, which in a straight corridor means it can target a block two columns ahead that the near column still hides — the same lesson the diamond miner's batch sequencing encodes.
+Columns are batched only as far as the pickup box reaches (`CHAIN_DISTANCE`), and the batch is executed **in the order it was planned** — `policy()` opts into `withOrderedTasks()`. The controller's default is to run the task nearest the player, which in a straight corridor targets a block two columns ahead that the near column still hides — the same lesson the diamond miner's batch sequencing encodes, and the reason batching used to be forbidden here outright. The serpentine already *is* a safe order, so insertion order is both the faster and the correct one.
 
 `nextColumn` guards the same hazard for the sweep itself: it resumes at the column the bot stands in, runs the snake's direction *to the end*, and only then walks back over what was left behind, nearest first. It never wraps. A forward-only scan with wraparound looks like it keeps the sweep adjacent, but once the work ahead is done the modulo throws the bot to the far corner and it walks back — reaching a column three over while the one right behind it still blocks the line of sight, and the run dies on a look timeout.
+
+### The two ways the sweep departs from a clean serpentine
+
+Both were logged (`SWEEPORDER`: bot column, its snake index, the column handed over, its index) on the aim test's 7×3 patch, entering at index 120:
+
+```
+[121][122][123] → [133][134] → [132] → [135][136][137][138] → [119][118][117] → [106]…[100]
+```
+
+**The entry-row stub.** The bot enters a slab wherever it descended, so its own row is the one row the snake cannot hand it whole: `119,118,117` — the half of the entry row behind the bot — is mined a whole row late. In a full chunk that stub is up to half a row. Sweeping the row's own leftovers first fixes it and was tried: it turns the entry row into one there-and-back, out to that end, turn, all the way to the other, after which every row runs end to end. It was **reverted** — the walk back over the stub cost 0.7–3.4 ticks per block and ~500° of yaw across three runs of the aim test. It is a fixed cost per slab (under 1% of a 256-column slab, a fifth of a 20-column fixture), so the pace tests systematically overstate it and cannot settle the question.
+
+**The deferred turn.** `132` is the column where the row turns, and it is mined after `133`/`134`. The bot mines from a standstill out to reach, so at a turn it is typically two columns short of the row's end, its line to the diagonal corner runs through the column beside it, `isAimable` defers it, the occluder is dug and the corner comes back one step later.
+
+Waiting for the collect walk to carry the bot to the row's end was tried — it is the one thing that used to move the bot forward without a task, and the drops lie exactly where the corner is visible from. It changed nothing and was reverted: **the pace work removed the walk it was waiting for.** COLLECTING is down to 5 ticks in a whole 20-column run, so at a turn there is no walk left to finish. Order at the turn went from `133,134,132` to `134,135,132+133` — the corner still third, at no measurable cost (20/20 at 13.8, yaw 1067) and no benefit.
+
+**Mining ahead and turning late are the same mechanism.** The bot is fast because it clears everything it can reach without stepping; that is also why it is never standing at the row's end when the row turns. Moving the corner into its place needs the bot to approach a target that is *in reach but occluded*, and the controller has no such move: it navigates only to targets out of reach, and LOOKING's early re-approach closes to two blocks, which the bot already beats at a turn. That is the change to make if the order matters more than the pace — in the controller, not in the sweep.
 
 Running forward *to the end* is the part that matters, and it replaced trying the snake's direction first **at each distance** (`start+i` then `start-i`). Alternating like that is invisible while the bot walks, but a whole group of columns inside `reachDistance` (~4.5 blocks — a 2-high corridor is dug several columns deep without a step) is mined from a standstill: `start` never moves, so every column dug hands the next turn to the other side and the bot ping-pongs across itself. Measured with the bot at x=3015, it dug 3016, then 3014, then 3017 — three ~150° head turns in a row. LOOKING is the phase where the pickaxe is idle, so that is also three gaps in the mining; both symptoms were reported as one. Any ordering heuristic derived from the bot's position has to ask whether the bot actually moves.
 
@@ -149,7 +165,7 @@ The budget now comes from a person doing the job by hand: **16 stone blocks with
 
 **Measure the pace at `-PtickSpeed=1`, not at the default 10.** The two costs that dominate a break are server round trips — the block-change ack that ends INTERACTING, and the item-entity sync that ends COLLECTING — and a round trip costs constant *wall-clock* time. At 200 tps a tick is 5 ms, so the same latency counts ten times over in ticks. Measured directly: the trace's `tail` (ticks in INTERACTING after the last tick of real hardness progress) is **6.8 per block at 10x and 1.0 at 1x**, and the `BREAKEXIT` instrumentation showed `seq=20 acked=19` for five straight ticks before the ack landed. A budget stated in game ticks and compared against a human benchmark recorded at 20 tps is therefore ~6 ticks per block stricter at 10x than the requirement asks. The tests are left running at whatever the suite uses and the budget is unchanged — the miner misses it at both rates, so there was nothing to fix in the measurement — but any pace figure quoted without its tick rate is meaningless.
 
-Current state, over a 248-tick two-slab corridor run of 13 blocks at 1x, **19.1 ticks per block**:
+The breakdown that located the problem, over a 248-tick two-slab corridor run of 13 blocks at 1x, **19.1 ticks per block** — before the queue top-up below:
 
 | per block | ticks | reducible |
 |---|---|---|
@@ -168,7 +184,27 @@ The pickaxe, the tool choice and the ground contact are all fine (`held=diamond_
 
 Chaining several columns into one plan fixes the within-batch case, and the chain is bounded by **vanilla's pickup box (1.425 blocks), not by reach**. Reach (4.0) was measured and is worse: the bot clears everything it can touch from one standing spot and then walks back over four blocks of loot. It bought 4.1 ticks per block of COLLECTING and gave back 24 ticks of SCANNING and POSITIONING plus a 40-tick break in the mining — the aim test counted a long gap that had not been there, and continuous mining is the requirement. Columns needing groundwork (a cap, a dam, a floor) are never chained: `planPlacement` clears the plan, and the intervention has to run *before* the cell in front of it opens.
 
-**Topping the queue up mid-break does not work, and the measurement is worth keeping.** Between batches the queue still empties, so the obvious next step is to let the behaviour plan while the controller is still in INTERACTING (its `tick` gate otherwise refuses unless the controller is idle or collecting). Tried, with `verifyPlannedBlocks` taught to leave the in-flight block alone and `plan` appending instead of replacing: the corridor test failed outright (`cannot break 3019, 41, 3015`), and `mines without stalling` fell from **19.1 to 62.0** ticks per block with 136 of 248 ticks in LOOKING and 71 in POSITIONING. The cause is `TaskQueue.pollNearest`: handed a choice while the near column still stands, it takes a block behind it, the hit-result gate never fires and the task burns a look timeout and a re-approach. Anything that removes the collect round has to preserve the sweep order — an order-respecting queue for behaviours would, topping up does not.
+**Topping the queue up mid-break is what removes the collect round, and it needs two things to be safe.** Between batches the queue still empties, so the behaviour plans while the controller is still in INTERACTING (its `tick` gate otherwise refuses unless the controller is idle or collecting), with `verifyPlannedBlocks` leaving the in-flight block alone — that block has not failed to break, it has not finished being tried — and `plan` appending instead of replacing.
+
+1. **`BotPolicy.withOrderedTasks`.** Without it this change is a catastrophe, not an improvement: handed a choice mid-break, `pollNearest` takes a block behind the column still standing in front of the bot, the hit-result gate never fires, and the task burns a look timeout and a re-approach. Measured: the corridor test failed outright (`cannot break 3019, 41, 3015`) and `mines without stalling` fell from **19.1 to 62.0** ticks per block, 136 of 248 ticks in LOOKING.
+2. **The same pickup-box bound as the chain.** Planning mid-break for a column further than `CHAIN_DISTANCE` mines a block whose cobble lands where the bot is not standing, and nothing comes back for it — the collect round being skipped is the thing that would have. Unbounded it cost five of fifteen drops, and the corridor test timed out with all eight blocks mined and the cobblestone still on the floor. Bounded, the bot collects, walks, and plans again from where it lands.
+
+Groundwork keeps its own guard on the same path: `planPlacement` clears the plan, so a cap, a dam or a floor must not be started while a block is still under the pick.
+
+Together with the bot module's pre-aim during the break confirmation, the whole loop at 1x looks like this, against 19.1 before — **13.8 ticks per block, 20 of 20 blocks, 19 of them collected**:
+
+| per block | ticks | against 19.1 |
+|---|---|---|
+| breaking (real progress) | 5.0 | unchanged — `8/1.5/30` is a game constant |
+| lead: entering INTERACTING to first progress | 4.4 | up from 3.2 |
+| tail: break confirmation | 1.5 | unchanged |
+| LOOKING | 1.5 | down from 3.5 (pre-aim) |
+| COLLECTING | 0.6 | down from 5.5 (chaining + top-up) |
+| IDLE | 0.8 | unchanged |
+
+The collect round is gone and the aim is nearly free. What is left over breaking is **vanilla's five-tick `destroyDelay`, and it is a fixed budget, not a cost that can be removed** — it only drains inside a call to `continueDestroyBlock`, so every tick the bot spends confirming, aiming or collecting spends one of the five, and whatever is left is paid at the head of the next break. That is why the lead grew as LOOKING shrank: the same five ticks, moved. A human pays them too — 16 stone in 200 ticks is 12.5 per block against a floor of 6 breaking plus 5 delay. Chasing the remaining tick is chasing that floor.
+
+The other two tests at 1x: `resumes the layer it stands in` mines all four blocks with the last break on tick 52 of a 55-tick budget, and `holds its aim` all twenty with the last on tick 270 of 275 — both fail only because the budget has to cover the *run* ending, not just the mining. `mines without stalling` is the laggard at 15.5 (from 20.7): it digs down through its own floor, so it walks between batches and pays a collect round each time.
 
 Falsified against the pre-fix code with the session's three fixes stashed: `duty 0%, swinging=0` fails both the stall and the resume test, while **all eight older tests stayed green** — the measurement that justifies these three existing.
 
