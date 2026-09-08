@@ -457,6 +457,58 @@ public class ChunkMinerTests {
                 Math.round(yawPerBlock), trace);
     }
 
+    // ================================================================
+    // Test 12: water in the next chunk is dammed, not refused
+    // ================================================================
+
+    /**
+     * A chunk that borders water used to end the run: every cell the water
+     * could flow in through lay in the next chunk, and the dam refused to
+     * leave the chunk it was mining, so it had nothing to place and stopped.
+     * The face beyond the border is the only thing that can hold the water
+     * back — the body is too big to cap, and there is nothing inside the
+     * chunk to dam.
+     *
+     * <p>The pocket is walled in on every other side, so the border column is
+     * the only way into the chunk and the cell beyond it the only cell that
+     * closes it.
+     */
+    @MinecraftTest(name = "Chunk miner dams beyond the chunk border",
+            timeoutTicks = 2000, order = 21)
+    public void damsBeyondTheChunkBorder(TestContext ctx) {
+        // Chunk-local x 15 is the last column inside the chunk, 16 the first
+        // one outside it.
+        final BlockPos stand = prepare(ctx, 13, STAND_DZ);
+        BlockPos corridor = stand.offset(1, 0, 0);
+        BlockPos border = stand.offset(2, 0, 0);
+        BlockPos water = stand.offset(3, 0, 0);
+        // Stone first, water last: an open pocket floods the fixture while the
+        // remaining setup commands are still on their way to the server.
+        fill(ctx, 16, Y - 1, 6, 22, Y + 1, 8, "stone");
+        setBlock(ctx, corridor, "stone");
+        setBlock(ctx, border, "stone");
+        setBlock(ctx, border.above(), "stone");
+        // Six sources — past MAX_SEALABLE_SOURCES, so this is a dam and not a
+        // capping run, which is the case that was allowed out of the chunk.
+        fill(ctx, 16, Y, 7, 21, Y, 7, "water");
+        ctx.waitFor(mc -> !mc.level.getFluidState(water).isEmpty());
+        ctx.runCommand("give @s cobblestone 64");
+
+        runChunkMiner(ctx, Y + 1, Y, true);
+
+        boolean sealed = ctx.computeOnClient(mc -> mc.level.getFluidState(water).isEmpty());
+        if (!sealed) {
+            throw new AssertionError("Water at " + water + " was never dammed");
+        }
+        // What ran in while the wall was down has no source behind it any more
+        // and drains by itself, a handful of ticks past the last block — so the
+        // corridor is checked after the drain, not on the tick the run ends.
+        ctx.waitFor(mc -> mc.level.getFluidState(border).isEmpty()
+                && mc.level.getFluidState(corridor).isEmpty());
+        assertAir(ctx, border, "the chunk's last column");
+        LOGGER.info("Chunk miner border dam test passed");
+    }
+
     // --- Run quality ---
 
     /** Corridor length for the stall test — long enough for a steady state. */

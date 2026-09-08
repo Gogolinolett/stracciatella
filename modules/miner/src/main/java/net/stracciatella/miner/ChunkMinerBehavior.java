@@ -2,6 +2,7 @@ package net.stracciatella.miner;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -49,8 +50,9 @@ import org.slf4j.LoggerFactory;
  * losing the client) therefore resumes exactly where it left off, and no
  * saved cursor can ever disagree with what is actually still standing.
  *
- * <p>The bot never mines outside the target chunk and never places outside it
- * except to cap a water source that would otherwise pour in.
+ * <p>The bot never mines outside the target chunk. It does place outside it
+ * where a liquid leaves no choice: to cap a source that would otherwise pour
+ * in, and to dam the face a liquid at the chunk border flows through.
  */
 public class ChunkMinerBehavior implements BotBehavior {
 
@@ -93,6 +95,10 @@ public class ChunkMinerBehavior implements BotBehavior {
     // forever, because the hole it was meant to fill is still a hole.
     private BlockPos pendingPlacement;
     private String placementWhat = "";
+    // Column whose liquid was still walled in when the column was planned. The
+    // seal is due as soon as the column itself is open — see
+    // handleLiquidsAround.
+    private BlockPos sealAfterOpening;
     private int stepRetries;
     private int breatherTicks;
 
@@ -156,6 +162,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         plannedBlocks.clear();
         batchQueue.clear();
         pendingPlacement = null;
+        sealAfterOpening = null;
         stepRetries = 0;
         breatherTicks = 0;
         blocksMined = 0;
@@ -412,6 +419,18 @@ public class ChunkMinerBehavior implements BotBehavior {
      * block two columns ahead that the near column still hides.
      */
     private BehaviorStatus tickClear(LocalPlayer player, Level level) {
+        // A liquid that was walled in when its column was planned is sealed
+        // now, through the opening that column left: that opening is the only
+        // line of sight there ever is to it. Not while a batch is still
+        // running, for the same reason the groundwork below waits — a
+        // placement takes the plan with it.
+        if (sealAfterOpening != null && plannedBlocks.isEmpty()) {
+            BehaviorStatus pending = handleLiquidsAround(player, level, sealAfterOpening);
+            if (pending != null) {
+                return pending;
+            }
+            sealAfterOpening = null;
+        }
         BlockPos column = nextColumn(player, level);
         if (column == null) {
             phase = Phase.SELECT_SLAB;
@@ -714,6 +733,10 @@ public class ChunkMinerBehavior implements BotBehavior {
      * and all lava, gets dammed at the face it would flow in through: chasing
      * an ocean's sources is endless, and letting lava burn itself out into
      * obsidian costs far more time than a block of cobble.
+     *
+     * <p>Returns null when there is nothing to do — which includes water that
+     * is still walled in: that one is only noted, and dealt with once the wall
+     * in front of it is gone.
      */
     private BehaviorStatus handleLiquidsAround(LocalPlayer player, Level level, BlockPos column) {
         Set<BlockPos> touching = liquidsTouching(level, column);
@@ -724,6 +747,19 @@ public class ChunkMinerBehavior implements BotBehavior {
         BlockPos start = touching.iterator().next();
         boolean lava = level.getFluidState(start).is(net.minecraft.tags.FluidTags.LAVA);
         List<BlockPos> body = floodFill(level, start);
+        // Water still boxed in by solid blocks — the aquifer behind the wall
+        // the bot is about to break — cannot be sealed yet. Every face it
+        // could be built against lies behind that wall, so aiming at one only
+        // burns a look timeout, and that is how a run ended at the first chunk
+        // it dug up against water. It cannot flow anywhere either: the wall is
+        // the dam until it comes out, and the seal goes in afterwards, through
+        // the opening it leaves. Lava gets no such benefit — mining into it
+        // costs health and the run, so stopping while it is still walled off
+        // is the better answer.
+        if (!lava && !touchesOpenSpace(level, body)) {
+            sealAfterOpening = column;
+            return null;
+        }
         List<BlockPos> sources = new ArrayList<>();
         for (BlockPos pos : body) {
             if (level.getFluidState(pos).isSource()) {
@@ -735,23 +771,20 @@ public class ChunkMinerBehavior implements BotBehavior {
         boolean capping = !lava && !sources.isEmpty() && sources.size() <= MAX_SEALABLE_SOURCES
                 && body.size() < FLOOD_FILL_LIMIT;
         if (capping) {
-            // Small pool, fully surveyed: cap the sources themselves. This is
-            // the only case that may reach outside the chunk — an uncapped
-            // source next door refills the chunk as fast as it is dug.
+            // Small pool, fully surveyed: cap the sources themselves — an
+            // uncapped source next door refills the chunk as fast as it is dug.
             toSeal = sources;
         } else {
-            // Dam: only the cells the bot was about to occupy or walk past,
-            // and only inside the chunk.
-            toSeal = new ArrayList<>();
-            for (BlockPos pos : touching) {
-                if (chunk.equals(new ChunkPos(pos))) {
-                    toSeal.add(pos);
-                }
-            }
-            if (toSeal.isEmpty()) {
-                return fail((lava ? "lava" : "water") + " at " + shortPos(start)
-                        + " can only be dammed from outside the chunk");
-            }
+            // Dam: the cells the bot was about to occupy or walk past,
+            // wherever they lie. A column on the chunk border has half of them
+            // in the neighbouring chunk, and that is the side the water comes
+            // from — a dam that stops at the border is no dam at all, and the
+            // run died at the first lake it dug past.
+            toSeal = new ArrayList<>(touching);
+            // Cells beyond the chunk go first. A plug inside it is mined out
+            // again later and the liquid walks straight back in behind it, so
+            // the dam that holds is the one on the far side of the border.
+            toSeal.sort(Comparator.comparing(pos -> chunk.equals(new ChunkPos(pos))));
         }
         LOGGER.info("Chunk miner: {} {} block(s) against {} at {}",
                 capping ? "capping" : "damming", toSeal.size(),
@@ -792,6 +825,23 @@ public class ChunkMinerBehavior implements BotBehavior {
             }
         }
         return found;
+    }
+
+    /**
+     * Whether any cell of a liquid body has open space beside it. That is both
+     * what makes the body dangerous — one with nowhere to go stays where it is
+     * — and what makes it sealable, because a support face the bot has no line
+     * of sight to cannot be clicked.
+     */
+    private static boolean touchesOpenSpace(Level level, List<BlockPos> body) {
+        for (BlockPos pos : body) {
+            for (Direction dir : Direction.values()) {
+                if (level.getBlockState(pos.relative(dir)).isAir()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // --- Placement ---
