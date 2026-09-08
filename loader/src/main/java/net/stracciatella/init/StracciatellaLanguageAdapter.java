@@ -1,5 +1,6 @@
 package net.stracciatella.init;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
@@ -60,18 +61,17 @@ public class StracciatellaLanguageAdapter implements LanguageAdapter {
                 moduleManager.load(path);
             }
             var directory = stracciatella.service(Path.class, Stracciatella.WORKING_DIRECTORY);
+
+            // Modules bundled into the mod jar itself, as built by the stracciatellaModJar task.
+            // Absent in a dev run, where the modules come from the classpath above.
+            var modContainer = stracciatella.service(ModContainer.class, Stracciatella.STRACCIATELLA_MOD_CONTAINER);
+            var bundledModules = modContainer.findPath("stracciatella/modules");
+            if (bundledModules.isPresent()) loadModules(extractBundledModules(bundledModules.get(), directory), moduleManager);
+
+            // Modules dropped next to the game, they override bundled ones of the same id
             var modulesDirectory = directory.resolve("modules");
             Files.createDirectories(modulesDirectory);
-            try (var stream = Files.newDirectoryStream(modulesDirectory)) {
-                for (var file : stream) {
-                    if (Files.isDirectory(file)) continue;
-                    if (!file.getFileName().toString().endsWith(".jar")) {
-                        stracciatella.logger().info("Skipping module file {}", file.getFileName().toString());
-                        continue;
-                    }
-                    moduleManager.load(file);
-                }
-            }
+            loadModules(modulesDirectory, moduleManager);
         } catch (Throwable e) {
             throw StracciatellaThrowables.propagate(e);
         }
@@ -84,6 +84,40 @@ public class StracciatellaLanguageAdapter implements LanguageAdapter {
         }
         var accessWidenerConfig = stracciatella.service(AccessWidenerConfig.class);
         accessWidenerConfig.freeze();
+    }
+
+    /**
+     * Copies the modules bundled inside the mod jar next to the game, so they become real files.
+     *
+     * <p>{@link net.stracciatella.module.classloader.SimpleModuleClassLoader} resolves both classes
+     * and resources through URLs, and Java's {@code jar:} handler cannot address an entry inside a
+     * nested jar. A module read straight out of the mod jar therefore fails to load its very first
+     * class. Fabric extracts its own nested jars for the same reason.</p>
+     */
+    private static Path extractBundledModules(Path bundled, Path workingDirectory) throws IOException {
+        var target = workingDirectory.resolve("bundled");
+        Files.createDirectories(target);
+        // Drop what a previous version bundled, so removed modules don't linger
+        try (var stream = Files.newDirectoryStream(target, "*.jar")) {
+            for (var stale : stream) Files.delete(stale);
+        }
+        try (var stream = Files.newDirectoryStream(bundled, "*.jar")) {
+            for (var file : stream) Files.copy(file, target.resolve(file.getFileName().toString()));
+        }
+        return target;
+    }
+
+    private static void loadModules(Path directory, SimpleModuleManager moduleManager) throws Throwable {
+        try (var stream = Files.newDirectoryStream(directory)) {
+            for (var file : stream) {
+                if (Files.isDirectory(file)) continue;
+                if (!file.getFileName().toString().endsWith(".jar")) {
+                    Stracciatella.instance().logger().info("Skipping module file {}", file.getFileName().toString());
+                    continue;
+                }
+                moduleManager.load(file);
+            }
+        }
     }
 
     @Override

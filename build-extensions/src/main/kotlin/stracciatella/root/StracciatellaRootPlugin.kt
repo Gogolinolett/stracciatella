@@ -8,12 +8,23 @@ import org.gradle.api.Project
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.TaskContainer
 import org.gradle.api.tasks.TaskProvider
+import org.gradle.api.tasks.bundling.Jar
 import org.gradle.api.tasks.testing.Test
 import org.gradle.kotlin.dsl.*
 
 class StracciatellaRootPlugin : Plugin<Project> {
     companion object {
         const val MODULE_CONFIGURATION = "stracciatellaModule"
+
+        /**
+         * Configuration every module project publishes its production ready jar on:
+         * `completeJar` from the stracciatella plugin, remapped to intermediary with
+         * the access wideners already split up. [MODULE_CONFIGURATION] carries the
+         * named `devJarStracciatella` instead, which only works inside a dev run.
+         */
+        const val MODULE_COMPLETE_CONFIGURATION = "stracciatellaComplete"
+
+        private const val MODULE_PLUGIN_ID = "net.stracciatella.stracciatella"
     }
 
     override fun apply(project: Project) {
@@ -123,6 +134,10 @@ class StracciatellaRootPlugin : Plugin<Project> {
         project.subprojects {
             version = project.version
             group = project.group
+            pluginManager.withPlugin(MODULE_PLUGIN_ID) {
+                configurations.consumable(MODULE_COMPLETE_CONFIGURATION)
+                artifacts.add(MODULE_COMPLETE_CONFIGURATION, tasks.named<Jar>("completeJar"))
+            }
         }
     }
 

@@ -29,6 +29,15 @@ val includeInCreator = configurations.detachedConfiguration(projects.loader.appl
     targetConfiguration = "finalJar"
 })
 
+// Ingredients of the distributable mod jar: the loader's remapped Fabric mod and
+// the remapped jar of every module.
+val modJarLoader = configurations.detachedConfiguration(projects.loader.apply {
+    targetConfiguration = "finalJar"
+})
+val modJarModules = configurations.detachedConfiguration(projects.modules.apply {
+    targetConfiguration = "complete"
+})
+
 configurations.modLightRuntimeOnly.configure { extendsFrom(modListLight.get()) }
 configurations.modFullRuntimeOnly.configure { extendsFrom(modList.get()) }
 configurations.lightRuntimeClasspath.configure { extendsFrom(configurations.runtimeClasspath.get()) }
@@ -56,6 +65,25 @@ tasks {
     register<ModListCreator>("createModList") {
         modFiles.from(modList)
         modFiles.from(includeInCreator)
+    }
+    register<Jar>("stracciatellaModJar") {
+        group = LifecycleBasePlugin.BUILD_GROUP
+        description = "Builds the installable Fabric mod: the loader with every module bundled in"
+        archiveBaseName = "stracciatella"
+        archiveClassifier = "all"
+        // zipTree only sees a plain file, so the configuration has to be depended on explicitly
+        dependsOn(modJarLoader)
+        // Loom writes Fabric-Mapping-Namespace and friends in there, so it has to survive the repackaging
+        manifest.from(provider {
+            zipTree(modJarLoader.singleFile).matching { include("META-INF/MANIFEST.MF") }.singleFile
+        })
+        from(provider { zipTree(modJarLoader.singleFile) }) {
+            exclude("META-INF/MANIFEST.MF")
+        }
+        // where StracciatellaLanguageAdapter looks for modules inside the mod jar
+        into("stracciatella/modules") {
+            from(modJarModules)
+        }
     }
 }
 
