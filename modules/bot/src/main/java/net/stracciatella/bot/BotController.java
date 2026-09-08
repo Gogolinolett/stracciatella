@@ -754,7 +754,11 @@ public class BotController {
         // slower, but the bot keeps working instead of burning maxBreakTicks.
         boolean serverSettled = ServerBlockSync.isSettled(completionSequence);
         if (serverSettled || (stateConfirmTicks >= CONFIG.airConfirmTicks && artifact)) {
-            BlockInteractor.stopInteraction();
+            // Not a plain stop: the break is done but vanilla's five-tick
+            // post-break delay is not, and it only runs down while something
+            // keeps driving the game mode. Draining it through the aim is what
+            // a player holding the button gets for free.
+            BlockInteractor.releaseAfterBreak();
             // A step from opportunistic collection must not survive the phase
             // change — transitionTo does not touch the movement keys.
             releaseMovementKeys();

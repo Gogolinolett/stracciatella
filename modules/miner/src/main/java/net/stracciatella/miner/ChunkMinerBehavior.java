@@ -173,6 +173,16 @@ public class ChunkMinerBehavior implements BotBehavior {
         return failReason != null;
     }
 
+    /**
+     * Blocks broken so far this run. The pace tests divide their tick count by
+     * it; the collected-item count they used before lags behind the break by
+     * however long the drop takes to reach the inventory, which is the very
+     * thing being measured.
+     */
+    public int blocksMined() {
+        return blocksMined;
+    }
+
     @Override
     public String statusLine() {
         if (failReason != null) {
@@ -200,6 +210,16 @@ public class ChunkMinerBehavior implements BotBehavior {
         // last column's drops are in the controller starts the next break
         // instead of standing idle waiting to be handed one — the beat that
         // made the loop read as mine, stand, walk, mine.
+        // Planning does NOT run on through INTERACTING, and the reason is
+        // measured rather than cautious. Topping the queue up mid-break is the
+        // only moment that would remove the collect round entirely —
+        // continueSeam looks for a queued task at the tick the break confirms
+        // — but it hands pollNearest a choice while the near column still
+        // stands, and it picks a block behind it: the corridor test failed
+        // outright ("cannot break"), and the stalling test fell from 19.1 to
+        // 62.0 ticks per block with 136 of 248 ticks in LOOKING and 71 in
+        // POSITIONING. Whatever removes the collect has to keep the ordering,
+        // and topping up does not.
         boolean collecting = BotController.getPhase() == BotController.Phase.COLLECTING;
         if (BotController.isPaused() || !BotController.getTaskQueue().isEmpty()
                 || (BotController.isActive() && !collecting)) {
@@ -207,7 +227,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
 
         if (pendingPlacement != null) {
-            BehaviorStatus placed = verifyPlacement(level);
+            BehaviorStatus placed = verifyPlacement(player, level);
             if (placed != null) {
                 return placed;
             }
@@ -306,11 +326,11 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (!chunk.equals(new ChunkPos(under))) {
             return fail("standing outside the target chunk at " + shortPos(feet));
         }
-        BehaviorStatus liquid = handleLiquidsAround(level, under);
+        BehaviorStatus liquid = handleLiquidsAround(player, level, under);
         if (liquid != null) {
             return liquid;
         }
-        BehaviorStatus footing = ensureSafeDrop(level, under);
+        BehaviorStatus footing = ensureSafeDrop(player, level, under);
         if (footing != null) {
             return footing;
         }
@@ -367,29 +387,90 @@ public class ChunkMinerBehavior implements BotBehavior {
             phase = Phase.SELECT_SLAB;
             return BehaviorStatus.RUNNING;
         }
-        BehaviorStatus liquid = handleLiquidsAround(level, column);
+        BehaviorStatus liquid = handleLiquidsAround(player, level, column);
         if (liquid != null) {
             return liquid;
         }
-        BehaviorStatus footing = ensureFloor(level, column.below());
+        BehaviorStatus footing = ensureFloor(player, level, column.below());
         if (footing != null) {
             return footing;
         }
-        // Head before feet: while the head block stands, the foot block's
-        // upward face is covered and its side faces are hidden by the corridor
-        // wall, so aiming at it first only burns a look timeout.
         List<BlockPos> blocks = new ArrayList<>();
-        for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-            if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
-                blocks.add(pos);
-            }
-        }
+        addColumn(level, column, blocks);
         if (blocks.isEmpty()) {
             return BehaviorStatus.RUNNING;
+        }
+        // Keep the queue stocked past the end of this column. The controller
+        // only skips the collect-and-replan round when another task is already
+        // queued and in reach (continueSeam), and planning a single column
+        // guaranteed it never was: the queue ran dry on every second block. At
+        // 5.0 ticks of actual breaking per block that round cost 5.3 in
+        // COLLECTING and 1.8 idle, measured at normal tick rate. A person
+        // digging a corridor does not stop after each column either — a drop
+        // keeps its ten-tick pickup delay whether the bot stands over it or
+        // mines on, and vanilla's pickup box takes it on the way past.
+        //
+        // Only columns needing no groundwork are chained: a cap, a dam or a
+        // floor placement has to happen before the cell in front of it opens,
+        // and batching one in would run it out of order.
+        List<BlockPos> columns = slabColumns(slabFeetY);
+        for (int i = columns.indexOf(column) + 1; i > 0 && i < columns.size(); i++) {
+            BlockPos next = columns.get(i);
+            if (!withinChainDistance(player, next) || !needsNoGroundwork(level, next)) {
+                break;
+            }
+            addColumn(level, next, blocks);
         }
         plan(blocks);
         breatherTicks = HumanBehavior.randomBreatherTicks(BotController.CONFIG);
         return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * How far a column may sit from the bot to join the same plan. Vanilla's
+     * pickup box reaches 1.425 blocks on each horizontal axis — {@code
+     * Player.touch} inflates the bounding box by 1.0 and the item is 0.25 wide
+     * — so cobble from a column further out than that lands where the bot has
+     * to walk back for it, which is the collect round the chaining exists to
+     * remove.
+     *
+     * <p>Chaining out to the full reach (4.0) was measured and is worse than
+     * this: the bot clears everything it can touch from one standing spot and
+     * then walks back over four blocks of loot. It bought 4.1 ticks per block
+     * of COLLECTING and gave back 24 ticks of SCANNING and POSITIONING plus a
+     * 40-tick break in the mining — the aim test counted a long gap that was
+     * not there before, and continuous mining is the point.
+     */
+    private static final double CHAIN_DISTANCE = 1.5;
+
+    /**
+     * Append the diggable, in-range cells of one column. Head before feet:
+     * while the head block stands, the foot block's upward face is covered and
+     * its side faces are hidden by the corridor wall, so aiming at it first
+     * only burns a look timeout.
+     */
+    private void addColumn(Level level, BlockPos column, List<BlockPos> into) {
+        for (BlockPos pos : new BlockPos[] {column.above(), column}) {
+            if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
+                into.add(pos);
+            }
+        }
+    }
+
+    /**
+     * Whether a column can simply be mined: a floor already under it and no
+     * liquid touching either of its cells. Both are interventions that must
+     * run before the cell is opened, so a column needing one never joins
+     * another column's plan.
+     */
+    private boolean needsNoGroundwork(Level level, BlockPos column) {
+        return !isPassable(level.getBlockState(column.below()))
+                && liquidsTouching(level, column).isEmpty();
+    }
+
+    private boolean withinChainDistance(LocalPlayer player, BlockPos pos) {
+        return player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5)
+                <= CHAIN_DISTANCE * CHAIN_DISTANCE;
     }
 
     // --- Slab geometry ---
@@ -534,7 +615,7 @@ public class ChunkMinerBehavior implements BotBehavior {
      * opened up. A hole deeper than a safe drop is filled in from the nearest
      * sturdy neighbour rather than walked into.
      */
-    private BehaviorStatus ensureSafeDrop(Level level, BlockPos pos) {
+    private BehaviorStatus ensureSafeDrop(LocalPlayer player, Level level, BlockPos pos) {
         int open = 0;
         BlockPos below = pos.below();
         while (open <= MAX_SAFE_DROP && isPassable(level.getBlockState(below))) {
@@ -544,31 +625,29 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (open <= MAX_SAFE_DROP) {
             return null;
         }
-        return ensureFloor(level, pos.below());
+        return ensureFloor(player, level, pos.below());
     }
 
     /** Put a block at {@code pos} if nothing solid is there to stand on. */
-    private BehaviorStatus ensureFloor(Level level, BlockPos pos) {
+    private BehaviorStatus ensureFloor(LocalPlayer player, Level level, BlockPos pos) {
         if (!isPassable(level.getBlockState(pos))) {
             return null;
         }
         if (!chunk.equals(new ChunkPos(pos))) {
             return fail("no floor at " + shortPos(pos) + ", which is outside the chunk");
         }
-        return planPlacement(level, pos, "floor");
+        return planPlacement(player, level, pos, "floor");
     }
 
     // --- Liquids ---
 
     /**
-     * Deal with any liquid touching the cell about to be opened, before it is
-     * opened. Water that comes from a handful of sources gets each source
-     * capped — cheap, permanent, and it leaves the chunk dry. Anything bigger,
-     * and all lava, gets dammed at the face it would flow in through: chasing
-     * an ocean's sources is endless, and letting lava burn itself out into
-     * obsidian costs far more time than a block of cobble.
+     * Every fluid cell touching either half of a column, the column's own two
+     * cells included. Read-only, which is what lets {@link #needsNoGroundwork}
+     * ask the same question without triggering the capping and damming that
+     * {@link #handleLiquidsAround} does when the answer is non-empty.
      */
-    private BehaviorStatus handleLiquidsAround(Level level, BlockPos column) {
+    private Set<BlockPos> liquidsTouching(Level level, BlockPos column) {
         Set<BlockPos> touching = new LinkedHashSet<>();
         for (BlockPos cell : new BlockPos[] {column, column.above()}) {
             for (Direction dir : Direction.values()) {
@@ -581,6 +660,19 @@ public class ChunkMinerBehavior implements BotBehavior {
                 touching.add(cell);
             }
         }
+        return touching;
+    }
+
+    /**
+     * Deal with any liquid touching the cell about to be opened, before it is
+     * opened. Water that comes from a handful of sources gets each source
+     * capped — cheap, permanent, and it leaves the chunk dry. Anything bigger,
+     * and all lava, gets dammed at the face it would flow in through: chasing
+     * an ocean's sources is endless, and letting lava burn itself out into
+     * obsidian costs far more time than a block of cobble.
+     */
+    private BehaviorStatus handleLiquidsAround(LocalPlayer player, Level level, BlockPos column) {
+        Set<BlockPos> touching = liquidsTouching(level, column);
         if (touching.isEmpty()) {
             return null;
         }
@@ -622,7 +714,7 @@ public class ChunkMinerBehavior implements BotBehavior {
                 lava ? "lava" : "water", shortPos(start));
         String what = capping ? "water cap" : (lava ? "lava dam" : "water dam");
         for (BlockPos pos : toSeal) {
-            BehaviorStatus placement = planPlacement(level, pos, what);
+            BehaviorStatus placement = planPlacement(player, level, pos, what);
             if (placement != null) {
                 return placement;
             }
@@ -666,8 +758,9 @@ public class ChunkMinerBehavior implements BotBehavior {
      * the configured filler blocks — both mean the situation cannot be made
      * safe, and carrying on would mean walking into it.
      */
-    private BehaviorStatus planPlacement(Level level, BlockPos pos, String what) {
-        BlockPos support = PlaceBlockTask.findSupport(level, pos);
+    private BehaviorStatus planPlacement(LocalPlayer player, Level level, BlockPos pos,
+                                         String what) {
+        BlockPos support = PlaceBlockTask.findSupport(level, pos, player.getEyePosition());
         if (support == null) {
             return fail("nothing to build the " + what + " at " + shortPos(pos) + " against");
         }
@@ -684,7 +777,7 @@ public class ChunkMinerBehavior implements BotBehavior {
      * placement that keeps failing is fatal rather than skippable: it was
      * planned because the bot could not safely proceed without it.
      */
-    private BehaviorStatus verifyPlacement(Level level) {
+    private BehaviorStatus verifyPlacement(LocalPlayer player, Level level) {
         BlockPos pos = pendingPlacement;
         if (!isPassable(level.getBlockState(pos))) {
             pendingPlacement = null;
@@ -693,7 +786,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         if (stepRetries < config.maxStepRetries) {
             stepRetries++;
-            BlockPos support = PlaceBlockTask.findSupport(level, pos);
+            BlockPos support = PlaceBlockTask.findSupport(level, pos, player.getEyePosition());
             if (support != null) {
                 BotController.enqueueTask(
                         new PlaceBlockTask(pos, support, fillerPredicate(), "filler"));
@@ -701,8 +794,12 @@ public class ChunkMinerBehavior implements BotBehavior {
             }
         }
         pendingPlacement = null;
+        // Name what was observed, not a guess at why. This used to read "out
+        // of filler blocks?", which sent the reader to a hotbar that was full
+        // of them while the real reason — a look timeout on an unaimable
+        // support face — sat in the task diagnostics two lines up.
         return fail("could not place the " + placementWhat + " at " + shortPos(pos)
-                + " — out of filler blocks?");
+                + " — " + stepRetries + " attempts failed, see the task diagnostics above");
     }
 
     /** Matches any stack of a configured filler block. */

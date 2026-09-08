@@ -31,6 +31,25 @@ public class BlockInteractor {
      */
     private static final int USE_RETRY_TICKS = 15;
 
+    /**
+     * How long vanilla makes the pickaxe idle after a block comes apart.
+     * {@code MultiPlayerGameMode} sets {@code destroyDelay = 5} the moment a
+     * break completes, and {@code continueDestroyBlock} opens with
+     * {@code if (destroyDelay > 0) { destroyDelay--; return true; }} — five
+     * calls that report progress and make none. Nothing else spends it:
+     * {@code MultiPlayerGameMode.tick} does not decrement it, so it only runs
+     * down while something keeps calling that method.
+     *
+     * <p>The count is exact and is what keeps {@link #tickCooldownDrain} off
+     * the branch below the early-out. Once the delay reaches zero,
+     * {@code continueDestroyBlock} falls through to {@code sameDestroyTarget},
+     * and a hotbar switch made while aiming at the next block is enough to
+     * fail it — which routes into {@code startDestroyBlock}, and that sends a
+     * START_DESTROY_BLOCK packet through {@code startPrediction} with no air
+     * check in front of it. Draining exactly five never gets there.
+     */
+    private static final int DESTROY_DELAY_TICKS = 5;
+
     private static boolean interacting = false;
     private static InteractionType currentType = null;
     private static boolean started = false;
@@ -40,6 +59,11 @@ public class BlockInteractor {
     // placement pins the face, because it decides where the block ends up.
     private static Direction fixedFace = null;
     private static int useCooldown = 0;
+    // The block just broken, kept only to spend vanilla's post-break delay
+    // while the bot aims at the next one. See DESTROY_DELAY_TICKS.
+    private static BlockPos cooldownPos = null;
+    private static Direction cooldownFace = null;
+    private static int cooldownTicks = 0;
 
     /**
      * Begin block interaction against an explicit target. The interaction
@@ -64,11 +88,15 @@ public class BlockInteractor {
      * captured in {@link #startInteraction(InteractionType, BlockPos, Direction)}.
      */
     public static void tickInteraction() {
-        if (!interacting) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
             return;
         }
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.level == null || mc.gameMode == null || targetPos == null) {
+        if (!interacting) {
+            tickCooldownDrain(mc);
+            return;
+        }
+        if (targetPos == null) {
             return;
         }
 
@@ -130,7 +158,60 @@ public class BlockInteractor {
         started = true;
     }
 
+    /**
+     * Let go of the button after a break, but keep spending vanilla's
+     * post-break delay while the bot lines up the next block.
+     *
+     * <p>A player mining a wall holds the button down and moves the mouse; the
+     * five idle ticks pass <i>during</i> the mouse travel, which is why a human
+     * gets 16 stone in 200 ticks where 96 of those are the only real breaking.
+     * The bot used to release on every confirmed break and re-press on the next
+     * one, so it paid the delay after aiming instead of through it — five ticks
+     * per block, on top of the aim rather than inside it.
+     *
+     * <p>Only for mining, and only once the target really is air: it is the
+     * completed break that arms the delay, and a target still standing means
+     * the break did not finish.
+     */
+    public static void releaseAfterBreak() {
+        BlockPos broken = currentType == InteractionType.ATTACK ? targetPos : null;
+        Direction face = fixedFace;
+        stopInteraction();
+        if (broken == null) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null || !mc.level.getBlockState(broken).isAir()) {
+            return;
+        }
+        cooldownPos = broken;
+        cooldownFace = face != null ? face : faceTowardPlayer(mc, broken);
+        cooldownTicks = DESTROY_DELAY_TICKS;
+    }
+
+    /**
+     * Spend one tick of the post-break delay. Swings for the same reason the
+     * attack branch does — {@code Minecraft.continueAttack} swings whenever the
+     * game-mode call reports it is still working, and during these five ticks
+     * it does, which is exactly the stretch where a human's arm keeps moving.
+     */
+    private static void tickCooldownDrain(Minecraft mc) {
+        if (cooldownPos == null) {
+            return;
+        }
+        if (cooldownTicks-- <= 0 || !mc.level.getBlockState(cooldownPos).isAir()) {
+            cooldownPos = null;
+            return;
+        }
+        if (mc.gameMode.continueDestroyBlock(cooldownPos, cooldownFace)) {
+            mc.player.swing(InteractionHand.MAIN_HAND);
+        }
+    }
+
     public static void stopInteraction() {
+        // Unconditional: a hard stop must not leave the drain running, and
+        // stop()/pause()/failCurrentTask() all come through here.
+        cooldownPos = null;
         if (!interacting) {
             return;
         }

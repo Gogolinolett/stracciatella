@@ -434,12 +434,14 @@ public class BotTests {
         buildPlatform(ctx, origin, CLEAR_RADIUS);
         switchToSurvivalAt(ctx, origin, origin.getY());
 
-        BlockPos floatingSupport = ctx.computeOnClient(mc -> PlaceBlockTask.findSupport(mc.level, floating));
+        BlockPos floatingSupport = ctx.computeOnClient(
+                mc -> PlaceBlockTask.findSupport(mc.level, floating, mc.player.getEyePosition()));
         if (floatingSupport != null) {
             throw new AssertionError("findSupport returned " + floatingSupport.toShortString()
                     + " for a position surrounded by air");
         }
-        BlockPos floorSupport = ctx.computeOnClient(mc -> PlaceBlockTask.findSupport(mc.level, onFloor));
+        BlockPos floorSupport = ctx.computeOnClient(
+                mc -> PlaceBlockTask.findSupport(mc.level, onFloor, mc.player.getEyePosition()));
         if (!onFloor.below().equals(floorSupport)) {
             throw new AssertionError("Expected the platform below " + onFloor.toShortString()
                     + " as support, got " + floorSupport);

@@ -458,28 +458,40 @@ public class ChunkMinerTests {
     // the gap each one currently shows is recorded beside it.
 
     /**
-     * Game ticks a block may cost end to end. Stone has hardness 1.5 and a
-     * diamond pickaxe speed 8, so destroy progress is 8/1.5/30 per tick and a
-     * block takes <b>6 ticks of breaking</b>. A column is two of them; on the
-     * intended design the step to the next column and the aim that covers both
-     * its blocks happen while those twelve ticks are running, leaving the break
-     * confirmation as the only serial cost. Twelve ticks per block is therefore
-     * twice the floor and still generous.
+     * The pace to beat, taken from a person doing the job by hand: <b>16 stone
+     * blocks with a pickaxe in 10 seconds</b>, so 200 ticks, 12.5 per block.
+     * The budget allows 220 for that same work — a tenth on top.
      *
-     * <p>Currently measured: 25. The budget is the whole-run gate, so this is
-     * the number that has to move.
+     * <p>A human reference beats a derived one here because it settles what
+     * the game actually permits, and it happens to corroborate the arithmetic:
+     * 16 blocks of stone is 96 ticks of pure breaking at {@code 8/1.5/30}, so
+     * the other 104 ticks are the overhead a person cannot avoid either —
+     * essentially the 5-tick {@code destroyDelay} vanilla sets the moment a
+     * block completes, plus the mouse travel that happens <i>during</i> it.
+     * That is the whole difference between 12.5 and the bot's 20.8: the bot
+     * pays the cooldown inside INTERACTING and then aims separately in
+     * LOOKING, where a player holding the button spends the same ticks once.
      */
-    private static final int TICK_BUDGET_PER_BLOCK = 12;
+    private static final int REFERENCE_BLOCKS = 16;
+    private static final int REFERENCE_BUDGET_TICKS = 220;
     /**
-     * Share of the mining window the bot must actually be swinging in. The
-     * requirement is that the bot is always mining, so the bound is set where
-     * "always" stops being a fair description rather than at what the miner
-     * manages. Note the sensor is generous already: {@code player.swinging}
-     * over-runs the last swing by the swing animation.
+     * Share of the mining window in which a block is actually losing hardness.
+     * At the human pace of 12.5 ticks per block with 5-7 of them real
+     * breaking, 40% is what "always mining" can mean once vanilla's post-break
+     * cooldown is paid — a person hits about the same share.
      *
-     * <p>Currently measured: 67-70% over the corridor, 56% over the aim patch.
+     * <p>Currently measured: about 24% — 6.6 ticks of progress inside 27.
      */
-    private static final double MIN_DUTY_CYCLE = 0.90;
+    private static final double MIN_DUTY_CYCLE = 0.40;
+    /**
+     * Share of the same window in which the bot holds left click. Separate
+     * from the duty cycle on purpose: this is the one that goes to zero when
+     * the swing mirrored from {@code Minecraft.continueAttack} is dropped,
+     * which is the regression that started this work, and progress alone would
+     * not notice it. Currently measured: 68-77%, the shortfall being the aim
+     * and collect stretches where the button is genuinely released.
+     */
+    private static final double MIN_SWING_CYCLE = 0.90;
     /**
      * A gap longer than this counts as an interruption rather than a beat. The
      * bound is the longest pause the design actually sanctions:
@@ -531,10 +543,15 @@ public class ChunkMinerTests {
     private static final double MIN_COLLECTED_FRACTION = 0.90;
 
     private void assertMiningQuality(MiningTrace trace, int blocks) {
+        if (trace.swingCycle() < MIN_SWING_CYCLE) {
+            throw new AssertionError("Bot did not hold left click: swinging "
+                    + percent(trace.swingCycle()) + " of the mining window, required "
+                    + percent(MIN_SWING_CYCLE) + " — " + trace);
+        }
         if (trace.dutyCycle() < MIN_DUTY_CYCLE) {
-            throw new AssertionError("Bot was not mining often enough: duty cycle "
-                    + percent(trace.dutyCycle()) + ", required " + percent(MIN_DUTY_CYCLE)
-                    + " — " + trace);
+            throw new AssertionError("Bot was not mining often enough: blocks were losing "
+                    + "hardness on " + percent(trace.dutyCycle()) + " of ticks, required "
+                    + percent(MIN_DUTY_CYCLE) + " — " + trace);
         }
         if (trace.longGaps() > MAX_LONG_GAPS) {
             throw new AssertionError("Bot stopped mining too often: " + trace.longGaps()
@@ -566,7 +583,7 @@ public class ChunkMinerTests {
      */
     private MiningTrace traceChunkMiner(TestContext ctx, int fromY, int toY, int blocks) {
         final MiningTrace trace = new MiningTrace();
-        final int budget = blocks * TICK_BUDGET_PER_BLOCK;
+        final int budget = Math.ceilDiv(blocks * REFERENCE_BUDGET_TICKS, REFERENCE_BLOCKS);
         startChunkMiner(ctx, fromY, toY);
         try {
             ctx.waitFor(mc -> {
@@ -579,6 +596,7 @@ public class ChunkMinerTests {
             // "never got as far as counting".
             trace.collected = ctx.computeOnClient(
                     mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
+            trace.mined = ctx.computeOnClient(mc -> MinerSetup.chunkMiner().blocksMined());
             ctx.runOnClient(mc -> {
                 BehaviorRunner.stop();
                 BotController.stop();
@@ -587,8 +605,11 @@ public class ChunkMinerTests {
             if (message == null || !message.startsWith("Timed out")) {
                 throw e;
             }
-            throw new AssertionError("Chunk miner did not finish " + blocks + " blocks in "
-                    + budget + " ticks (" + TICK_BUDGET_PER_BLOCK + " per block) — " + trace);
+            throw new AssertionError("Chunk miner managed " + trace.mined + " of " + blocks
+                    + " blocks in " + budget + " ticks (" + trace.ticksPerBlock()
+                    + " per block) — a person mines " + REFERENCE_BLOCKS + " stone in "
+                    + (REFERENCE_BUDGET_TICKS - 20) + " ticks, "
+                    + (REFERENCE_BUDGET_TICKS - 20) / REFERENCE_BLOCKS + " per block — " + trace);
         }
         // Counted before the bot is stopped, and never waited for afterwards:
         // a stopped bot cannot walk to a drop, so anything that arrives later
@@ -596,6 +617,7 @@ public class ChunkMinerTests {
         // number the miner is actually accountable for.
         trace.collected = ctx.computeOnClient(
                 mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
+        trace.mined = ctx.computeOnClient(mc -> MinerSetup.chunkMiner().blocksMined());
         ctx.runOnClient(mc -> BotController.stop());
         if (ctx.computeOnClient(mc -> MinerSetup.chunkMiner().failed())) {
             throw new AssertionError("Chunk miner aborted: "
@@ -617,6 +639,8 @@ public class ChunkMinerTests {
     private static final class MiningTrace {
         private int ticks;
         private int swingTicks;
+        /** Swing ticks as of the last progress tick — the window's own count. */
+        private int swingTicksInWindow;
         private int firstBreakTick = -1;
         private int lastBreakTick = -1;
         private int gap;
@@ -630,12 +654,32 @@ public class ChunkMinerTests {
         private int maxFeetY = Integer.MIN_VALUE;
         /** Cobblestone in the inventory when the run ended. Not sampled. */
         private int collected;
+        /** Blocks the behaviour reports broken. Not sampled. */
+        private int mined;
         /**
          * Ticks spent in each controller phase. This is what makes a budget
          * failure actionable: "too slow" is not a finding, "nineteen of every
          * twenty-five ticks went somewhere other than INTERACTING" is.
          */
         private final int[] phaseTicks = new int[BotController.Phase.values().length];
+        /** Ticks a block was actually losing hardness. */
+        private int progressTicks;
+        /**
+         * The two halves of the idle time inside INTERACTING, summed over every
+         * visit: {@code lead} runs from entering the phase to the first tick the
+         * block loses hardness, {@code tail} from the last such tick to leaving.
+         * Six ticks of stone is a game constant and nothing can be won there —
+         * these two are the entire cost the phase adds on top of it, and they
+         * have separate causes (getting the attack going versus confirming the
+         * break), so a single "idle" number would name neither.
+         */
+        private int leadTicks;
+        private int tailTicks;
+        private int spans;
+        private BotController.Phase prevPhase;
+        private int spanTicks;
+        private int spanFirst = -1;
+        private int spanLast;
 
         void sample(Minecraft mc) {
             LocalPlayer player = mc.player;
@@ -654,15 +698,31 @@ public class ChunkMinerTests {
             int feetY = player.blockPosition().getY();
             minFeetY = Math.min(minFeetY, feetY);
             maxFeetY = Math.max(maxFeetY, feetY);
-            phaseTicks[BotController.getPhase().ordinal()]++;
-
-            // The arm swing, not a phase of ours: BlockInteractor swings only
-            // on a tick where continueDestroyBlock reported the break is still
-            // running. It over-runs the last swing by the swing animation
-            // (about six ticks), which shortens gaps a little and cannot
-            // manufacture one — a bot that stops mining stops swinging.
-            if (player.swinging) {
+            BotController.Phase phase = BotController.getPhase();
+            phaseTicks[phase.ordinal()]++;
+            // Only from the first break onwards, and the figure that counts is
+            // the one snapshotted at the last break below. Both shares are
+            // measured over the same window, so counting swings across the
+            // whole run would put ticks in the numerator that the denominator
+            // never saw — it read as 109% before this.
+            if (player.swinging && firstBreakTick >= 0) {
                 swingTicks++;
+            }
+
+            // Real progress on a block, which is a different question from
+            // whether the bot looks busy. getDestroyStage is
+            // `destroyProgress > 0 ? (int)(progress * 10) : -1` with no
+            // isDestroying guard, so it is exactly "a break is under way".
+            //
+            // The distinction is not academic. continueDestroyBlock returns
+            // true — and BlockInteractor therefore swings — while
+            // destroyDelay is still draining, and vanilla sets that to 5 after
+            // every completed block. Measured: 128 swinging ticks against 46
+            // making progress. Judging the miner by the swing would score
+            // those idle ticks as mining.
+            boolean progressing = mc.gameMode != null && mc.gameMode.getDestroyStage() >= 0;
+            if (progressing) {
+                progressTicks++;
                 if (firstBreakTick < 0) {
                     firstBreakTick = ticks;
                 } else if (gap > 0) {
@@ -672,10 +732,35 @@ public class ChunkMinerTests {
                     }
                 }
                 lastBreakTick = ticks;
+                swingTicksInWindow = swingTicks;
                 gap = 0;
             } else if (firstBreakTick >= 0) {
                 gap++;
             }
+
+            // Split the phase's idle time at its two ends. A visit that never
+            // made progress is left out of both sums rather than counted as
+            // one long lead: it is a failed break, a different fault, and
+            // averaging it into the lead would hide how the normal ones went.
+            if (phase == BotController.Phase.INTERACTING) {
+                if (prevPhase != BotController.Phase.INTERACTING) {
+                    spanTicks = 0;
+                    spanFirst = -1;
+                    spanLast = 0;
+                }
+                spanTicks++;
+                if (progressing) {
+                    if (spanFirst < 0) {
+                        spanFirst = spanTicks;
+                    }
+                    spanLast = spanTicks;
+                }
+            } else if (prevPhase == BotController.Phase.INTERACTING && spanFirst >= 0) {
+                leadTicks += spanFirst - 1;
+                tailTicks += spanTicks - spanLast;
+                spans++;
+            }
+            prevPhase = phase;
         }
 
         /** Ticks from the run's start to the first tick it spent mining. */
@@ -684,15 +769,31 @@ public class ChunkMinerTests {
         }
 
         /**
-         * Share of the mining window spent swinging. The window ends at the
-         * last swing, not at the run's end: the closing collect is work the
-         * run owes, not time the bot spent idle.
+         * Share of the mining window in which a block was actually losing
+         * hardness. The window ends at the last such tick, not at the run's
+         * end: the closing collect is work the run owes, not time spent idle.
          */
         double dutyCycle() {
             if (firstBreakTick < 0) {
                 return 0.0;
             }
-            return (double) swingTicks / (lastBreakTick - firstBreakTick + 1);
+            return (double) progressTicks / (lastBreakTick - firstBreakTick + 1);
+        }
+
+        /** Ticks the run spent per block actually broken, to one decimal. */
+        String ticksPerBlock() {
+            if (mined <= 0) {
+                return "n/a";
+            }
+            return String.valueOf(Math.round(ticks * 10.0 / mined) / 10.0);
+        }
+
+        /** Share of the same window in which the bot held left click. */
+        double swingCycle() {
+            if (firstBreakTick < 0) {
+                return 0.0;
+            }
+            return (double) swingTicksInWindow / (lastBreakTick - firstBreakTick + 1);
         }
 
         int longGaps() {
@@ -713,13 +814,16 @@ public class ChunkMinerTests {
 
         @Override
         public String toString() {
-            return "ticks=" + ticks + " swinging=" + swingTicks
+            return "ticks=" + ticks + " breaking=" + progressTicks
                     + " duty=" + percent(dutyCycle())
-                    + " firstSwing=" + firstBreakTick + " lastSwing=" + lastBreakTick
+                    + " swinging=" + swingTicksInWindow + " swingDuty=" + percent(swingCycle())
+                    + " firstBreak=" + firstBreakTick + " lastBreak=" + lastBreakTick
                     + " maxGap=" + maxGap + " longGaps=" + longGaps
                     + " yaw=" + Math.round(yawTravel) + "deg"
                     + " maxYawStep=" + Math.round(maxYawStep) + "deg"
                     + " feetY=" + minFeetY + ".." + maxFeetY
+                    + " mined=" + mined + " perBlock=" + ticksPerBlock()
+                    + " lead=" + leadTicks + " tail=" + tailTicks + " spans=" + spans
                     + " collected=" + collected
                     + " phases=" + phaseHistogram();
         }
