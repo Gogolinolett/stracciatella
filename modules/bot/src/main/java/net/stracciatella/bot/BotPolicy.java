@@ -24,10 +24,11 @@ public record BotPolicy(
         int minFreeSlots,
         boolean opportunisticCollection,
         boolean fastCollectExit,
-        boolean orderedTasks) {
+        boolean orderedTasks,
+        boolean approachOccluded) {
 
     private static final BotPolicy NONE =
-            new BotPolicy(false, false, false, 0, false, false, false);
+            new BotPolicy(false, false, false, 0, false, false, false, false);
 
     /**
      * Everything off — the execution layer behaves exactly as it did before
@@ -40,19 +41,19 @@ public record BotPolicy(
     /** Stop the run on any health decrease. */
     public BotPolicy withDamageStop() {
         return new BotPolicy(true, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded);
     }
 
     /** Stop the run when a player attacks the bot, even for zero damage. */
     public BotPolicy withPlayerAttackStop() {
         return new BotPolicy(stopOnDamage, true, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded);
     }
 
     /** Stop the run once fewer than {@code minFreeSlots} main slots are empty. */
     public BotPolicy withInventoryFullStop(int minFreeSlots) {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, true, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded);
     }
 
     /**
@@ -61,7 +62,7 @@ public record BotPolicy(
      */
     public BotPolicy withOpportunisticCollection() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                true, fastCollectExit, orderedTasks);
+                true, fastCollectExit, orderedTasks, approachOccluded);
     }
 
     /**
@@ -71,7 +72,7 @@ public record BotPolicy(
      */
     public BotPolicy withFastCollectExit() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, true, orderedTasks);
+                opportunisticCollection, true, orderedTasks, approachOccluded);
     }
 
     /**
@@ -96,6 +97,37 @@ public record BotPolicy(
      */
     public BotPolicy withOrderedTasks() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, true);
+                opportunisticCollection, fastCollectExit, true, approachOccluded);
+    }
+
+    /**
+     * Step closer to a target that is <b>in reach but hidden</b>, instead of
+     * staring at whatever the raycast does land on until the look times out.
+     *
+     * <p>The controller only ever walks to targets out of reach — where it
+     * stands is otherwise the behavior's business — and a block inside
+     * {@code reachDistance} with something in front of it therefore has no
+     * move at all. LOOKING's re-approach is the closest thing and it does not
+     * cover this: it closes to {@code APPROACH_CLOSE_DISTANCE} (2.0), which a
+     * bot two columns short of a row's end already beats, so it walks nowhere
+     * and the second look timeout kills the task.
+     *
+     * <p>With the flag on, an obstructed line of sight is detected
+     * geometrically — a clip from the eye to the target, independent of where
+     * the camera happens to point — and POSITIONING walks until that line is
+     * clear rather than until a distance is met. The sight line is the actual
+     * requirement; a distance was only ever standing in for it, and it stood in
+     * badly in exactly the case that matters.
+     *
+     * <p>For a sweep this is what puts a corner in its place. The bot mines
+     * everything it can reach without stepping, so at a row's turn it is
+     * typically two columns short of the end and the first column of the next
+     * row sits diagonally behind the one beside it. Without this the sweep has
+     * to skip the corner and come back for it — one extra turn per row.
+     * Costs a short walk at each turn, and it is opt-in for that reason.
+     */
+    public BotPolicy withApproachOccluded() {
+        return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
+                opportunisticCollection, fastCollectExit, orderedTasks, true);
     }
 }

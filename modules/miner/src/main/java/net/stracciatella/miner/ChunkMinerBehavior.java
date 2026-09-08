@@ -139,7 +139,14 @@ public class ChunkMinerBehavior implements BotBehavior {
                 // about this behaviour that must not be second-guessed: every
                 // step of it is adjacent, which is what keeps the bot from
                 // aiming at a column the one in front still hides.
-                .withOrderedTasks();
+                .withOrderedTasks()
+                // Which only holds if the order can actually be followed. The
+                // bot clears everything within reach without stepping, so at a
+                // row's turn it stands two columns short of the end and the
+                // corner of the next row is hidden behind its neighbour. This
+                // is what lets it walk the last stretch instead of skipping the
+                // corner and turning back for it.
+                .withApproachOccluded();
     }
 
     @Override
@@ -566,24 +573,24 @@ public class ChunkMinerBehavior implements BotBehavior {
      * one direction is exhausted the bot turns around exactly once, which is
      * what a serpentine is for.
      *
-     * <p>A column that is close enough to be occluded is deferred, because the
-     * snake stepping past an empty column leaves the bot standing *diagonally*
-     * to the next one with the orthogonal neighbour still up: measured in a
-     * real world at surface height, target -16,110,-6 with the head block
-     * -15,111,-6 in the line and the bot 1.75 blocks away. Nothing walks it
-     * clear — the controller only navigates to targets out of reach, and the
-     * post-timeout re-approach closes to two blocks, which it already beats —
-     * so LOOKING times out twice and the whole run dies on a block that is
-     * merely hidden for the moment. Deferring costs nothing: the occluder is
-     * itself a column of this sweep and is dug next, and since the miner keeps
-     * no cursor and re-derives from the world, the skipped column simply comes
-     * back once it is visible. The deferred one is still returned if it is all
-     * that is left, so a genuinely unbreakable block fails the run as before.
+     * <p>A column that is momentarily hidden is <b>no longer skipped</b>. It
+     * used to be: the snake stepping past an empty column leaves the bot
+     * standing *diagonally* to the next one with the orthogonal neighbour still
+     * up (measured in a real world, target -16,110,-6 with the head block
+     * -15,111,-6 in the line and the bot 1.75 blocks away), and with nothing
+     * able to walk the bot clear, LOOKING timed out twice and the run died on a
+     * block that was merely hidden for the moment. Skipping it was the cheap
+     * answer and it is what puts a row's corner out of order — the bot digs
+     * past the corner and turns back for it, one extra turn per row. The
+     * expensive answer is now available instead:
+     * {@link BotPolicy#withApproachOccluded} makes the controller walk until
+     * the sight line is clear, so the column can simply be handed over in its
+     * place. A block that stays hidden is bounded the same way as before, by
+     * the position and look timeouts and {@code maxStepRetries}.
      */
     private BlockPos nextColumn(LocalPlayer player, Level level) {
         List<BlockPos> columns = slabColumns(slabFeetY);
         int start = columnIndex(columns, player.blockPosition());
-        BlockPos deferred = null;
         for (int i = 0; i < columns.size(); i++) {
             int ahead = start + i;
             int index = ahead < columns.size()
@@ -599,37 +606,13 @@ public class ChunkMinerBehavior implements BotBehavior {
                 // A position already in the plan is not work left to find: the
                 // block still under the pick would otherwise be handed back
                 // and the sweep would never move past its own column.
-                if (!isInRange(pos) || plannedBlocks.contains(pos)
-                        || !isDiggable(level.getBlockState(pos))) {
-                    continue;
-                }
-                if (isAimable(player, level, pos)) {
+                if (isInRange(pos) && !plannedBlocks.contains(pos)
+                        && isDiggable(level.getBlockState(pos))) {
                     return column;
                 }
-                if (deferred == null) {
-                    deferred = column;
-                }
-                break;
             }
         }
-        return deferred;
-    }
-
-    /**
-     * Whether the bot could aim at {@code pos} from where it stands. Out of
-     * reach counts as aimable: the controller walks to those, and where it
-     * ends up is not knowable from here.
-     */
-    private boolean isAimable(LocalPlayer player, Level level, BlockPos pos) {
-        Vec3 eye = player.getEyePosition();
-        Vec3 aim = Vec3.atCenterOf(pos);
-        double reach = BotController.CONFIG.reachDistance;
-        if (eye.distanceToSqr(aim) > reach * reach) {
-            return true;
-        }
-        BlockHitResult clip = level.clip(new ClipContext(
-                eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
-        return clip.getType() != HitResult.Type.BLOCK || clip.getBlockPos().equals(pos);
+        return null;
     }
 
     /** Index of the bot's own column in the sweep, or 0 if it stands outside. */

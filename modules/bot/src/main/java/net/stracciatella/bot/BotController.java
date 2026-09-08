@@ -378,8 +378,18 @@ public class BotController {
         // Close enough? Reaction beat before LOOKING starts. After a failed
         // look (forceApproach) "close enough" means close range, not reach —
         // the whole point of the re-approach is to change the viewpoint.
-        double closeEnough = forceApproach ? APPROACH_CLOSE_DISTANCE : CONFIG.reachDistance;
-        if (distanceToTarget(player, currentTask.targetPos()) <= closeEnough) {
+        //
+        // A behavior that asked for approachOccluded gets the viewpoint stated
+        // outright instead of approximated by a distance: walk until the sight
+        // line is clear. Two blocks is no use to a bot that is already at 1.4
+        // and hidden behind a corner — it arrives before it has moved, which is
+        // the whole failure this replaces.
+        BlockPos approaching = currentTask.targetPos();
+        boolean arrived = forceApproach && policy.approachOccluded()
+                ? hasLineOfSight(client, player, approaching)
+                : distanceToTarget(player, approaching)
+                        <= (forceApproach ? APPROACH_CLOSE_DISTANCE : CONFIG.reachDistance);
+        if (arrived) {
             forceApproach = false;
             scheduleAction(() -> transitionTo(Phase.LOOKING));
             return;
@@ -530,6 +540,22 @@ public class BotController {
         // fails the task cleanly if it never clears).
         boolean aimedHit = isHitResultOnTarget(client, target, currentTask.preferredFace());
         if (!aimedHit) {
+            // Something is in the way, and no amount of aiming moves it. The
+            // streak below waits for the camera to settle before it believes
+            // that, because a crosshair still travelling lands on all sorts of
+            // blocks; a clip does not care where the camera points, so a
+            // behavior that has asked for the approach gets it on tick one
+            // rather than eight ticks of staring later.
+            if (policy.approachOccluded() && !lookRetryUsed
+                    && !hasLineOfSight(client, player, target)) {
+                lookRetryUsed = true;
+                forceApproach = true;
+                if (CONFIG.debugEnabled) {
+                    LOGGER.info("Target {} is hidden — approaching", target);
+                }
+                transitionTo(Phase.POSITIONING);
+                return;
+            }
             // Early re-approach: the camera has settled on its aim point but
             // the crosshair keeps resting on the same other block — the
             // geometry won't change by staring, so step closer now instead
@@ -601,6 +627,22 @@ public class BotController {
             return false;
         }
         return requiredFace == null || bhr.getDirection() == requiredFace;
+    }
+
+    /**
+     * Whether anything stands between the bot's eye and the target block.
+     *
+     * <p>Geometry, not aim: this is a clip from the eye to the block's centre
+     * and says nothing about where the camera currently points, which is what
+     * makes it usable the moment LOOKING starts instead of after the camera has
+     * settled on the wrong block for {@link #WRONG_HIT_STREAK_TICKS} ticks. A
+     * ray that ends on the target itself counts as clear — clip stops at the
+     * target's own outline on the way to its centre.
+     */
+    private static boolean hasLineOfSight(Minecraft client, LocalPlayer player, BlockPos target) {
+        BlockHitResult clip = client.level.clip(new ClipContext(player.getEyePosition(),
+                Vec3.atCenterOf(target), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+        return clip.getType() != HitResult.Type.BLOCK || clip.getBlockPos().equals(target);
     }
 
     /**

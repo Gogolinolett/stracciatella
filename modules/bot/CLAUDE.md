@@ -202,6 +202,7 @@ Safety and collection behaviour is **opted into per behavior**, never configured
 | `opportunisticCollection` | INTERACTING steps toward nearby drops without dropping the break |
 | `fastCollectExit` | Closes the COLLECTING stalls below: leaves as soon as the ground is clear, without waiting out the absence window |
 | `orderedTasks` | Take queued tasks in insertion order instead of nearest-first |
+| `approachOccluded` | Step closer to a target that is in reach but hidden, instead of staring until the look times out |
 
 ### `orderedTasks`: when nearest-first is wrong
 
@@ -210,6 +211,16 @@ Nearest-first is the right default and stays it — a person works an area close
 It also restores head-before-feet within a column, which the chunk miner plans for and nearest-first quietly undid: standing on the floor, the foot block is 1.0 away and the head block 1.41, so nearest-first always took the one whose upward face is still covered.
 
 `BotController` routes every queue read through `peekNextTask`/`pollNextTask`, which pick `peek`/`poll` or `peekNearest`/`pollNearest` from this flag. Three call sites use them: the aim look-ahead bias in LOOKING, the within-reach continuation after a break, and `startNextTask`.
+
+### `approachOccluded`: the move the controller did not have
+
+The controller walks to a target only when it is **out of reach** — where the bot stands is otherwise the behavior's business. A block inside `reachDistance` with something in front of it therefore had no move at all: the raycast lands on the obstacle, the hit-result gate holds, and LOOKING burns its timeout. The one thing that looked like a fix does not cover it — the post-timeout re-approach closes to `APPROACH_CLOSE_DISTANCE` (2.0), and a bot two columns short of a corner is already at 1.4, so it "arrives" without moving and the second timeout kills the task.
+
+With the flag on, two things change. LOOKING detects the obstruction **geometrically** — `hasLineOfSight`, a clip from the eye to the target's centre — which does not care where the camera points and therefore fires on tick one instead of after `WRONG_HIT_STREAK_TICKS` of the crosshair resting on the wrong block. And POSITIONING then walks until *that line is clear* rather than until a distance is met: the sight line is the actual requirement, and the distance was only ever standing in for it.
+
+Still bounded exactly as before — `lookRetryUsed` allows one approach per task, and a target that stays hidden runs out the position timeout, returns to LOOKING and fails there.
+
+Written for the chunk miner's row turns, where it let the sweep hand over a hidden column in its place instead of skipping it and turning back: yaw per run fell from 1067–1107 to 865–884 at unchanged pace (20/20 blocks at 13.8 ticks per block). Opt-in because it trades a short walk for the turn, and that trade is only obviously right for a behavior whose order is already decided.
 
 ### Detection: packets, not polling
 
