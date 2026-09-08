@@ -44,6 +44,16 @@ public final class ServerBlockSync {
         return ((ClientLevelAccessor) level).stracciatella$predictionHandler().currentSequence();
     }
 
+    /**
+     * The highest settled sequence. TEMPORARY (multiplayer break
+     * investigation, remove with the fix): only the diagnostics read it —
+     * next to the sequence a break is waiting on, it says how far behind the
+     * connection's acknowledgements are running.
+     */
+    public static int lastAcked() {
+        return lastAckedSequence;
+    }
+
     /** Whether the server has settled everything up to {@code sequence}. */
     public static boolean isSettled(int sequence) {
         return sequence >= 0 && lastAckedSequence >= sequence;

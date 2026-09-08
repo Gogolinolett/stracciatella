@@ -28,10 +28,12 @@ public class InventoryHelper {
      * pickaxe sitting in row 2 and silently falls back to bare hand — the
      * server then drops nothing when mining ore.
      * <p>
-     * {@link Inventory#setSelectedSlot} only updates client state — the server
-     * needs {@link ServerboundSetCarriedItemPacket} to know which slot is held,
-     * otherwise break/use actions are resolved against a stale server-side slot
-     * and drops may be computed with the wrong tool.
+     * {@link Inventory#setSelectedSlot} only updates client state, and that is
+     * deliberately all this does: the server learns the slot from
+     * {@link ServerboundSetCarriedItemPacket}, which vanilla's
+     * {@code ensureHasSentCarriedItem} sends on the first interaction call
+     * after the slot changes. Sending one from here as well is what a bot
+     * looks like on the wire — see the comment in {@code equip}.
      */
     public static int selectBestTool(LocalPlayer player, BlockState targetBlock) {
         Inventory inv = player.getInventory();
@@ -135,22 +137,18 @@ public class InventoryHelper {
             }
         }
 
+        // Selecting the slot is all a player's client does here. The packet is
+        // vanilla's job: ensureHasSentCarriedItem sits at the head of
+        // continueDestroyBlock, useItemOn, useItem and attack, and sends
+        // exactly when the slot differs from the one last sent. Sending it
+        // here as well — unconditionally, "small and idempotent" — put one on
+        // the wire per mined block, where a player clearing a whole chunk with
+        // the same pickaxe sends one in total. The measured stream had 119 of
+        // them across 100 breaks. Vanilla's send lands on the second tick of
+        // the break, before any progress is resolved, which is the same tick
+        // a player who scrolls and then clicks gets it on.
         inv.setSelectedSlot(hotbarSlot);
-        // Always send — even if client-side selectedSlot matches hotbarSlot,
-        // the server's copy may disagree under accelerated ticks or after a
-        // prior state-bleed. The packet is small and idempotent.
-        player.connection.send(new ServerboundSetCarriedItemPacket(hotbarSlot));
         return hotbarSlot;
     }
 
-    /**
-     * Re-send the ServerboundSetCarriedItemPacket for the player's current
-     * client-side selected slot. Used during the tool-settle window so a
-     * dropped or reordered packet doesn't leave the server on a stale held
-     * slot when the first attack arrives.
-     */
-    public static void resendCarriedItem(LocalPlayer player) {
-        int slot = player.getInventory().getSelectedSlot();
-        player.connection.send(new ServerboundSetCarriedItemPacket(slot));
-    }
 }

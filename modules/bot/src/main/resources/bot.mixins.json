@@ -6,8 +6,10 @@
 
   ],
   "client": [
+    "ClientCommonPacketListenerImplMixin",
     "ClientLevelAccessor",
-    "ClientPacketListenerMixin"
+    "ClientPacketListenerMixin",
+    "MinecraftMixin"
   ],
   "injectors": {
     "defaultRequire": 1,

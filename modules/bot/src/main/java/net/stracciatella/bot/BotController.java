@@ -168,6 +168,13 @@ public class BotController {
     // inhaled-drop case; a placement lowers it by the block consumed, which
     // is the equivalent signal for USE.
     private static int startInventoryCount = 0;
+    // TEMPORARY (multiplayer break investigation, remove with the fix).
+    // How many times the target went back from finished to standing during
+    // one interaction — i.e. how often the server refused the prediction —
+    // and the tick it first looked finished. Together with the exit reason
+    // they say whether the server rejected the break or merely acked slowly.
+    private static int stateReverts = 0;
+    private static int firstDoneTick = -1;
 
     public enum Phase {
         IDLE,
@@ -483,11 +490,6 @@ public class BotController {
             }
             toolSelected = true;
             releaseMovementKeys();
-        } else {
-            // Re-send carried-item each tick during LOOKING so a dropped or
-            // reordered packet doesn't leave the server on a stale slot when
-            // INTERACTING starts. Cheap, idempotent.
-            InventoryHelper.resendCarriedItem(player);
         }
         // Aim at the center of the face that's most directly visible from the
         // bot's eye, not the block center. The center of a block in the middle
@@ -666,9 +668,14 @@ public class BotController {
             BlockPos t = currentTask.targetPos();
             HitResult hr = client.hitResult;
             LOGGER.warn("Interaction timeout diagnostics: target={} state={} dist={}"
+                    // TEMPORARY (multiplayer break investigation): the same
+                    // three numbers the BREAKWIRE line carries, so a timeout
+                    // says whether the server kept reverting the prediction.
+                    + " firstDone={} reverts={} seq={} acked={}"
                     + " player=({}, {}, {}) held={} hitResult={}",
                     t.toShortString(), client.level.getBlockState(t),
                     String.format("%.2f", Math.sqrt(player.distanceToSqr(Vec3.atCenterOf(t)))),
+                    firstDoneTick, stateReverts, completionSequence, ServerBlockSync.lastAcked(),
                     String.format("%.2f", player.getX()), String.format("%.2f", player.getY()),
                     String.format("%.2f", player.getZ()), player.getMainHandItem(),
                     hr instanceof BlockHitResult bhr ? bhr.getBlockPos().toShortString() : hr);
@@ -691,9 +698,9 @@ public class BotController {
             stateConfirmTicks = 0;
             completionSequence = -1;
             dropSeenThisBreak = false;
+            stateReverts = 0;
+            firstDoneTick = -1;
             startInventoryCount = countMainInventory(player);
-            // Defensive re-send in case the packet was dropped while turning.
-            InventoryHelper.resendCarriedItem(player);
             // Sustained aim during mining is when "frozen gaze" reads as bot.
             // Saccades may have been enabled by LOOKING's hesitation gate;
             // ensure they're on here as well in case hesitation was 0.
@@ -787,9 +794,17 @@ public class BotController {
                 // this one settles ours too: the ack retires everything up to
                 // the sequence it names.
                 completionSequence = ServerBlockSync.currentSequence(client.level);
+                firstDoneTick = phaseTicks;
             }
             stateConfirmTicks++;
         } else {
+            // The target standing again after it had looked finished is the
+            // server refusing the prediction — the ack reverted it. Counted
+            // because it is the one signal that separates "the server said no"
+            // from "the server has not answered yet".
+            if (stateConfirmTicks > 0) {
+                stateReverts++;
+            }
             completionSequence = -1;
             stateConfirmTicks = 0;
         }
@@ -825,6 +840,20 @@ public class BotController {
             // A step from opportunistic collection must not survive the phase
             // change — transitionTo does not touch the movement keys.
             releaseMovementKeys();
+
+            // TEMPORARY (multiplayer break investigation, remove with the fix).
+            // One line per interaction, unconditional so a run on a server
+            // needs no configuration. exit=ack means the server settled the
+            // prediction; exit=window means the bot proceeded on the sustained
+            // state plus an artifact, with nothing from the server.
+            LOGGER.warn("BREAKWIRE {} {} ticks={} firstDone={} reverts={} seq={} acked={}"
+                    + " exit={} drop={} invDelta={} dist={} held={}",
+                    placing ? "place" : "break", target.toShortString(), phaseTicks,
+                    firstDoneTick, stateReverts, completionSequence, ServerBlockSync.lastAcked(),
+                    serverSettled ? "ack" : "window", dropSeenThisBreak,
+                    countMainInventory(player) - startInventoryCount,
+                    String.format("%.2f", distanceToTarget(player, target)),
+                    player.getMainHandItem());
 
             if (CONFIG.debugEnabled) {
                 LOGGER.info("{} at {} in {} ticks", placing ? "Block placed" : "Block broken",

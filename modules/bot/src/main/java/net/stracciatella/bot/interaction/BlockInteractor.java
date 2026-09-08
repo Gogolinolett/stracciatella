@@ -64,6 +64,12 @@ public class BlockInteractor {
     private static BlockPos cooldownPos = null;
     private static Direction cooldownFace = null;
     private static int cooldownTicks = 0;
+    // Post-break delay ticks still owed while the interaction waits for the
+    // server's answer, or -1 for "the current break has not finished yet".
+    // Three states, not two: past the early-out the same call turns into
+    // startDestroyBlock (see the attack branch), so "already spent" has to be
+    // distinguishable from "not armed yet" or the drain re-arms forever.
+    private static int airDelayTicks = -1;
 
     /**
      * Begin block interaction against an explicit target. The interaction
@@ -80,6 +86,7 @@ public class BlockInteractor {
         targetPos = target;
         fixedFace = face;
         useCooldown = 0;
+        airDelayTicks = -1;
     }
 
     /**
@@ -103,6 +110,46 @@ public class BlockInteractor {
         Direction face = fixedFace != null ? fixedFace : faceTowardPlayer(mc, targetPos);
 
         if (currentType == InteractionType.ATTACK) {
+            // Once the client has removed the block there is nothing left to
+            // mine, and driving the game mode on is not merely useless: with
+            // the post-break delay spent, continueDestroyBlock falls through
+            // to sameDestroyTarget, which compares the held stack with
+            // isSameItemSameComponents — so the durability the server syncs
+            // back for the block just broken fails it, and the call routes
+            // into startDestroyBlock, which puts a fresh START_DESTROY_BLOCK
+            // on the wire with no air check in front of it.
+            //
+            // A server that still has that block standing reads it as the
+            // start of a new break: START resets destroyProgressStart
+            // unconditionally, so the STOP that follows misses the 0.7
+            // progress gate, and if a destroy was still in progress the
+            // server answers with the block's real state, which reverts the
+            // client's prediction. The bot then breaks the same block over
+            // and over — measured on a live server as eight reverts inside
+            // one interaction, with the block finally reported as unbreakable.
+            // Locally none of it shows: the integrated server has already
+            // destroyed the block by the time the stray START arrives, so it
+            // dies in the server's own air check.
+            //
+            // The five delay ticks still have to be spent, and the drain is
+            // what spends them with an exact count that never reaches the
+            // fall-through — the same guard it was written for.
+            if (isBlockBroken(mc.level, targetPos)) {
+                if (airDelayTicks < 0) {
+                    airDelayTicks = DESTROY_DELAY_TICKS;
+                }
+                if (airDelayTicks > 0) {
+                    airDelayTicks--;
+                    if (mc.gameMode.continueDestroyBlock(targetPos, face)) {
+                        mc.player.swing(InteractionHand.MAIN_HAND);
+                    }
+                }
+                return;
+            }
+            // Standing again means a break is in progress — either the first
+            // one or a retry after the server reverted the prediction — so the
+            // delay that break will arm has not been spent yet.
+            airDelayTicks = -1;
             boolean hitting;
             if (!started) {
                 mc.missTime = 0;
@@ -176,6 +223,12 @@ public class BlockInteractor {
     public static void releaseAfterBreak() {
         BlockPos broken = currentType == InteractionType.ATTACK ? targetPos : null;
         Direction face = fixedFace;
+        // The confirmation wait has already been spending the delay — the
+        // attack branch starts counting the tick the client sees the block go —
+        // so only what is left of it may carry over. Arming a fresh five here
+        // would spend the delay twice, and the second five would land past
+        // vanilla's early-out on exactly the fall-through this drain avoids.
+        int remaining = airDelayTicks >= 0 ? airDelayTicks : DESTROY_DELAY_TICKS;
         stopInteraction();
         if (broken == null) {
             return;
@@ -186,7 +239,7 @@ public class BlockInteractor {
         }
         cooldownPos = broken;
         cooldownFace = face != null ? face : faceTowardPlayer(mc, broken);
-        cooldownTicks = DESTROY_DELAY_TICKS;
+        cooldownTicks = remaining;
     }
 
     /**
@@ -225,10 +278,30 @@ public class BlockInteractor {
         targetPos = null;
         fixedFace = null;
         useCooldown = 0;
+        airDelayTicks = -1;
     }
 
     public static boolean isInteracting() {
         return interacting;
+    }
+
+    /**
+     * The block currently under the pick, or {@code null}. TEMPORARY
+     * (multiplayer break investigation, remove with the fix): the packet trace
+     * logs only the traffic that concerns this block.
+     */
+    public static BlockPos currentTarget() {
+        return interacting ? targetPos : null;
+    }
+
+    /**
+     * Whether the bot is currently mining, i.e. standing in for a held attack
+     * button. Vanilla's {@code Minecraft.continueAttack} is the other half of
+     * that: with the button up it calls {@code stopDestroyBlock}, which the
+     * mixin suppresses while this returns true.
+     */
+    public static boolean isMining() {
+        return interacting && currentType == InteractionType.ATTACK;
     }
 
     /**

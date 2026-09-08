@@ -87,9 +87,13 @@ public class BotConfig {
     public double reachDistance = 4.0;
 
     // Maximum ticks INTERACTING runs before giving up (mine + wait for drop
-    // entity). Must cover the slowest legitimate break on the server plus
-    // item-entity spawn sync under load.
-    public int maxBreakTicks = 400;
+    // entity). 100 ticks (5 s) is a deliberate fail-fast, and it is *below*
+    // the unenchanted break time of the hardest blocks: a break costs
+    // 30 x hardness / tool speed ticks, so obsidian with a diamond pickaxe
+    // needs 188 and ancient debris 113. Those are reachable only with
+    // Efficiency on the pickaxe; without it they now time out. The trade is
+    // that a break the server refuses is reported after 5 s instead of 20.
+    public int maxBreakTicks = 100;
 
     // Phase timeouts
     public int navigateTimeout = 200;

@@ -3,9 +3,11 @@ package net.stracciatella.bot.mixin;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
+import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundDamageEventPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.sounds.SoundEvents;
+import net.stracciatella.bot.interaction.BlockWireTrace;
 import net.stracciatella.bot.interaction.ServerBlockSync;
 import net.stracciatella.bot.safety.BotAlarm;
 import org.spongepowered.asm.mixin.Mixin;
@@ -64,5 +66,19 @@ public class ClientPacketListenerMixin {
     private void stracciatella$onBlockChangedAck(ClientboundBlockChangedAckPacket packet,
                                                  CallbackInfo ci) {
         ServerBlockSync.onAck(packet.sequence());
+        BlockWireTrace.onAck(packet.sequence());
+    }
+
+    /**
+     * TEMPORARY (multiplayer break investigation, remove with the fix). The
+     * server sending a block back is how it says no — the refusal path of
+     * {@code ServerPlayerGameMode} answers a rejected break with the block's
+     * real state and nothing else. Logging it next to the outgoing actions is
+     * what separates "the server refused" from "the server never answered".
+     */
+    @Inject(at = @At("TAIL"), method = "handleBlockUpdate")
+    private void stracciatella$onBlockUpdate(ClientboundBlockUpdatePacket packet,
+                                             CallbackInfo ci) {
+        BlockWireTrace.onBlockUpdate(packet.getPos(), packet.getBlockState());
     }
 }
