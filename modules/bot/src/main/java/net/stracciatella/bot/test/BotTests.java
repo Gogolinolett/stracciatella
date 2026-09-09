@@ -664,6 +664,163 @@ public class BotTests {
         LOGGER.info("Out-of-reach failure test passed");
     }
 
+    // ================================================================
+    // Test 16: POSITIONING must not walk into a hole to reach a support
+    // ================================================================
+    /**
+     * A placement whose support block sits on the far side of a cavity. The
+     * chunk miner produces exactly this over a cave: the cell it wants to
+     * floor has lost every neighbour except the far rim, so
+     * {@link PlaceBlockTask#findSupport} can only return that rim — and at
+     * 5.4 blocks from the eye it lands in the window where
+     * {@code startNextTask} skips pathfinding and hands the walk to
+     * POSITIONING, which drives {@code keyUp} directly. The camera is aimed
+     * at a block below the bot's feet, the walk follows the gaze, and the
+     * hole is on the way.
+     *
+     * <p>The task is expected to fail: the support is out of reach, and
+     * bridging reaches one block, not a cavity. What must not happen is the
+     * bot arriving at the bottom of it. This is the walk that keeps the plain
+     * refusal — no crouch, because creeping at a third speed cannot close
+     * five blocks either, and the position timeout is then the honest answer.
+     * The crouch is for the re-approach, which only has to move the viewpoint.
+     */
+    @MinecraftTest(name = "Bot refuses to walk off a ledge", timeoutTicks = 200, order = -183)
+    public void refusesToWalkOffALedge(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1750, 30, 1000);
+        final BlockPos placePos = origin.offset(4, -1, 0);
+        final BlockPos supportPos = origin.offset(5, -1, 0);
+        final int floorY = origin.getY() - 1;
+        final int caveFloorY = origin.getY() - 5;
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        // The cavity: floor gone two to four blocks east of the bot, four
+        // blocks deep, with a stone bottom so a fall is measurable instead
+        // of endless. The rim at x+5 stays, and is the only sturdy face left
+        // anywhere around placePos.
+        ctx.runCommand("fill " + (origin.getX() + 2) + " " + (caveFloorY + 1) + " " + (origin.getZ() - 3)
+                + " " + (origin.getX() + 4) + " " + floorY + " " + (origin.getZ() + 3) + " air");
+        ctx.runCommand("fill " + (origin.getX() + 2) + " " + caveFloorY + " " + (origin.getZ() - 3)
+                + " " + (origin.getX() + 4) + " " + caveFloorY + " " + (origin.getZ() + 3) + " stone");
+        ctx.runCommand("give @s cobblestone 8");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        BlockPos support = ctx.computeOnClient(
+                mc -> PlaceBlockTask.findSupport(mc.level, placePos, mc.player.getEyePosition()));
+        if (!supportPos.equals(support)) {
+            throw new AssertionError("Fixture broken: expected the far rim " + supportPos.toShortString()
+                    + " as the only support for " + placePos.toShortString() + ", got " + support);
+        }
+
+        final double[] lowestFeetY = { origin.getY() };
+        ctx.runOnClient(mc -> BotController.enqueueTask(new PlaceBlockTask(
+                placePos, supportPos, stack -> stack.is(Items.COBBLESTONE), "cobblestone")));
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.getY());
+            return BotController.getPhase() == BotController.Phase.IDLE;
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+
+        if (lowestFeetY[0] < origin.getY() - 0.5) {
+            throw new AssertionError("Bot walked into the cavity: feet reached y="
+                    + String.format("%.2f", lowestFeetY[0]) + ", stands on y=" + origin.getY());
+        }
+        LOGGER.info("Ledge test passed (feet stayed at y={})", String.format("%.2f", lowestFeetY[0]));
+    }
+
+    // ================================================================
+    // Test 17: bridging — the placement that can only be made from the edge
+    // ================================================================
+    /**
+     * The gap beside the bot has lost every neighbour except the block under
+     * its own feet, so {@link PlaceBlockTask#findSupport} can only return
+     * that one and the face to click is its vertical side. Every ray from an
+     * eye still over the block meets the block's top face first, which is why
+     * this placement used to be unreachable from anywhere: the bot cannot
+     * step back far enough to see a face that its own footing hides.
+     *
+     * <p>What works is what a player does to bridge — crouch, walk out until
+     * the edge of the block underfoot comes into view, place. The crouch is
+     * both halves of it: vanilla will not let a crouched walk leave the block
+     * it stands on, and the point it stops at is roughly a third of a block
+     * past the rim, which is exactly where the side face becomes visible.
+     *
+     * <p>Asserts both halves: the block lands, and the bot is still standing
+     * on the slab when it does.
+     */
+    @MinecraftTest(name = "Bot bridges into a gap", timeoutTicks = 300, order = -182)
+    public void bridgesIntoAGap(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1800, 30, 1000);
+        final BlockPos placePos = origin.offset(1, -1, 0);
+        final BlockPos supportPos = origin.below();
+        final int caveFloorY = origin.getY() - 5;
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        // Everything east of the bot is gone, four blocks deep, so the only
+        // sturdy face anywhere around placePos is the one under its feet.
+        ctx.runCommand("fill " + (origin.getX() + 1) + " " + (caveFloorY + 1) + " "
+                + (origin.getZ() - 3) + " " + (origin.getX() + 5) + " " + (origin.getY() - 1)
+                + " " + (origin.getZ() + 3) + " air");
+        ctx.runCommand("fill " + (origin.getX() + 1) + " " + caveFloorY + " "
+                + (origin.getZ() - 3) + " " + (origin.getX() + 5) + " " + caveFloorY
+                + " " + (origin.getZ() + 3) + " stone");
+        ctx.runCommand("give @s cobblestone 8");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        BlockPos support = ctx.computeOnClient(
+                mc -> PlaceBlockTask.findSupport(mc.level, placePos, mc.player.getEyePosition()));
+        if (!supportPos.equals(support)) {
+            throw new AssertionError("Fixture broken: expected the block underfoot "
+                    + supportPos.toShortString() + " as the only support for "
+                    + placePos.toShortString() + ", got " + support);
+        }
+
+        // Sampled per tick: how far out the bot got, whether it was crouching
+        // while it was out there, and whether it ever left the slab. The
+        // crouch is not decoration — it is what stops the walk at the rim, and
+        // without it the only thing between the bot and the drop is the
+        // arrival check firing in time.
+        final double[] lowestFeetY = { origin.getY() };
+        final double[] furthestX = { origin.getX() + 0.5 };
+        final boolean[] crouchedPastRim = { false };
+        ctx.runOnClient(mc -> BotController.enqueueTask(new PlaceBlockTask(
+                placePos, supportPos, stack -> stack.is(Items.COBBLESTONE), "cobblestone")));
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.getY());
+            furthestX[0] = Math.max(furthestX[0], mc.player.getX());
+            if (mc.player.getX() > origin.getX() + 1.0 && mc.player.isShiftKeyDown()) {
+                crouchedPastRim[0] = true;
+            }
+            return BotController.getPhase() == BotController.Phase.IDLE;
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+        LOGGER.info("Bridge run: furthestX={} crouchedPastRim={} lowestFeetY={}",
+                String.format("%.2f", furthestX[0]), crouchedPastRim[0],
+                String.format("%.2f", lowestFeetY[0]));
+
+        boolean placed = ctx.computeOnClient(
+                mc -> mc.level.getBlockState(placePos).is(Blocks.COBBLESTONE));
+        if (!placed) {
+            throw new AssertionError("Expected cobblestone bridged into "
+                    + placePos.toShortString() + " but found "
+                    + ctx.computeOnClient(mc -> mc.level.getBlockState(placePos).getBlock()));
+        }
+        if (lowestFeetY[0] < origin.getY() - 0.5) {
+            throw new AssertionError("Bot fell while bridging: feet reached y="
+                    + String.format("%.2f", lowestFeetY[0]));
+        }
+        if (!crouchedPastRim[0]) {
+            throw new AssertionError("Bot placed the block without crouching past the rim"
+                    + " (furthest x=" + String.format("%.2f", furthestX[0])
+                    + ", rim at x=" + (origin.getX() + 1) + ") — it stayed up only because"
+                    + " the walk happened to stop in time");
+        }
+        LOGGER.info("Bridge test passed (feet stayed at y={}, crouched out to x={})",
+                String.format("%.2f", lowestFeetY[0]), String.format("%.2f", furthestX[0]));
+    }
+
     // --- Shared helpers ---
 
     /**

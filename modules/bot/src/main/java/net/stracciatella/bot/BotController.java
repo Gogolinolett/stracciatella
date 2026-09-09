@@ -88,6 +88,19 @@ public class BotController {
     private static final double APPROACH_CLOSE_DISTANCE = 2.0;
     private static final int WRONG_HIT_STREAK_TICKS = 8;
 
+    // Bridging: the crouch that lets the bot place a block into the gap it is
+    // standing at the edge of. See updateBridging for when it goes down and,
+    // more importantly, when it comes back up. sneakKeyHeld mirrors what was
+    // last written to the key so the bot only ever touches it on a change —
+    // driving it to false every tick would take crouching away from the
+    // player for as long as the module is loaded.
+    private static boolean bridging = false;
+    private static boolean sneakKeyHeld = false;
+    // How far the eye has to clear the face plane before that face can be
+    // aimed at. A crouch buys about 0.3 blocks of overhang, so this stays
+    // well inside what the step can actually reach.
+    private static final double EDGE_STEP_CLEARANCE = 0.1;
+
     // Opportunistic collection (policy-gated, INTERACTING only). The range is
     // deliberately short: a drop further than this can't be fetched and
     // returned from without the break suffering, and COLLECTING gets it anyway.
@@ -219,6 +232,7 @@ public class BotController {
     public static void stop() {
         BlockInteractor.stopInteraction();
         PathWalker.stop();
+        releaseSneak();
         currentTask = null;
         phase = Phase.IDLE;
         phaseTicks = 0;
@@ -292,12 +306,17 @@ public class BotController {
     }
 
     public static void tick(Minecraft client) {
-        if (paused || phase == Phase.IDLE) {
+        LocalPlayer player = client.player;
+        if (player == null || client.level == null) {
             return;
         }
 
-        LocalPlayer player = client.player;
-        if (player == null || client.level == null) {
+        // Ahead of the phase gate and of the pause gate both: a bot standing
+        // on the lip of a hole has to keep crouching whatever the state
+        // machine is doing, including nothing.
+        updateBridging(client, player);
+
+        if (paused || phase == Phase.IDLE) {
             return;
         }
 
@@ -360,6 +379,18 @@ public class BotController {
             // If we're within a generous distance, try looking anyway
             forceApproach = false;
             if (isWithinReach(player, currentTask.targetPos())) {
+                // Said out loud even though the task lives on. Sixty ticks of
+                // POSITIONING that end where they began is a bot that could
+                // not move — boxed in, or refused by the floor check — and
+                // without this line the phase leaves no trace at all: the run
+                // shows two look timeouts five seconds apart and nothing in
+                // between, which is what hid exactly that.
+                LOGGER.warn("Position timeout in reach: target={} player=({}, {}, {}) los={}",
+                        currentTask.targetPos().toShortString(),
+                        String.format(java.util.Locale.US, "%.2f", player.getX()),
+                        String.format(java.util.Locale.US, "%.2f", player.getY()),
+                        String.format(java.util.Locale.US, "%.2f", player.getZ()),
+                        hasLineOfSight(client, player, currentTask.targetPos()));
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
             } else {
                 // Failure-only diagnostics: without them this message says only
@@ -368,15 +399,21 @@ public class BotController {
                 // what separates "boxed into its own hole" from "path ran out".
                 BlockPos t = currentTask.targetPos();
                 BlockPos feet = player.blockPosition();
+                net.minecraft.core.Direction pinnedFace = currentTask.preferredFace();
+                String pastFace = pinnedFace == null || pinnedFace.getAxis().isVertical()
+                        ? "n/a"
+                        : String.format("%.2f",
+                                pastFacePlane(player.getEyePosition(), t, pinnedFace));
                 LOGGER.warn("Position timeout diagnostics: target={} dist={} player=({}, {}, {})"
-                        + " feet={} under={} head={} onGround={} pathActive={}",
+                        + " feet={} under={} head={} onGround={} pathActive={}"
+                        + " crouched={} pastFace={}",
                         t.toShortString(), String.format("%.2f", Math.sqrt(
                                 player.distanceToSqr(Vec3.atCenterOf(t)))),
                         String.format("%.2f", player.getX()), String.format("%.2f", player.getY()),
                         String.format("%.2f", player.getZ()), feet.toShortString(),
                         client.level.getBlockState(feet.below()),
                         client.level.getBlockState(feet.above()), player.onGround(),
-                        PathWalker.isActive());
+                        PathWalker.isActive(), bridging, pastFace);
                 failCurrentTask("Could not get within reach of target");
             }
             return;
@@ -392,10 +429,20 @@ public class BotController {
         // and hidden behind a corner — it arrives before it has moved, which is
         // the whole failure this replaces.
         BlockPos approaching = currentTask.targetPos();
-        boolean arrived = forceApproach && policy.approachOccluded()
-                ? hasLineOfSight(client, player, approaching)
-                : distanceToTarget(player, approaching)
-                        <= (forceApproach ? APPROACH_CLOSE_DISTANCE : CONFIG.reachDistance);
+        boolean arrived;
+        if (needsEdgeStep(player, currentTask)) {
+            // Still owed the step out to the rim: the edge of the block
+            // underfoot is not in sight yet, and nothing else about the
+            // position matters until it is. Asked first because the other two
+            // rules both say "arrived" here — the support is in reach, and the
+            // sight line to its centre was never blocked; only its face is.
+            arrived = false;
+        } else if (forceApproach && policy.approachOccluded()) {
+            arrived = hasLineOfSight(client, player, approaching);
+        } else {
+            arrived = distanceToTarget(player, approaching)
+                    <= (forceApproach ? APPROACH_CLOSE_DISTANCE : CONFIG.reachDistance);
+        }
         if (arrived) {
             forceApproach = false;
             scheduleAction(() -> transitionTo(Phase.LOOKING));
@@ -416,7 +463,47 @@ public class BotController {
         // a human closes the last few blocks watching the thing they're
         // about to mine, instead of strafing over with a hard-snapped view.
         BlockPos target = currentTask.targetPos();
-        aimCameraAt(player, target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5);
+        // A placement is aimed at the face it builds off, not at the block
+        // centre, and on an edge step the two point opposite ways: the support
+        // is the block underfoot, so its centre sits behind the eye and the
+        // walk would set off backwards. LOOKING aims at the face already —
+        // POSITIONING aiming anywhere else means the walk and the look
+        // disagree about where the work is.
+        net.minecraft.core.Direction pinned = currentTask.preferredFace();
+        double faceX = pinned != null ? pinned.getStepX() * 0.5 : 0.0;
+        double faceY = pinned != null ? pinned.getStepY() * 0.5 : 0.0;
+        double faceZ = pinned != null ? pinned.getStepZ() * 0.5 : 0.0;
+        aimCameraAt(player, target.getX() + 0.5 + faceX, target.getY() + 0.5 + faceY,
+                target.getZ() + 0.5 + faceZ);
+        // The same raw-key walk COLLECTING runs, and the same hazard: a target
+        // below the bot's feet aims the camera down into a hole and the walk
+        // follows it straight in. That is how the chunk miner walked into the
+        // very hole it had opened in order to fill it.
+        //
+        // COLLECTING answers that by refusing the step, and POSITIONING must
+        // not: it is walking because a sight line has to be cleared or a
+        // target reached, and standing still fails the task outright. Refusing
+        // it cost a real run — the bot sat out sixty ticks of an occluded
+        // approach at the exact position it started, because the gaze pointed
+        // across the hole even though the only movement available was a slide
+        // east along a wall onto solid ground.
+        //
+        // So a re-approach crouches instead, which is what a person does at an
+        // edge they still have to work near. Vanilla clips a crouched walk to
+        // positions that still have support under the bounding box, so the bot
+        // gets as far as it safely can and no further — and that is further
+        // than a refusal, far enough for its eye to clear the rim.
+        //
+        // Only a re-approach. A walk that is merely out of reach is trying to
+        // close four blocks, which no amount of creeping at a third speed will
+        // do: there the refusal is right and the position timeout is the
+        // honest answer. The crouch is for the walk that only has to move the
+        // viewpoint, and updateBridging raises it on the tick after the walk
+        // asks, so one tick of standing still is the whole cost.
+        if (!bridging && !hasFloorAhead(client, player)) {
+            releaseMovementKeys();
+            return;
+        }
         client.options.keyUp.setDown(true);
     }
 
@@ -441,11 +528,13 @@ public class BotController {
             String hit = hr instanceof BlockHitResult bhr
                     ? bhr.getBlockPos().toShortString() + " (" + bhr.getDirection() + ")"
                     : String.valueOf(hr == null ? null : hr.getType());
-            LOGGER.warn("Look timeout diagnostics: target={} face={} player=({}, {}, {}) hitResult={}",
+            LOGGER.warn("Look timeout diagnostics: target={} face={} player=({}, {}, {})"
+                    + " hitResult={} approached={} los={}",
                     t.toShortString(), face,
                     String.format(java.util.Locale.US, "%.2f", player.getX()),
                     String.format(java.util.Locale.US, "%.2f", player.getY()),
-                    String.format(java.util.Locale.US, "%.2f", player.getZ()), hit);
+                    String.format(java.util.Locale.US, "%.2f", player.getZ()), hit,
+                    lookRetryUsed, hasLineOfSight(client, player, t));
             failCurrentTask("Look timeout — could not aim at target");
             return;
         }
@@ -1077,6 +1166,100 @@ public class BotController {
         return false;
     }
 
+    /**
+     * Whether the next step in the direction the bot is facing has ground
+     * under it. Both of the raw-key walks move in view direction — COLLECTING
+     * chasing a drop, POSITIONING closing on a target — so both ask this
+     * before pressing forward.
+     */
+    private static boolean hasFloorAhead(Minecraft client, LocalPlayer player) {
+        double yawRad = Math.toRadians(player.getYRot());
+        BlockPos ahead = BlockPos.containing(
+                player.getX() - Math.sin(yawRad) * STEP_LOOKAHEAD,
+                player.getY(),
+                player.getZ() + Math.cos(yawRad) * STEP_LOOKAHEAD);
+        return hasFloorWithinOneBlock(client.level, ahead);
+    }
+
+    /**
+     * Hold or release the crouch. Two questions with different answers: it
+     * goes down as soon as a task needs to step to an edge, and it comes back
+     * up only once the bot has ground under it again — not when the task
+     * ends. Standing on the lip of the hole it was trying to fill, a released
+     * crouch plus the last of the walk's momentum is precisely the fall the
+     * crouch was there to prevent, so a failed placement keeps it.
+     */
+    private static void updateBridging(Minecraft client, LocalPlayer player) {
+        boolean wanted = currentTask != null
+                && (needsEdgeStep(player, currentTask)
+                        || (phase == Phase.POSITIONING && forceApproach
+                                && !hasFloorAhead(client, player)));
+        if (wanted) {
+            bridging = true;
+        } else if (bridging && hasFloorWithinOneBlock(client.level, player.blockPosition())) {
+            bridging = false;
+        }
+        if (client.options != null && bridging != sneakKeyHeld) {
+            client.options.keyShift.setDown(bridging);
+            sneakKeyHeld = bridging;
+        }
+    }
+
+    /** Let go of the crouch, wherever the run ended. */
+    private static void releaseSneak() {
+        bridging = false;
+        Minecraft client = Minecraft.getInstance();
+        if (client.options != null && sneakKeyHeld) {
+            client.options.keyShift.setDown(false);
+            sneakKeyHeld = false;
+        }
+    }
+
+    /**
+     * Whether the task's support face is one the bot can only see by stepping
+     * to the very edge of what it stands on. A block is placed on the side of
+     * an existing block, and when that side is vertical and below the eye,
+     * every ray from an eye still horizontally over the block meets the
+     * block's <em>top</em> face first — so no amount of aiming produces the
+     * side face and LOOKING can only run out its timeout. The move that does
+     * work is the one a player bridges with: crouch, walk out until the edge
+     * of the block underfoot comes into view, place. This says whether that
+     * walk is still owed, and once the step is done it says no, which is how
+     * POSITIONING knows it has arrived.
+     *
+     * <p>Only for a support already in reach. Further out the ordinary walk
+     * has to happen first, at walking speed and with its own floor check — a
+     * crouch creeping across five blocks is a position timeout, not an
+     * approach.
+     */
+    private static boolean needsEdgeStep(LocalPlayer player, BotTask task) {
+        net.minecraft.core.Direction face = task.preferredFace();
+        if (face == null || face.getAxis().isVertical()) {
+            return false;
+        }
+        BlockPos support = task.targetPos();
+        Vec3 eye = player.getEyePosition();
+        if (eye.y <= support.getY() + 1.0 || !isWithinReach(player, support)) {
+            return false;
+        }
+        return pastFacePlane(eye, support, face) < EDGE_STEP_CLEARANCE;
+    }
+
+    /**
+     * How far the eye sits past the plane of {@code face}, measured on that
+     * face's own axis and signed so positive always means "on the side the
+     * new block goes", whichever way the face points.
+     */
+    private static double pastFacePlane(Vec3 eye, BlockPos support,
+                                        net.minecraft.core.Direction face) {
+        if (face.getAxis() == net.minecraft.core.Direction.Axis.X) {
+            return (eye.x - (support.getX() + (face.getStepX() > 0 ? 1.0 : 0.0)))
+                    * face.getStepX();
+        }
+        return (eye.z - (support.getZ() + (face.getStepZ() > 0 ? 1.0 : 0.0)))
+                * face.getStepZ();
+    }
+
     private static void tickCollecting() {
         Minecraft client = Minecraft.getInstance();
         LocalPlayer player = client.player;
@@ -1342,12 +1525,7 @@ public class BotController {
         // collect window and the single-block test timed out. One block down
         // is a normal step and stays allowed; deeper is the hole, and a drop
         // down there is worth less than the run.
-        double yawRad = Math.toRadians(player.getYRot());
-        BlockPos ahead = BlockPos.containing(
-                player.getX() - Math.sin(yawRad) * STEP_LOOKAHEAD,
-                player.getY(),
-                player.getZ() + Math.cos(yawRad) * STEP_LOOKAHEAD);
-        if (!hasFloorWithinOneBlock(client.level, ahead)) {
+        if (!hasFloorAhead(client, player)) {
             releaseMovementKeys();
             return;
         }
@@ -1406,7 +1584,10 @@ public class BotController {
     private static void beginNavigation(LocalPlayer player) {
         BlockPos target = currentTask.targetPos();
 
-        if (isWithinReach(player, target)) {
+        // In reach is not the same as aimable. A face that only opens up from
+        // past the edge needs the crouch-step first, and until that has
+        // happened LOOKING has nothing to do but time out.
+        if (isWithinReach(player, target) && !needsEdgeStep(player, currentTask)) {
             transitionTo(Phase.LOOKING);
             return;
         }
@@ -1550,8 +1731,9 @@ public class BotController {
 
         BlockPos target = currentTask.targetPos();
 
-        // Already within reach — skip navigation
-        if (isWithinReach(player, target)) {
+        // Already within reach — skip navigation. In reach is not the same as
+        // aimable, though: see beginNavigation.
+        if (isWithinReach(player, target) && !needsEdgeStep(player, currentTask)) {
             transitionTo(Phase.LOOKING);
             return;
         }

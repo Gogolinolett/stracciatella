@@ -26,7 +26,6 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
-import net.minecraft.world.phys.Vec3;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorStatus;
@@ -66,6 +65,14 @@ public class ChunkMinerBehavior implements BotBehavior {
     private static final int MAX_SEALABLE_SOURCES = 5;
     /** Deepest drop the bot is allowed to open under its own feet. */
     private static final int MAX_SAFE_DROP = 2;
+    /**
+     * How many cells of the way to a column one call may walk. The line the
+     * bot walks without pathfinding is at most {@code reachDistance + 2.5}
+     * long, and a diagonal costs two grid steps per block of it, so this is
+     * the whole of that with room to spare; the cap is there to bound a case
+     * nobody has thought of, not to shape this one.
+     */
+    private static final int MAX_BRIDGE_STEPS = 12;
     /** Ticks to wait for the bot to fall into an opened cell before giving up. */
     private static final int MAX_DROP_WAIT_TICKS = 100;
 
@@ -95,10 +102,11 @@ public class ChunkMinerBehavior implements BotBehavior {
     // forever, because the hole it was meant to fill is still a hole.
     private BlockPos pendingPlacement;
     private String placementWhat = "";
-    // Column whose liquid was still walled in when the column was planned. The
-    // seal is due as soon as the column itself is open — see
-    // handleLiquidsAround.
-    private BlockPos sealAfterOpening;
+    // Column whose groundwork had nothing to be clicked from while the column
+    // itself was still standing: a liquid walled in behind it (see
+    // handleLiquidsAround), the floor cell under it, or both. Due as soon as
+    // the column is open, through the opening it leaves.
+    private BlockPos groundworkAfterOpening;
     private int stepRetries;
     private int breatherTicks;
 
@@ -162,7 +170,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         plannedBlocks.clear();
         batchQueue.clear();
         pendingPlacement = null;
-        sealAfterOpening = null;
+        groundworkAfterOpening = null;
         stepRetries = 0;
         breatherTicks = 0;
         blocksMined = 0;
@@ -274,7 +282,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
 
         if (!plannedBlocks.isEmpty()) {
-            BehaviorStatus verified = verifyPlannedBlocks(level);
+            BehaviorStatus verified = verifyPlannedBlocks(player, level);
             if (verified != null) {
                 return verified;
             }
@@ -419,17 +427,23 @@ public class ChunkMinerBehavior implements BotBehavior {
      * block two columns ahead that the near column still hides.
      */
     private BehaviorStatus tickClear(LocalPlayer player, Level level) {
-        // A liquid that was walled in when its column was planned is sealed
-        // now, through the opening that column left: that opening is the only
-        // line of sight there ever is to it. Not while a batch is still
-        // running, for the same reason the groundwork below waits — a
-        // placement takes the plan with it.
-        if (sealAfterOpening != null && plannedBlocks.isEmpty()) {
-            BehaviorStatus pending = handleLiquidsAround(player, level, sealAfterOpening);
+        // Groundwork that had nowhere to be clicked from while the column
+        // stood is done now, through the opening that column left: a liquid
+        // that was walled in when the column was planned, and the floor cell
+        // under the column itself — that opening is the only line of sight
+        // there ever is to either. Not while a batch is still running, for the
+        // same reason the groundwork below waits — a placement takes the plan
+        // with it.
+        if (groundworkAfterOpening != null && plannedBlocks.isEmpty()) {
+            BehaviorStatus pending = handleLiquidsAround(player, level, groundworkAfterOpening);
             if (pending != null) {
                 return pending;
             }
-            sealAfterOpening = null;
+            BehaviorStatus footing = ensureFloor(player, level, groundworkAfterOpening.below());
+            if (footing != null) {
+                return footing;
+            }
+            groundworkAfterOpening = null;
         }
         BlockPos column = nextColumn(player, level);
         if (column == null) {
@@ -441,8 +455,12 @@ public class ChunkMinerBehavior implements BotBehavior {
         // batch still has a block under the pick: that block would drop out of
         // the plan while the controller keeps mining it, and nothing would ever
         // see it finish. Wait the one block out — the seam is worth skipping
-        // where a cap, a dam or a floor is due anyway.
-        if (!plannedBlocks.isEmpty() && !needsNoGroundwork(level, column)) {
+        // where a cap, a dam or a floor is due anyway. Groundwork already owed
+        // on the column just opened holds the sweep the same way: planning past
+        // it would take the bot on over a hole that is not filled until the
+        // batch has drained.
+        if (!plannedBlocks.isEmpty()
+                && (groundworkAfterOpening != null || !needsNoGroundwork(level, column))) {
             return BehaviorStatus.RUNNING;
         }
         // Planning mid-break reaches no further than the pickup box either.
@@ -456,18 +474,34 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (!plannedBlocks.isEmpty() && !withinChainDistance(player, column)) {
             return BehaviorStatus.RUNNING;
         }
+        // Access before work. A column out of reach means a walk, and a walk
+        // over a gap is a step the controller refuses — the task then dies on
+        // the position timeout without the bot having moved. Reached only
+        // while no batch is running, which is already true here: out of reach
+        // is well past CHAIN_DISTANCE, so the guard above has returned.
+        BehaviorStatus step = ensureStepToward(player, level, column);
+        if (step != null) {
+            return step;
+        }
         BehaviorStatus liquid = handleLiquidsAround(player, level, column);
         if (liquid != null) {
             return liquid;
-        }
-        BehaviorStatus footing = ensureFloor(player, level, column.below());
-        if (footing != null) {
-            return footing;
         }
         List<BlockPos> blocks = new ArrayList<>();
         addColumn(level, column, blocks);
         if (blocks.isEmpty()) {
             return BehaviorStatus.RUNNING;
+        }
+        // A hole under the column is noted here and filled once the column is
+        // out of the way, never before: the column is the roof over that cell,
+        // so nowhere the bot can stand has a line to any face of it, and
+        // findSupport hands back the column's own underside — a face a ray
+        // from the side never meets, it lands on the wall instead. Three look
+        // timeouts later the run died on a hole it could not see. Mining first
+        // is what a person does, for the same reason: the hole is not there to
+        // be filled until the block above it is gone.
+        if (isPassable(level.getBlockState(column.below()))) {
+            groundworkAfterOpening = column;
         }
         // Keep the queue stocked past the end of this column. The controller
         // only skips the collect-and-replan round when another task is already
@@ -479,16 +513,20 @@ public class ChunkMinerBehavior implements BotBehavior {
         // keeps its ten-tick pickup delay whether the bot stands over it or
         // mines on, and vanilla's pickup box takes it on the way past.
         //
-        // Only columns needing no groundwork are chained: a cap, a dam or a
-        // floor placement has to happen before the cell in front of it opens,
-        // and batching one in would run it out of order.
-        List<BlockPos> columns = slabColumns(slabFeetY);
-        for (int i = columns.indexOf(column) + 1; i > 0 && i < columns.size(); i++) {
-            BlockPos next = columns.get(i);
-            if (!withinChainDistance(player, next) || !needsNoGroundwork(level, next)) {
-                break;
+        // Only columns needing no groundwork are chained: a cap or a dam has to
+        // happen before the cell in front of it opens, and batching one in
+        // would run it out of order. The column just planned counts too — with
+        // its own floor still owed, a chain would carry the sweep on over a
+        // hole that is not filled until the batch has drained.
+        if (groundworkAfterOpening == null) {
+            List<BlockPos> columns = slabColumns(slabFeetY);
+            for (int i = columns.indexOf(column) + 1; i > 0 && i < columns.size(); i++) {
+                BlockPos next = columns.get(i);
+                if (!withinChainDistance(player, next) || !needsNoGroundwork(level, next)) {
+                    break;
+                }
+                addColumn(level, next, blocks);
             }
-            addColumn(level, next, blocks);
         }
         plan(blocks);
         breatherTicks = HumanBehavior.randomBreatherTicks(BotController.CONFIG);
@@ -691,6 +729,119 @@ public class ChunkMinerBehavior implements BotBehavior {
         return ensureFloor(player, level, pos.below());
     }
 
+    /**
+     * Bridge the way to a column the bot cannot reach from where it stands.
+     *
+     * <p>Every column is worked from the cell beside it, whether the walk
+     * there is one step or five, and that walk is the one thing the slab's
+     * own floor does not guarantee. POSITIONING refuses a
+     * step over a cell with nothing under it, which is right and is what keeps
+     * the bot out of caves, but the refusal leaves the task to die on the
+     * position timeout, and the run ends with {@code cannot break} at a column
+     * the bot never got near. Reported from a real world at y=92..93: two
+     * columns mined from 3.6 and 3.8 blocks away, the next one at 4.77, and
+     * the bot sat on the same spot through six tasks without moving a
+     * millimetre ({@code pathActive=false crouched=false under=stone}).
+     *
+     * <p>So fill the gap the way a player bridges: one cell into it, step on,
+     * ask again. Nothing has to remember a route — the sweep re-reads the
+     * world every tick. The support {@code findSupport} hands back is the
+     * floor block beside the gap, whose face is horizontal and below the eye,
+     * and that is the placement only the edge step in {@code BotController}
+     * can reach: this is the miner's half of the bridging technique.
+     *
+     * <p>Sampled along the line the bot will actually walk, and only up to the
+     * cell beside the column — the one under it belongs to
+     * {@code groundworkAfterOpening} and must wait until the column is out of
+     * the way; filling it from here would be exactly the ordering bug that
+     * case exists to prevent.
+     */
+    private BehaviorStatus ensureStepToward(LocalPlayer player, Level level, BlockPos column) {
+        BlockPos feet = player.blockPosition();
+        if (feet.getY() != slabFeetY) {
+            return null;
+        }
+        // The cells the bot will cross, in the order it crosses them. Neither
+        // walk that gets it there pathfinds: POSITIONING and COLLECTING both
+        // hold the walk key in view direction, so the way to a column is the
+        // straight line to it and nothing else. Sampling an L instead — the
+        // whole of one axis, then the other — asks about cells round the
+        // outside of that line and never about the diagonal ones on it. From a
+        // real world: `retrying -29, 93, -61 — nothing to mend on the way
+        // there`, the L's row solid the whole way, and the bot standing still
+        // in front of -26, 91, -62, which is open and on the line.
+        //
+        // A grid traversal gives both halves of what this needs. It visits
+        // every cell the line passes through, and it still advances one axis
+        // at a time, so each cell is orthogonally next to the last one and a
+        // placement always has a face to build against.
+        double x = player.getX();
+        double z = player.getZ();
+        double dirX = (column.getX() + 0.5) - x;
+        double dirZ = (column.getZ() + 0.5) - z;
+        double invX = Math.abs(dirX) < 1.0E-6 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dirX);
+        double invZ = Math.abs(dirZ) < 1.0E-6 ? Double.POSITIVE_INFINITY : 1.0 / Math.abs(dirZ);
+        int stepX = dirX >= 0 ? 1 : -1;
+        int stepZ = dirZ >= 0 ? 1 : -1;
+        int cx = feet.getX();
+        int cz = feet.getZ();
+        // Guarded rather than multiplied out: a bot standing exactly on a grid
+        // line with no travel along that axis gives infinity times zero, and
+        // NaN loses every comparison, which would pick the wrong axis.
+        double nextX = invX == Double.POSITIVE_INFINITY ? Double.POSITIVE_INFINITY
+                : invX * (stepX > 0 ? cx + 1 - x : x - cx);
+        double nextZ = invZ == Double.POSITIVE_INFINITY ? Double.POSITIVE_INFINITY
+                : invZ * (stepZ > 0 ? cz + 1 - z : z - cz);
+        BlockPos footing = feet.below();
+        for (int laid = 0; laid < MAX_BRIDGE_STEPS; laid++) {
+            // Beside the column is the end of the way, not within reach of it.
+            // Reach is what the break needs; what falls out of the break needs
+            // a bot that can walk to where it lands, and COLLECTING has no
+            // pathfinder to go round with — it walks this same line and stops
+            // where the line stops. Stopping at reach let the bot mine a whole
+            // face from one cell of bridge and then abandon every drop of it
+            // on the far side of the gap it had just declined to fill.
+            if (Math.abs(column.getX() - cx) + Math.abs(column.getZ() - cz) <= 1) {
+                return null;
+            }
+            if (nextX <= nextZ) {
+                nextX += invX;
+                cx += stepX;
+            } else {
+                nextZ += invZ;
+                cz += stepZ;
+            }
+            BlockPos floor = new BlockPos(cx, slabFeetY - 1, cz);
+            if (!isSturdyFloor(level, floor)) {
+                if (!isPassable(level.getBlockState(floor))
+                        || !chunk.equals(new ChunkPos(floor))
+                        || !isSturdyFloor(level, footing)) {
+                    // Nothing to build, or nothing to build it from, or it is
+                    // off the chunk. The task fails on the position timeout
+                    // exactly as it did before this existed.
+                    return null;
+                }
+                LOGGER.info("Chunk miner: bridging the floor at {}", shortPos(floor));
+                return planPlacement(floor, footing, "floor");
+            }
+            footing = floor;
+        }
+        return null;
+    }
+
+    /** Something the bot can stand on top of — the slab's own floor, or a
+     * block just laid to extend it. Deliberately not the controller's
+     * {@code hasFloorWithinOneBlock}: that one tolerates a drop of a block,
+     * because it is answering whether a step is survivable, and a step down is.
+     * The sweep is answering something else — whether a cell is the floor it
+     * is working from — and only the slab's own level is. Borrowing the
+     * controller's answer let the bot walk down into a one-block dip, out of
+     * line with every column behind it, and place its next block beside its
+     * own head. */
+    private static boolean isSturdyFloor(Level level, BlockPos pos) {
+        return level.getBlockState(pos).isFaceSturdy(level, pos, Direction.UP);
+    }
+
     /** Put a block at {@code pos} if nothing solid is there to stand on. */
     private BehaviorStatus ensureFloor(LocalPlayer player, Level level, BlockPos pos) {
         if (!isPassable(level.getBlockState(pos))) {
@@ -699,6 +850,12 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (!chunk.equals(new ChunkPos(pos))) {
             return fail("no floor at " + shortPos(pos) + ", which is outside the chunk");
         }
+        // Said out loud, the way capping and damming are. A hole is the one
+        // thing the sweep meets that moves the bot somewhere it did not plan
+        // to go, and without this line a run that ends up in one leaves no
+        // trace of whether the fill was even reached: the placement itself is
+        // silent unless it fails.
+        LOGGER.info("Chunk miner: filling the floor at {}", shortPos(pos));
         return planPlacement(player, level, pos, "floor");
     }
 
@@ -757,7 +914,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         // costs health and the run, so stopping while it is still walled off
         // is the better answer.
         if (!lava && !touchesOpenSpace(level, body)) {
-            sealAfterOpening = column;
+            groundworkAfterOpening = column;
             return null;
         }
         List<BlockPos> sources = new ArrayList<>();
@@ -858,6 +1015,23 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (support == null) {
             return fail("nothing to build the " + what + " at " + shortPos(pos) + " against");
         }
+        return planPlacement(pos, support, what);
+    }
+
+    /**
+     * The same, against a support the caller has already chosen.
+     *
+     * <p>Bridging needs this. {@code findSupport} ranks the faces of a cell by
+     * how squarely each one faces the eye, which is the right question for a
+     * block the bot is looking at and the wrong one for a block it is standing
+     * next to: across a gap it picked the neighbour on the <i>far</i> side and
+     * left the bot to walk round to a face it could see — into the hole it
+     * was supposed to be bridging over ({@code filling the floor at -24, 91,
+     * -61} against {@code -24, 91, -60}, reported from a real world). A bridge
+     * is built from the block underfoot outward, never from the far rim, and
+     * that is not a preference the ranking can express.
+     */
+    private BehaviorStatus planPlacement(BlockPos pos, BlockPos support, String what) {
         BotController.enqueueTask(new PlaceBlockTask(pos, support, fillerPredicate(), "filler"));
         pendingPlacement = pos;
         placementWhat = what;
@@ -913,7 +1087,7 @@ public class ChunkMinerBehavior implements BotBehavior {
      * Returns null when verification is resolved ({@code plannedBlocks}
      * reflects the outcome), or a terminal status.
      */
-    private BehaviorStatus verifyPlannedBlocks(Level level) {
+    private BehaviorStatus verifyPlannedBlocks(LocalPlayer player, Level level) {
         // The position the controller has under the pick right now has not
         // failed to break — it has not finished being tried. Planning runs
         // during INTERACTING to keep the queue stocked, so verify sees that
@@ -960,6 +1134,30 @@ public class ChunkMinerBehavior implements BotBehavior {
             stepRetries++;
             plannedBlocks.clear();
             plannedBlocks.addAll(remaining);
+            // The block is still standing and the bot has just failed to get
+            // to it. That failure is worth more than the guess that preceded
+            // it: ensureStepToward runs once, on the tick the column is
+            // planned, and has to predict a walk that has not happened yet —
+            // from a position the bot may still be settling into. Here the
+            // prediction is over. The bot is where the attempt left it, at
+            // rest and on the ground, and the same question asked from there
+            // is answered against the world as it really is.
+            //
+            // Without this the retry re-queues a task that has just proven
+            // itself impossible, twice more, and the run then dies on a hole
+            // nobody looked at: six position timeouts at one unchanging spot
+            // and `cannot break -27, 93, -61 (blocks mined: 0)`, reported
+            // from a real world where the way west was missing its floor.
+            BlockPos owed = remaining.get(0);
+            BehaviorStatus step = ensureStepToward(player, level,
+                    new BlockPos(owed.getX(), slabFeetY, owed.getZ()));
+            if (step != null) {
+                // A placement takes the plan with it; the column is still
+                // standing, so the sweep finds it again once the ground is in.
+                return step;
+            }
+            LOGGER.info("Chunk miner: retrying {} — nothing to mend on the way there",
+                    shortPos(owed));
             enqueue(remaining);
             return null;
         }

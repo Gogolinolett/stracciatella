@@ -28,8 +28,19 @@ import org.slf4j.LoggerFactory;
  * <p>Liquids are always placed on the bot's own side of the block being
  * mined. Sealing one means clicking the face of its neighbour *through* the
  * liquid cell, so anything standing between the bot and that face blocks the
- * aim — which in a real corridor never happens, because the corridor is
- * cleared towards the bot one column at a time.
+ * aim — which for a liquid never happens, because the corridor is cleared
+ * towards the bot one column at a time.
+ *
+ * <p>That is a statement about the <em>mining</em> order, and it was read for
+ * a long time as a statement about the chunk. It is not, and a sparse chunk
+ * hides the difference: with nothing standing anywhere, no fixture here can
+ * put a block between the bot and a face it has to click. A <b>floor fill</b>
+ * is where the difference bites, because its support is chosen by
+ * {@code findSupport} and not by the serpentine — so it can be two cells away
+ * on a diagonal, with a column the sweep has not reached yet in the line.
+ * {@link #fillsAHoleInASolidSlab} is the one dense fixture in this file and
+ * exists for that; when adding a test about aiming, ask whether it needs to
+ * be dense before reaching for {@code prepare}.
  */
 @TestSuite(name = "Chunk Miner Tests")
 public class ChunkMinerTests {
@@ -509,6 +520,135 @@ public class ChunkMinerTests {
         LOGGER.info("Chunk miner border dam test passed");
     }
 
+    // ================================================================
+    // Test 12: the floor under the next column is missing
+    // ================================================================
+
+    /**
+     * A hole under the column ahead. The fill cannot go in before that column
+     * comes out — the column is the roof over the hole, so nowhere the bot can
+     * stand has a line to any face of it, and findSupport hands back the
+     * column's own underside, which a ray from the side never meets. A run
+     * that tried died on three look timeouts with 718 blocks behind it.
+     *
+     * <p>The hole is three cells deep, because two is a depth the bot is
+     * *allowed* to enter: {@code hasFloorWithinOneBlock} tolerates a one-block
+     * drop, which is a step and not a fall. Its floor is the fixture's own
+     * block, so nothing under the cleared band matters.
+     *
+     * <p>The column sits three over rather than next to the bot, so the run
+     * has to cover the distance the way a real one does: at 3.0 blocks the
+     * column itself is inside {@code reachDistance} 4.0 and is mined without a
+     * step, and what closes the remaining gap is the collect walk going after
+     * the drops that fell into the hole.
+     *
+     * <p>The feet check is the second assertion, and it is a guard rather than
+     * a reproduction. <b>It does not fail on the pre-fix code.</b> Measured:
+     * with the POSITIONING ledge check removed the bot still stops at the rim,
+     * because COLLECTING refuses the step first and the placement is in reach
+     * from there ({@code place 3019, 39, 3015 ... dist=2,87}) — so POSITIONING
+     * never runs in this geometry, at one cell of depth or at three. The fall
+     * this was written for happened in a real world against a cave, and no
+     * single-cell fixture reproduced it. What the assertion is worth is the
+     * other direction: it fails the moment anything lets the bot into the hole
+     * it is about to fill, which is the cell it then cannot place into.
+     */
+    @MinecraftTest(name = "Chunk miner fills a hole under the next column",
+            timeoutTicks = 2000, order = 22)
+    public void fillsHoleUnderNextColumn(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        final BlockPos over = stand.offset(3, 0, 0);
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        setBlock(ctx, over.below(4), "stone");
+        fill(ctx, STAND_DX + 3, Y - 3, STAND_DZ, STAND_DX + 3, Y - 1, STAND_DZ, "air");
+        ctx.waitFor(mc -> mc.level.getBlockState(over.below()).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertAir(ctx, over, "the column over the hole");
+        assertAir(ctx, over.above(), "the head block of the column over the hole");
+        assertNotAir(ctx, over.below(), "the floor under the column over the hole");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot went into the hole instead of filling it from the rim:"
+                    + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
+        }
+        LOGGER.info("Chunk miner hole test passed");
+    }
+
+    // ================================================================
+    // Test 13: a cave under the slab is stopped at, not walked into
+    // ================================================================
+
+    /**
+     * The floor under the column ahead is not a hole but the roof of a cave,
+     * and that is the case the single-cell fixture above does not cover. The
+     * difference is what the cell to fill has to offer as a support: over a
+     * cave every neighbour of it is open except one — the block the bot is
+     * standing on — and that one cannot be aimed at. Its face toward the cell
+     * is vertical, under the bot's own feet, and every ray from an eye above
+     * the rim meets the block's <i>top</i> face first, which the placement
+     * gate rejects because the direction decides where the block would land
+     * ({@code face=east ... hitResult=... (up)} in the log). Three look
+     * timeouts later the run stops with {@code could not place the floor}.
+     *
+     * <p>The stop is all this covers, and it is worth saying what it does
+     * <b>not</b>: the bot does not fall here, with or without the fix, so
+     * this fixture never reproduced the reported fall. The support is right
+     * under the bot, so it is in reach and POSITIONING is never entered —
+     * and the {@code approachOccluded} re-approach cannot enter it either,
+     * because its arrival test is a sight line to the block's <i>centre</i>,
+     * which is clear the whole time; only the face is not. The fall needs a
+     * support the bot has to <i>walk</i> to, which is
+     * {@code Bot refuses to walk off a ledge} in {@code BotTests} — the
+     * defect was in {@code BotController}, so the test that proves it is
+     * there too.
+     *
+     * <p>The run itself is allowed to fail or succeed. Over a cavity wider
+     * than one block it still stops, because the support the fill needs is
+     * then on the far rim and out of reach; where the gap is narrow enough
+     * the controller now bridges it, crouching out past the edge to click the
+     * side face of the block underfoot (see the bot module's <i>Bridging</i>).
+     * Pinning either outcome here would make the other one look like a
+     * regression, so this asserts the only thing that is true of both: the
+     * bot is still on the slab.
+     */
+    @MinecraftTest(name = "Chunk miner stops at a cave instead of walking in",
+            timeoutTicks = 3000, order = 23)
+    public void stopsAtACaveInsteadOfWalkingIn(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        final BlockPos over = stand.offset(2, 0, 0);
+        // Open the floor from the column onward, three cells deep and wide
+        // enough on every side that nothing but the rim block is left to build
+        // against — a hole with a far wall would be the other test's case.
+        fill(ctx, STAND_DX + 2, Y - 3, STAND_DZ - 2, STAND_DX + 4, Y - 1, STAND_DZ + 2, "air");
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.waitFor(mc -> mc.level.getBlockState(over.below()).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, false);
+
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot walked into the cave: feet reached y=" + lowestFeetY[0]
+                    + ", expected to stay at y=" + Y + " and stop at the rim");
+        }
+        LOGGER.info("Chunk miner cave test passed (feet stayed at y={})", lowestFeetY[0]);
+    }
+
     // --- Run quality ---
 
     /** Corridor length for the stall test — long enough for a steady state. */
@@ -930,6 +1070,379 @@ public class ChunkMinerTests {
             }
         }
         return count;
+    }
+
+    // ================================================================
+    // Test 14: a hole under the column the snake reaches diagonally
+    // ================================================================
+
+    /**
+     * Every other fixture in this file is sparse, and that is what let this
+     * through. The serpentine keeps each <em>mining</em> step adjacent, so
+     * nothing stands between the bot and a column it is about to break — but
+     * a floor fill does not get its target from the serpentine. It gets it
+     * from {@code findSupport}, which ranks the neighbours of the hole by how
+     * directly their face is turned toward the eye and therefore picks the
+     * <em>far</em> side of it, two cells out. In a sparse chunk there is
+     * nothing in between. In a real one there is a column the sweep has not
+     * reached yet.
+     *
+     * <p>The layout is taken from the run that reported it, column for column.
+     * The bot stands at chunk-local (14, 2), which is index 46 of the snake;
+     * (15, 2) is the last of that row and holds nothing, so the scan steps
+     * past it to (15, 3) — the first column of the next row and
+     * <em>diagonal</em> to the bot, exactly the case { nextColumn}'s
+     * own notes describe. Opening it exposes the hole under it; the support
+     * for that fill is (15, 4), and the ray to its north face crosses (14, 3),
+     * the column orthogonally beside the bot, which is still standing. The
+     * reported run ended there: {@code could not place the floor}, one block
+     * mined.
+     *
+     * <p>Two blocks deep, not three, so the drop stays inside
+     * {@code MAX_SAFE_DROP} and this exercises {@code ensureFloor} rather than
+     * {@code ensureSafeDrop} — the path the report came down.
+     *
+     * <p>Asserts the run finishes and the hole is closed. <em>How</em> is
+     * deliberately not asserted: walking clear of the neighbour, clicking the
+     * near face instead, and a crouched edge step are all legitimate, and
+     * pinning one would make the others look like regressions.
+     */
+    @MinecraftTest(name = "Chunk miner fills a hole behind a standing neighbour",
+            timeoutTicks = 3000, order = 24)
+    public void fillsAHoleBehindAStandingNeighbour(TestContext ctx) {
+        final int standDx = 14;
+        final int standDz = 2;
+        prepare(ctx, standDx, standDz);
+        final BlockPos hole = new BlockPos(BASE_X + 15, Y - 1, BASE_Z + 3);
+
+        // Solid, which no other fixture here is: the neighbour that ends up in
+        // the line of sight only exists because the chunk is not empty.
+        fill(ctx, 13, Y, 1, 16, Y + 1, 4, "stone");
+        // The bot's own two cells.
+        fill(ctx, standDx, Y, standDz, standDx, Y + 1, standDz, "air");
+        // The column the snake steps past — nothing to dig — which is what
+        // leaves the bot standing diagonally to the one it takes instead.
+        fill(ctx, 15, Y, 2, 15, Y + 1, 2, "air");
+        // The hole under that one, floored two down so the drop is survivable
+        // and the fill is ensureFloor's rather than ensureSafeDrop's.
+        fill(ctx, 15, Y - 2, 3, 15, Y - 1, 3, "air");
+        fill(ctx, 15, Y - 3, 3, 15, Y - 3, 3, "stone");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        awaitChunkMiner(ctx, true);
+
+        boolean filled = ctx.computeOnClient(mc -> !mc.level.getBlockState(hole).isAir());
+        if (!filled) {
+            throw new AssertionError("The floor at " + hole.toShortString()
+                    + " is still open: " + ctx.computeOnClient(
+                            mc -> mc.level.getBlockState(hole).getBlock()));
+        }
+        LOGGER.info("Standing-neighbour test passed (floor at {} closed)", hole.toShortString());
+    }
+
+    // ================================================================
+    // Test 15: a gap on the way to the next column is bridged
+    // ================================================================
+
+    /**
+     * A trench between the bot and the column it has to mine next. Reported
+     * from a real world, slab y=92..93: two columns came out from 3.6 and 3.8
+     * blocks away without the bot taking a step, the next one stood at 4.77,
+     * and the run died with {@code cannot break -27, 93, -61} after six tasks
+     * that each ended where they began — {@code player=(-22.23, 92.00,
+     * -62.00)} in every one of them, {@code pathActive=false crouched=false
+     * under=stone}. Nothing was wrong with the aim or the target. The bot
+     * could not walk there: POSITIONING refuses a step over a cell with
+     * nothing under it, and no one filled that cell.
+     *
+     * <p>The trench is <b>two</b> columns wide, and the width is the point. At
+     * one column the far rim is still a neighbour of the cell to fill, and
+     * {@code findSupport} ranks it above the block underfoot — the fill then
+     * happens as an ordinary placement across the gap and proves nothing about
+     * bridging. At two, the first cell's only sturdy neighbour is the block
+     * the bot is standing on; its face is horizontal and below the eye, so the
+     * placement can be reached from nowhere except past the rim. That is the
+     * edge step, and it is why {@code crouchedPastRim} is asserted: a run that
+     * closed the trench some other way fails here.
+     *
+     * <p>Five blocks to the column, deliberately. Past {@code reachDistance}
+     * 4.0 so the bot has to walk at all, and inside the 6.5 window where
+     * {@code startNextTask} skips pathfinding, so what walks is the raw-key
+     * POSITIONING step this is about and not the PathWalker.
+     *
+     * <p>Three cells deep, so {@code hasFloorWithinOneBlock} finds nothing
+     * under either cell — one deep is a step down and not a gap — and across
+     * the full width of the floor strip, so there is no way round it.
+     */
+    @MinecraftTest(name = "Chunk miner bridges a gap on its way",
+            timeoutTicks = 3000, order = 25)
+    public void bridgesAGapOnItsWay(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 3, STAND_DX + 6, STAND_DZ - 3, STAND_DZ + 3);
+        final BlockPos over = stand.offset(5, 0, 0);
+        final BlockPos nearGap = stand.offset(1, -1, 0);
+        final BlockPos farGap = stand.offset(2, -1, 0);
+        fill(ctx, STAND_DX + 1, Y - 3, STAND_DZ - 3,
+                STAND_DX + 2, Y - 1, STAND_DZ + 3, "air");
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.waitFor(mc -> mc.level.getBlockState(nearGap).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        final boolean[] crouchedPastRim = {false};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            if (mc.player.getX() > stand.getX() + 1.0 && mc.player.isShiftKeyDown()) {
+                crouchedPastRim[0] = true;
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertNotAir(ctx, nearGap, "the near half of the trench");
+        assertNotAir(ctx, farGap, "the far half of the trench");
+        assertAir(ctx, over, "the column beyond the trench");
+        assertAir(ctx, over.above(), "the head block of the column beyond the trench");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot went into the trench instead of bridging it:"
+                    + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
+        }
+        if (!crouchedPastRim[0]) {
+            throw new AssertionError("The trench was closed without the edge step: the bot"
+                    + " never crouched past x=" + (stand.getX() + 1.0)
+                    + ", so the first cell was not placed from the rim");
+        }
+        LOGGER.info("Chunk miner bridge test passed (feet stayed at y={})", lowestFeetY[0]);
+    }
+
+    // ================================================================
+    // Test 16: a dip on the way is bridged, not stepped down into
+    // ================================================================
+
+    /**
+     * The same walk as above, but the hole is one block deep instead of three
+     * — and that one block is a different bug wearing the same coat.
+     * {@code hasFloorWithinOneBlock} calls a one-block drop a step and not a
+     * fall, quite rightly: the controller is deciding whether a walk is
+     * survivable. So POSITIONING goes down into the dip without complaint, and
+     * the bot is then a level below the slab it is clearing, out of line with
+     * every column behind it, placing its next block beside its own head.
+     * Reported from a real world the first time the sweep was allowed to walk
+     * at all: the bot went into the hole and built above itself.
+     *
+     * <p>The sweep therefore does not borrow the controller's question. It has
+     * its own: is this cell the floor I am working from? Only
+     * {@code slabFeetY - 1} is, and anything lower gets bridged. That is the
+     * whole difference between the two predicates, and it is the reason
+     * {@code isSturdyFloor} exists next to a controller method that looks like
+     * it would have done.
+     *
+     * <p>The dip is floored one block down rather than left open, so the
+     * failure it pins is the step and nothing else — over an open hole the
+     * refusal would have stopped the bot anyway and the test would pass for
+     * the wrong reason.
+     */
+    @MinecraftTest(name = "Chunk miner bridges a dip instead of stepping down",
+            timeoutTicks = 3000, order = 26)
+    public void bridgesADipInsteadOfSteppingDown(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 3, STAND_DX + 6, STAND_DZ - 3, STAND_DZ + 3);
+        final BlockPos over = stand.offset(5, 0, 0);
+        final BlockPos nearDip = stand.offset(1, -1, 0);
+        final BlockPos farDip = stand.offset(2, -1, 0);
+        fill(ctx, STAND_DX + 1, Y - 1, STAND_DZ - 3,
+                STAND_DX + 2, Y - 1, STAND_DZ + 3, "air");
+        fill(ctx, STAND_DX + 1, Y - 2, STAND_DZ - 3,
+                STAND_DX + 2, Y - 2, STAND_DZ + 3, "stone");
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.waitFor(mc -> mc.level.getBlockState(nearDip).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertNotAir(ctx, nearDip, "the near half of the dip");
+        assertNotAir(ctx, farDip, "the far half of the dip");
+        assertAir(ctx, over, "the column beyond the dip");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot stepped down into the dip instead of bridging it:"
+                    + " feet reached y=" + lowestFeetY[0] + ", expected to stay on the slab"
+                    + " floor at y=" + Y);
+        }
+        LOGGER.info("Chunk miner dip test passed (feet stayed at y={})", lowestFeetY[0]);
+    }
+
+    // ================================================================
+    // Test 17: the reported abort — a column one row over, across a pit
+    // ================================================================
+
+    /**
+     * The world a user reported the run dying in, rebuilt block for block
+     * from the save: {@code cannot break -27, 93, -61 (blocks mined: 0)},
+     * six position timeouts at one unchanging spot.
+     *
+     * <p>The two tests above bridge to a column straight ahead. This one
+     * differs in the single respect that mattered: the column sits one row
+     * <em>over</em>, so the bot's own row and the target's are not the same,
+     * and the pit between them is wider in the bot's row than in the
+     * column's. Read from the region file at the failing coordinates, with
+     * the bot's feet cell as the origin:
+     *
+     * <pre>
+     *   floor (y-1)   dx: -4  -3  -2  -1   0        (0 = under the bot)
+     *     row dz=-1        #   #   .   .   #
+     *     row dz= 0        #   .   .   .   #        (the bot's own row)
+     *     row dz=+1        #   #   .   .   #        (the column's row)
+     * </pre>
+     *
+     * The column stands at dx=-4, dz=+1 — 4.27 blocks off, just past the
+     * reach of 4.0, so the run has to walk, and the walk has to cross the
+     * pit. Everything else in the chunk is air, so this is the only work the
+     * sweep can find and the only column it can pick.
+     */
+    @MinecraftTest(name = "Chunk miner bridges to a column off its own row",
+            timeoutTicks = 3000, order = 27)
+    public void bridgesToAColumnOffItsOwnRow(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 5, STAND_DX + 1, STAND_DZ - 1, STAND_DZ + 2);
+        final BlockPos over = stand.offset(-4, 0, 1);
+        final BlockPos firstStep = stand.offset(-1, -1, 0);
+        // The pit: two cells wide in the neighbouring rows, three in the
+        // bot's own. Deep, not a dip — the cleared volume below Y-1 is
+        // already air, so nothing is within the one-block step the
+        // controller tolerates.
+        fill(ctx, STAND_DX - 2, Y - 1, STAND_DZ - 1, STAND_DX - 1, Y - 1, STAND_DZ + 1, "air");
+        fill(ctx, STAND_DX - 3, Y - 1, STAND_DZ, STAND_DX - 3, Y - 1, STAND_DZ, "air");
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.waitFor(mc -> mc.level.getBlockState(firstStep).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        // One cell of bridge is what this crossing needs — from the cell it
+        // opens, the column is 3.2 blocks off. How many the sweep lays is
+        // its business; that the bot got across without dropping in, and
+        // that the run did not abort, is the behaviour under test.
+        assertNotAir(ctx, firstStep, "the first cell of the bridge");
+        assertAir(ctx, over, "the column across the pit");
+        assertAir(ctx, over.above(), "the column's head block");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot dropped into the pit instead of bridging it:"
+                    + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
+        }
+        LOGGER.info("Chunk miner off-row bridge test passed (feet stayed at y={})",
+                lowestFeetY[0]);
+    }
+
+    // ================================================================
+    // Test 18: what it mines across a pit, it also has to pick up
+    // ================================================================
+
+    /**
+     * Bridging works and the run still gets nowhere, reported from the same
+     * world as the test above and rebuilt from the save at those coordinates.
+     * The bot bridged west along its own row (`bridging the floor at -24, 91,
+     * -63`, then `-25, 91, -63`), and from the two cobble blocks it had just
+     * laid it mined the columns at -27 and -28 in the row <em>two over</em>,
+     * at 3.2 and 3.8 blocks. Both broke. Both dropped. Neither drop was ever
+     * picked up: they lie in the row the bot mined into, the pit still runs
+     * between it and them, and COLLECTING has no pathfinder — it walks in
+     * view direction, the gap refuses the step, and the phase burns its
+     * no-progress budget. Every column costs that, and the cobble piles up on
+     * a ledge the bot cannot stand on.
+     *
+     * <p>Reach was what the sweep bridged for, and reach is not the whole
+     * requirement: a column is only worth mining from somewhere the bot can
+     * also walk to what falls out of it. Four blocks of reach across a
+     * one-block bridge is exactly the case where those two come apart.
+     *
+     * <p>The fixture is that scene with the cobble bridge taken back out —
+     * the bot lays its own — and with the two columns the report managed
+     * grown to eight, so the drops pile up instead of proving the point once.
+     * The pit runs the full width of the floor: no way round it, and nothing
+     * to cross on until the bot builds it.
+     *
+     * <p>The shape of the wall is the whole trap and is not free to choose.
+     * Every column has to be within reach of the spot the bot already stands
+     * on, which is a fan two and three rows deep and never wider than the
+     * four blocks of reach allow. Put a single column further out and the
+     * fixture stops testing this: out of reach makes the bot <em>walk</em>,
+     * walking makes the sweep lay a bridge as a matter of course, and once
+     * the bot is across, every drop is on ground it can stand on. Two
+     * earlier fixtures died of exactly that — one with the wall straight
+     * ahead across a chasm, one with it far enough along the row to be out
+     * of reach — and both passed with the bug still in.
+     *
+     * <p>Here nothing ever asks the bot to move: it mines all sixteen blocks
+     * from where it was put, and all sixteen drops land on a ledge with a gap
+     * in front of it. Reach and footing are two different questions, and this
+     * is the smallest world that tells them apart.
+     */
+    @MinecraftTest(name = "Chunk miner collects what it mines across a pit",
+            timeoutTicks = 8000, order = 28)
+    public void collectsWhatItMinesAcrossAPit(TestContext ctx) {
+        final int standDx = 8;
+        final int standDz = 4;
+        final BlockPos stand = prepareWithFloor(ctx, standDx, standDz,
+                standDx - 4, standDx + 4, standDz, standDz + 3);
+        // The pit, the full width of the floor, one row over from the bot.
+        fill(ctx, standDx - 4, Y - 1, standDz + 1, standDx + 4, Y - 1, standDz + 1, "air");
+        // The wall across it: five columns in the row two over, three in the
+        // row behind that. The corners of both are inside four blocks of the
+        // bot's eye — 3.0 and 3.4 — so it never has cause to take a step.
+        fill(ctx, standDx - 2, Y, standDz + 2, standDx + 2, Y + 1, standDz + 2, "stone");
+        fill(ctx, standDx - 1, Y, standDz + 3, standDx + 1, Y + 1, standDz + 3, "stone");
+        final BlockPos nearest = stand.offset(0, 0, 2);
+        final BlockPos corner = stand.offset(2, 0, 2);
+        final BlockPos furthest = stand.offset(-1, 0, 3);
+        ctx.waitFor(mc -> !mc.level.getBlockState(furthest).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertAir(ctx, nearest, "the nearest column across the pit");
+        assertAir(ctx, corner, "the corner column of the near row");
+        assertAir(ctx, furthest, "the furthest column across the pit");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot dropped into the pit: feet reached y="
+                    + lowestFeetY[0] + ", expected to stay at y=" + Y);
+        }
+        int left = countItemsAround(ctx, stand);
+        if (left > 0) {
+            throw new AssertionError("Chunk miner left " + left + " drop(s) lying across the"
+                    + " pit — it mined blocks it could not walk to the cobble of");
+        }
+        LOGGER.info("Chunk miner across-pit collect test passed (feet stayed at y={})",
+                lowestFeetY[0]);
+    }
+
+    /** Item entities still on the ground anywhere near the working area. */
+    private int countItemsAround(TestContext ctx, BlockPos origin) {
+        return ctx.computeOnClient(mc -> mc.level.getEntities(
+                net.minecraft.world.entity.EntityType.ITEM,
+                new net.minecraft.world.phys.AABB(origin).inflate(20.0),
+                item -> true).size());
     }
 
     // --- Setup helpers ---

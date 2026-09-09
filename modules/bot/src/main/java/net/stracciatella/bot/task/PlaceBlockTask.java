@@ -85,8 +85,11 @@ public class PlaceBlockTask implements BotTask {
      * <p>Scoring by how directly the face points at the eye picks what a person
      * picks: the top of the block <em>under</em> the gap when there is one,
      * otherwise the side face of the block on the far side of it, whose face
-     * toward the gap is turned back toward the bot. A face the eye is level
-     * with or behind scores zero or less and is rejected outright.
+     * toward the gap is turned back toward the bot. Scoring only ranks: the
+     * lowest-scoring candidate of all, the side face of the block the bot is
+     * standing on, is still returned when it is the only one there is, and
+     * the controller has a move for it — crouching out past the rim until the
+     * face comes into view, which is how a player bridges.
      */
     public static BlockPos findSupport(Level level, BlockPos placePos, Vec3 eye) {
         BlockPos best = null;
