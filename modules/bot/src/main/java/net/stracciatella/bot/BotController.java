@@ -100,6 +100,24 @@ public class BotController {
     // aimed at. A crouch buys about 0.3 blocks of overhang, so this stays
     // well inside what the step can actually reach.
     private static final double EDGE_STEP_CLEARANCE = 0.1;
+    // How close to the rim the crouch comes on. The walk to a support four
+    // blocks off is a walk; only its last stretch is the edge step, and
+    // crouching for the whole of it creeps the bot across at a third speed
+    // for no gain. One and a half blocks is a shade before the floor check
+    // would refuse the step anyway — that refusal starts one block out, the
+    // reach of STEP_LOOKAHEAD — so the crouch is always already down by the
+    // time the ground runs out.
+    private static final double EDGE_STEP_APPROACH = 1.5;
+    // Where the bridging gaze rests while the bot backs into the gap: this
+    // far behind it, level with the block it is building off. Far enough for
+    // the yaw to be well defined, near enough that the pitch is already most
+    // of the way down to the face it will click.
+    private static final double BRIDGE_LOOK_BACK = 1.0;
+    // How far past the support's own centre the edge step aims to stand: half
+    // a block to the face plane and a little over it, which is inside what
+    // vanilla's crouch allows a body to overhang and comfortably clear of
+    // EDGE_STEP_CLEARANCE.
+    private static final double EDGE_STEP_OVERHANG = 0.8;
 
     // Opportunistic collection (policy-gated, INTERACTING only). The range is
     // deliberately short: a drop further than this can't be fetched and
@@ -385,12 +403,31 @@ public class BotController {
                 // without this line the phase leaves no trace at all: the run
                 // shows two look timeouts five seconds apart and nothing in
                 // between, which is what hid exactly that.
-                LOGGER.warn("Position timeout in reach: target={} player=({}, {}, {}) los={}",
+                // Sixty ticks that end where they began have exactly one
+                // question worth asking, and "in reach" does not answer it:
+                // what stopped the walk. For an edge step that is the way the
+                // bot was trying to go — a wall at body height holds it as
+                // dead still as the sneak clip does, and the two look
+                // identical from a coordinate that never changed.
+                net.minecraft.core.Direction pin = currentTask.preferredFace();
+                String blocked = "n/a";
+                String past = "n/a";
+                if (pin != null && !pin.getAxis().isVertical()) {
+                    BlockPos into = player.blockPosition().relative(pin);
+                    blocked = client.level.getBlockState(into) + "/"
+                            + client.level.getBlockState(into.above());
+                    past = String.format(java.util.Locale.US, "%.2f",
+                            pastFacePlane(player.getEyePosition(),
+                                    currentTask.targetPos(), pin));
+                }
+                LOGGER.warn("Position timeout in reach: target={} player=({}, {}, {}) los={}"
+                        + " face={} pastFace={} crouched={} onGround={} into={}",
                         currentTask.targetPos().toShortString(),
                         String.format(java.util.Locale.US, "%.2f", player.getX()),
                         String.format(java.util.Locale.US, "%.2f", player.getY()),
                         String.format(java.util.Locale.US, "%.2f", player.getZ()),
-                        hasLineOfSight(client, player, currentTask.targetPos()));
+                        hasLineOfSight(client, player, currentTask.targetPos()),
+                        pin, past, bridging, player.onGround(), blocked);
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
             } else {
                 // Failure-only diagnostics: without them this message says only
@@ -463,13 +500,60 @@ public class BotController {
         // a human closes the last few blocks watching the thing they're
         // about to mine, instead of strafing over with a hard-snapped view.
         BlockPos target = currentTask.targetPos();
-        // A placement is aimed at the face it builds off, not at the block
-        // centre, and on an edge step the two point opposite ways: the support
-        // is the block underfoot, so its centre sits behind the eye and the
-        // walk would set off backwards. LOOKING aims at the face already —
-        // POSITIONING aiming anywhere else means the walk and the look
-        // disagree about where the work is.
         net.minecraft.core.Direction pinned = currentTask.preferredFace();
+        if (pinned != null && needsEdgeStep(player, currentTask)) {
+            // The way a person bridges: turn your back on the gap, look down
+            // at the block you are standing on, and walk backwards into it.
+            //
+            // Aiming at the face itself instead — which is what every other
+            // approach does — spins the bot twice per block laid. The face
+            // centre is in front of the eye while the bot is short of the
+            // plane and behind it the moment the eye clears it, so the camera
+            // swings a full half-turn on arrival, and the next placement
+            // swings it back. Reported as a bot that turns towards its next
+            // target after every block instead of staying with the bridge.
+            // Resting the gaze behind the bot removes both swings: the yaw is
+            // already the one the placement needs, and it does not move again
+            // until the bridge itself changes direction.
+            aimCameraAt(player,
+                    player.getX() - pinned.getStepX() * BRIDGE_LOOK_BACK,
+                    target.getY() + 0.5,
+                    player.getZ() - pinned.getStepZ() * BRIDGE_LOOK_BACK);
+            // Which makes the walk a backwards one, and the floor check has to
+            // be asked about the gap rather than about the bridge already laid
+            // behind. It says no from one block out, and by then the crouch is
+            // down and vanilla's own edge check is the thing holding the bot
+            // up — the only thing that can, over a gap it is standing at.
+            //
+            // At the support's own column, not merely along the face. The rim
+            // this step needs is the far edge of the support itself, and from
+            // a neighbouring row there is no such edge underfoot: walking the
+            // face axis from there tracks along a row that was never bridged,
+            // and vanilla's crouch — correctly — stops the bot on the last
+            // sliver of whatever it is standing on. It then holds that spot
+            // for the whole of POSITIONING, because the walk it is being
+            // given cannot reach the plane from that row at all. Logged from
+            // a real world with the bot one row off the bridge it had just
+            // laid: pastFace -0.71, -0.70, -0.70 at ticks 5, 20 and 40, feet
+            // at -24/92/-64 against a support at -24/91/-63, under=air with
+            // onGround, and the back key held the entire time. Aiming the
+            // walk at the support closes the sideways offset first and turns
+            // into the rim step itself once the bot is over it.
+            double toX = target.getX() + 0.5 + pinned.getStepX() * EDGE_STEP_OVERHANG
+                    - player.getX();
+            double toZ = target.getZ() + 0.5 + pinned.getStepZ() * EDGE_STEP_OVERHANG
+                    - player.getZ();
+            if (!bridging && !hasFloorToward(client, player, toX, toZ)) {
+                releaseMovementKeys();
+                return;
+            }
+            walkToward(client, player, toX, toZ);
+            return;
+        }
+        // A placement is aimed at the face it builds off, not at the block
+        // centre. LOOKING aims at the face already — POSITIONING aiming
+        // anywhere else means the walk and the look disagree about where the
+        // work is.
         double faceX = pinned != null ? pinned.getStepX() * 0.5 : 0.0;
         double faceY = pinned != null ? pinned.getStepY() * 0.5 : 0.0;
         double faceZ = pinned != null ? pinned.getStepZ() * 0.5 : 0.0;
@@ -504,6 +588,10 @@ public class BotController {
             releaseMovementKeys();
             return;
         }
+        // Cleared first: the edge-step walk above drives all four keys, and a
+        // backwards one still held here would cancel this one out into
+        // standing still.
+        releaseMovementKeys();
         client.options.keyUp.setDown(true);
     }
 
@@ -1174,11 +1262,46 @@ public class BotController {
      */
     private static boolean hasFloorAhead(Minecraft client, LocalPlayer player) {
         double yawRad = Math.toRadians(player.getYRot());
+        return hasFloorToward(client, player, -Math.sin(yawRad), Math.cos(yawRad));
+    }
+
+    /**
+     * The same question for a walk that is not going where the bot is looking.
+     * Bridging is one: the gaze rests back along the bridge while the body
+     * backs into the gap, and asking about the cell behind the bot would let
+     * it walk off the front.
+     */
+    private static boolean hasFloorToward(Minecraft client, LocalPlayer player,
+                                          double dirX, double dirZ) {
+        double length = Math.sqrt(dirX * dirX + dirZ * dirZ);
+        if (length < 1.0e-6) {
+            return true;
+        }
         BlockPos ahead = BlockPos.containing(
-                player.getX() - Math.sin(yawRad) * STEP_LOOKAHEAD,
+                player.getX() + dirX / length * STEP_LOOKAHEAD,
                 player.getY(),
-                player.getZ() + Math.cos(yawRad) * STEP_LOOKAHEAD);
+                player.getZ() + dirZ / length * STEP_LOOKAHEAD);
         return hasFloorWithinOneBlock(client.level, ahead);
+    }
+
+    /**
+     * Press the walk keys that push the body along {@code (dirX, dirZ)},
+     * whatever the camera happens to be looking at — the same eight key
+     * directions {@code tickOpportunisticCollection} quantizes into, and for
+     * the same reason: the view is committed to the work, so the walk has to
+     * be expressed relative to it instead of steering it.
+     */
+    private static void walkToward(Minecraft client, LocalPlayer player,
+                                   double dirX, double dirZ) {
+        float moveYaw = (float) Math.toDegrees(Math.atan2(-dirX, dirZ));
+        float rel = AngleUtil.wrapDegrees(moveYaw - player.getYRot());
+        float a = Math.abs(rel);
+        boolean strafing = a > 22.5f && a < 157.5f;
+        client.options.keyUp.setDown(a <= 67.5f);
+        client.options.keyDown.setDown(a >= 112.5f);
+        client.options.keyRight.setDown(strafing && rel > 0);
+        client.options.keyLeft.setDown(strafing && rel < 0);
+        client.options.keySprint.setDown(false);
     }
 
     /**
@@ -1191,7 +1314,7 @@ public class BotController {
      */
     private static void updateBridging(Minecraft client, LocalPlayer player) {
         boolean wanted = currentTask != null
-                && (needsEdgeStep(player, currentTask)
+                && (atEdgeStepRim(player, currentTask)
                         || (phase == Phase.POSITIONING && forceApproach
                                 && !hasFloorAhead(client, player)));
         if (wanted) {
@@ -1243,6 +1366,26 @@ public class BotController {
             return false;
         }
         return pastFacePlane(eye, support, face) < EDGE_STEP_CLEARANCE;
+    }
+
+    /**
+     * Whether the crouch is due — an edge step is owed <em>and</em> the rim is
+     * close enough that the next stretch of walk is the step itself.
+     *
+     * <p>Two questions that used to be one. {@code needsEdgeStep} is happy
+     * with any support inside reach, which is four blocks, and the bot duly
+     * went down into the crouch four blocks out and creeped the whole way at a
+     * third of walking speed — reported as a bot that starts sneaking while it
+     * is still several blocks from the edge. The crouch is not the approach,
+     * it is the last of it: the part where a normal step would carry the body
+     * off the block it is standing on.
+     */
+    private static boolean atEdgeStepRim(LocalPlayer player, BotTask task) {
+        if (!needsEdgeStep(player, task)) {
+            return false;
+        }
+        return pastFacePlane(player.getEyePosition(), task.targetPos(), task.preferredFace())
+                > -EDGE_STEP_APPROACH;
     }
 
     /**

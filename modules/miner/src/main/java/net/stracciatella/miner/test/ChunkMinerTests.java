@@ -1,5 +1,6 @@
 package net.stracciatella.miner.test;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import net.minecraft.client.Minecraft;
@@ -1434,6 +1435,261 @@ public class ChunkMinerTests {
                     + " pit — it mined blocks it could not walk to the cobble of");
         }
         LOGGER.info("Chunk miner across-pit collect test passed (feet stayed at y={})",
+                lowestFeetY[0]);
+    }
+
+    // ================================================================
+    // Test 19: how the bot gets to the rim, not just that it gets there
+    // ================================================================
+
+    /**
+     * Every bridge test above starts with the gap under the bot's nose, so
+     * the approach to it is one step long and says nothing. This one puts
+     * the gap four blocks along the row, which is what the sweep produces as
+     * soon as it walks a stretch of solid floor before finding a hole — and
+     * two things the user reported go wrong on exactly that stretch.
+     *
+     * <p><b>The crouch used to come on at the far end of it.</b>
+     * {@code needsEdgeStep} is happy with any support inside reach, and reach
+     * is four blocks, so the bot went down into the crouch as soon as the
+     * placement was planned and creeped the whole approach at a third of
+     * walking speed. The crouch is not the approach, it is the last of it.
+     *
+     * <p><b>And the gaze used to swing half a turn per block laid.</b>
+     * POSITIONING aimed at the support's face, which sits in front of the eye
+     * while the bot is short of the plane and behind it the moment the eye
+     * clears it: a half-turn on arrival, and another one back at the next
+     * placement. What a person does instead is turn their back on the gap
+     * once and walk into it backwards, and that is what the bot does now — so
+     * the test samples the look direction halfway along the approach, where
+     * the two behaviours point opposite ways.
+     */
+    @MinecraftTest(name = "Chunk miner walks to a rim before it crouches at one",
+            timeoutTicks = 3000, order = 29)
+    public void walksToARimBeforeCrouchingAtIt(TestContext ctx) {
+        final int standDx = 4;
+        final int standDz = 7;
+        final BlockPos stand = prepareWithFloor(ctx, standDx, standDz,
+                standDx - 1, standDx + 8, standDz - 1, standDz + 1);
+        fill(ctx, standDx + 4, Y - 1, standDz - 1, standDx + 5, Y - 1, standDz + 1, "air");
+        final BlockPos nearGap = stand.offset(4, -1, 0);
+        final BlockPos over = stand.offset(6, 0, 0);
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.waitFor(mc -> mc.level.getBlockState(nearGap).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        // The plane the bot has to get its eye past: the near face of the
+        // first empty cell, four blocks east of where it starts.
+        final double rimX = stand.getX() + 4;
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final boolean[] crouchedEarly = {false};
+        final double[] lookAtHalfway = {Double.NaN};
+        ctx.waitFor(mc -> {
+            if (mc.player.isShiftKeyDown() && mc.player.getX() < rimX - 2.0) {
+                crouchedEarly[0] = true;
+            }
+            if (Double.isNaN(lookAtHalfway[0]) && mc.player.getX() >= rimX - 1.0) {
+                lookAtHalfway[0] = mc.player.getLookAngle().x;
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertNotAir(ctx, nearGap, "the near half of the gap");
+        assertAir(ctx, over, "the column beyond the gap");
+        if (crouchedEarly[0]) {
+            throw new AssertionError("Bot crouched more than two blocks short of the rim at x="
+                    + rimX + " — the whole approach was creeped, not just the edge step");
+        }
+        if (Double.isNaN(lookAtHalfway[0])) {
+            throw new AssertionError("Bot never got within a block of the rim at x=" + rimX);
+        }
+        if (lookAtHalfway[0] > 0) {
+            throw new AssertionError("Bot walked up to the rim facing it (look.x="
+                    + lookAtHalfway[0] + ") — the gaze belongs behind the bridge, so that"
+                    + " placing does not cost a half-turn there and another one back");
+        }
+        LOGGER.info("Chunk miner rim approach test passed (look.x={} one block short of the rim)",
+                lookAtHalfway[0]);
+    }
+
+    // ================================================================
+    // Test 20: the sweep keeps its place when the bot's feet wander off
+    // ================================================================
+
+    /**
+     * The corridor above, cleared with the bot standing in the row to the
+     * north of it — which is where its feet end up on their own, and where
+     * the sweep used to lose its place.
+     *
+     * <p>The bot leaves the row it is clearing every time it collects: it
+     * walks after cobble, and vanilla scatters a drop up to half a block off
+     * the column it fell from, which is all it takes. A scan anchored on the
+     * bot's cell then runs the rest of <i>that</i> row and enters the corridor
+     * from the far end, because the snake alternates direction and
+     * neighbouring rows are entered from opposite sides. The corridor test
+     * caught this about one run in ten — it needs the drops to bounce north
+     * and the breather between columns to run long enough for the scan to
+     * happen while the bot is over there — and reported {@code cannot break
+     * 3019, 41, 3015 (blocks mined: 2)}: the far column handed over with two
+     * still standing in front of it, nothing able to walk the bot to it, and
+     * three look timeouts.
+     *
+     * <p>So this puts the feet there instead of waiting for them to go: the
+     * bot is moved a row north as soon as the first column falls, and held
+     * there until the second one does. Client-side and not by command — the
+     * scan happens within a tick or two of the break, which no command
+     * round-trip would beat. What is asserted is the order the corridor comes
+     * down in, since that is the invariant: each column adjacent to the last,
+     * however far the bot has wandered from either.
+     */
+    @MinecraftTest(name = "Chunk miner keeps its place when the bot steps out of the row",
+            timeoutTicks = 3000, order = 30)
+    public void keepsItsPlaceWhenTheBotStepsOut(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        final int columns = 4;
+        for (int dx = 1; dx <= columns; dx++) {
+            setBlock(ctx, stand.offset(dx, 0, 0), "stone");
+            setBlock(ctx, stand.offset(dx, 1, 0), "stone");
+        }
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final List<Integer> order = new ArrayList<>();
+        ctx.waitFor(mc -> {
+            for (int dx = 1; dx <= columns; dx++) {
+                if (!order.contains(dx)
+                        && mc.level.getBlockState(stand.offset(dx, 0, 0)).isAir()) {
+                    order.add(dx);
+                }
+            }
+            if (order.size() == 1) {
+                mc.player.setPos(stand.getX() + 1.5, Y, stand.getZ() - 0.5);
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        for (int dx = 1; dx <= columns; dx++) {
+            assertAir(ctx, stand.offset(dx, 0, 0), "corridor floor block " + dx);
+            assertAir(ctx, stand.offset(dx, 1, 0), "corridor head block " + dx);
+        }
+        if (!order.equals(List.of(1, 2, 3, 4))) {
+            throw new AssertionError("Chunk miner cleared the corridor in the order " + order
+                    + " — the sweep followed the bot out of the row instead of holding its"
+                    + " own place, and handed over a column with others still standing in"
+                    + " front of it");
+        }
+        LOGGER.info("Chunk miner kept its place across the corridor (order {})", order);
+    }
+
+    // ================================================================
+    // Test 21: a bridge long enough that the bot has to walk out along it
+    // ================================================================
+
+    /**
+     * Every bridging fixture above lays its cells from one standing spot: the
+     * trench is two cells wide, the bot reaches across it without a step, and
+     * every placement in the suite logs the same {@code dist=2.2}. That is the
+     * easy half of bridging, and it is the only half under test.
+     *
+     * <p>The other half is what a long bridge actually is: lay a cell, walk
+     * out onto it, lay the next from there. Reported from a real world at
+     * chunk [-2, -4] — the first cell went in correctly (support -23, block
+     * into -24), and the second never did. The bot crouched, then stood dead
+     * still for the whole sixty ticks of POSITIONING (identical coordinates at
+     * both timeouts, -23.30/92.00/-62.47), and LOOKING found the top face of
+     * the support under every ray it cast — {@code hitResult=-24, 91, -62
+     * (up)}, the support seen from above because the eye never got past its
+     * side. Two look timeouts, {@code Task failed: Place filler at -25, 91,
+     * -62} twice, and the bot fell three blocks and the run aborted.
+     *
+     * <p>So: a column five cells out and one row over, its own footing under
+     * it, and nothing but air in between. Too far to reach from the platform,
+     * which leaves the bot no way to it but the one that was never tested.
+     */
+    @MinecraftTest(name = "Chunk miner walks out along the bridge it lays",
+            timeoutTicks = 4000, order = 31)
+    public void walksOutAlongItsOwnBridge(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 1, STAND_DX + 1, STAND_DZ - 1, STAND_DZ + 1);
+        final BlockPos over = stand.offset(-5, 0, 1);
+        setBlock(ctx, over.below(), "stone");
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertAir(ctx, over, "the column across the pit");
+        assertAir(ctx, over.above(), "the column's head block");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot dropped off its own bridge instead of walking it:"
+                    + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
+        }
+        LOGGER.info("Chunk miner long-bridge test passed (feet stayed at y={})", lowestFeetY[0]);
+    }
+
+    // ================================================================
+    // Test 22: the bridge is a staircase, and the bot has to get onto it
+    // ================================================================
+
+    /**
+     * A column four cells out and four cells over, so the line to it is a true
+     * diagonal and the bridge that follows it is a staircase: one cell west,
+     * one cell south, one cell west. The bot lays a cell in the row beside the
+     * one it is standing in, and the support for the cell after that is then
+     * diagonal to its feet.
+     *
+     * <p>Which is where it used to stop dead. The edge step walked the face's
+     * own axis and nothing else, so from the wrong row it tracked west along a
+     * row that was never bridged, and vanilla's crouch — rightly — held it on
+     * the last sliver of the block behind. Measured in a real world at chunk
+     * [-2, -4]: {@code pastFace} -0.71, -0.70, -0.70 at ticks 5, 20 and 40 of
+     * the same POSITIONING, feet at -24/92/-64 against a support at
+     * -24/91/-63, {@code under=air} with {@code onGround}, and the back key
+     * held throughout. Sixty ticks that moved the bot one hundredth of a
+     * block, then LOOKING found the support's top face because the eye had
+     * never got past its side, and the run died on the placement.
+     *
+     * <p>The rim the step needs is the far edge of the support, so the walk
+     * has to go at the support, not merely along the face — which closes the
+     * sideways offset first and becomes the rim step once the bot is over it.
+     */
+    @MinecraftTest(name = "Chunk miner steps onto its bridge instead of walking beside it",
+            timeoutTicks = 4000, order = 32)
+    public void stepsOntoItsBridge(TestContext ctx) {
+        final int standDx = STAND_DX + 1;
+        final int standDz = STAND_DZ - 1;
+        final BlockPos stand = prepareWithFloor(ctx, standDx, standDz,
+                standDx - 1, standDx + 1, standDz - 1, standDz + 1);
+        final BlockPos over = stand.offset(-4, 0, 4);
+        setBlock(ctx, over.below(), "stone");
+        setBlock(ctx, over, "stone");
+        setBlock(ctx, over.above(), "stone");
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final int[] lowestFeetY = {Integer.MAX_VALUE};
+        ctx.waitFor(mc -> {
+            lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertAir(ctx, over, "the column across the pit");
+        assertAir(ctx, over.above(), "the column's head block");
+        if (lowestFeetY[0] < Y) {
+            throw new AssertionError("Bot walked off its own staircase instead of onto it:"
+                    + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
+        }
+        LOGGER.info("Chunk miner staircase-bridge test passed (feet stayed at y={})",
                 lowestFeetY[0]);
     }
 

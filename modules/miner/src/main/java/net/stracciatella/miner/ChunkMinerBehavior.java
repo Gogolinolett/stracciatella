@@ -26,6 +26,7 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorStatus;
@@ -107,6 +108,10 @@ public class ChunkMinerBehavior implements BotBehavior {
     // handleLiquidsAround), the floor cell under it, or both. Due as soon as
     // the column is open, through the opening it leaves.
     private BlockPos groundworkAfterOpening;
+    // Where the sweep is in the snake: the column it took last, which is what
+    // the next one is chosen next to. Null until the slab's first column, and
+    // again after every descent, where the bot's own cell is the anchor.
+    private BlockPos sweepColumn;
     private int stepRetries;
     private int breatherTicks;
 
@@ -171,6 +176,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         batchQueue.clear();
         pendingPlacement = null;
         groundworkAfterOpening = null;
+        sweepColumn = null;
         stepRetries = 0;
         breatherTicks = 0;
         blocksMined = 0;
@@ -332,6 +338,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         for (int feetY = fromY - 1; feetY >= toY - 1; feetY -= SLAB_HEIGHT) {
             if (slabHasWork(level, feetY)) {
                 slabFeetY = feetY;
+                sweepColumn = null;
                 phase = Phase.DESCEND;
                 LOGGER.info("Chunk miner: working slab y={}..{}", feetY, feetY + 1);
                 return BehaviorStatus.RUNNING;
@@ -518,6 +525,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         // would run it out of order. The column just planned counts too — with
         // its own floor still owed, a chain would carry the sweep on over a
         // hole that is not filled until the batch has drained.
+        sweepColumn = column;
         if (groundworkAfterOpening == null) {
             List<BlockPos> columns = slabColumns(slabFeetY);
             for (int i = columns.indexOf(column) + 1; i > 0 && i < columns.size(); i++) {
@@ -526,6 +534,9 @@ public class ChunkMinerBehavior implements BotBehavior {
                     break;
                 }
                 addColumn(level, next, blocks);
+                // Everything the chain walks over is planned or already empty,
+                // so the sweep is past it whether it added anything or not.
+                sweepColumn = next;
             }
         }
         plan(blocks);
@@ -596,7 +607,7 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     /**
      * The next column with something to dig, following the snake onward from
-     * the one the bot is standing in and wrapping around.
+     * the one the sweep took last.
      *
      * <p>Starting at the chunk corner instead would break as soon as the
      * columns in between hold nothing — a blacklisted seam, a strip already
@@ -604,8 +615,24 @@ public class ChunkMinerBehavior implements BotBehavior {
      * sent at a block several columns away that is still inside its reach, so
      * the controller never walks over, but is hidden behind the columns that
      * were skipped: the look times out and the run dies on a block it never
-     * had a line to. Resuming at the bot keeps every step of the sweep
+     * had a line to. Resuming where the sweep is keeps every step of it
      * adjacent to the last, which is the whole point of a serpentine.
+     *
+     * <p>Where the sweep is, not where the bot's feet are — that distinction
+     * cost a run. The two agree while the bot is mining and part company while
+     * it is collecting: it walks after cobble that vanilla scatters up to half
+     * a block off the column it fell from, and half a block is all it takes to
+     * put its feet in the row next door. Anchored there, the scan runs the rest
+     * of that row, and then enters the row it was actually clearing from the
+     * far end — because the snake alternates direction, so neighbouring rows
+     * are entered from opposite sides. Logged from the corridor test: the bot
+     * cleared 3016 and was handed 3019 with 3017 and 3018 still standing, the
+     * ray stopped by 3017, nowhere to walk, and {@code cannot break 3019, 41,
+     * 3015 (blocks mined: 2)} three look timeouts later. It came and went with
+     * the way the drops happened to bounce. The sweep's own place in the snake
+     * does not bounce, so that is what the scan is anchored on; the bot's cell
+     * is the fallback for the slab's first column, where the sweep has no place
+     * yet and the bot has just descended into one.
      *
      * <p>Which is why the scan never wraps. Wrapping past the end of the snake
      * is the same non-adjacent jump by another name: with the sweep finished
@@ -656,7 +683,8 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     private BlockPos nextColumn(LocalPlayer player, Level level) {
         List<BlockPos> columns = slabColumns(slabFeetY);
-        int start = columnIndex(columns, player.blockPosition());
+        int start = columnIndex(columns,
+                sweepColumn != null ? sweepColumn : player.blockPosition());
         for (int i = 0; i < columns.size(); i++) {
             int ahead = start + i;
             int index = ahead < columns.size()
@@ -666,19 +694,55 @@ public class ChunkMinerBehavior implements BotBehavior {
                 continue;
             }
             BlockPos column = columns.get(index);
-            // Head first, matching the order tickClear plans them in: that
-            // is the block LOOKING aims at, so that is the one to test.
-            for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-                // A position already in the plan is not work left to find: the
-                // block still under the pick would otherwise be handed back
-                // and the sweep would never move past its own column.
-                if (isInRange(pos) && !plannedBlocks.contains(pos)
-                        && isDiggable(level.getBlockState(pos))) {
-                    return column;
-                }
+            if (hasWork(level, column)) {
+                return column;
             }
         }
         return null;
+    }
+
+    /**
+     * Whether either cell of a column is work this plan has not taken yet.
+     * Head first, matching the order tickClear plans them in: that is the
+     * block LOOKING aims at, so that is the one to test. A position already in
+     * the plan is not work left to find — the block still under the pick would
+     * otherwise be handed back and the sweep would never move past its own
+     * column.
+     */
+    private boolean hasWork(Level level, BlockPos column) {
+        for (BlockPos pos : new BlockPos[] {column.above(), column}) {
+            if (isInRange(pos) && !plannedBlocks.contains(pos)
+                    && isDiggable(level.getBlockState(pos))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The block standing between the bot's eye and {@code owed}, or null when
+     * the line to it is clear. Diagnostics only — nothing is decided on it.
+     *
+     * <p>A retry has exactly two reasons to be here and they want opposite
+     * fixes: the way there is missing its floor, which {@code ensureStepToward}
+     * mends, or something is standing in it, which no amount of walking will
+     * help because POSITIONING and LOOKING both work in a straight line. The
+     * retry line used to report the first as though it were the only one —
+     * "nothing to mend on the way there", true and useless, printed three times
+     * over while a column two cells ahead sat in the sight line and went
+     * unnamed.
+     *
+     * <p>The same clip the controller's {@code los=} comes from, so the two
+     * lines in the log agree instead of each having their own idea of what the
+     * bot can see.
+     */
+    private BlockPos columnInTheWay(LocalPlayer player, Level level, BlockPos owed) {
+        BlockHitResult clip = level.clip(new ClipContext(player.getEyePosition(),
+                Vec3.atCenterOf(owed), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE,
+                player));
+        return clip.getType() == HitResult.Type.BLOCK && !clip.getBlockPos().equals(owed)
+                ? clip.getBlockPos()
+                : null;
     }
 
     /** Index of the bot's own column in the sweep, or 0 if it stands outside. */
@@ -1156,8 +1220,11 @@ public class ChunkMinerBehavior implements BotBehavior {
                 // standing, so the sweep finds it again once the ground is in.
                 return step;
             }
-            LOGGER.info("Chunk miner: retrying {} — nothing to mend on the way there",
-                    shortPos(owed));
+            BlockPos blocking = columnInTheWay(player, level, owed);
+            LOGGER.info("Chunk miner: retrying {} — {}", shortPos(owed),
+                    blocking == null
+                            ? "nothing to mend on the way there"
+                            : "still standing in the way: " + shortPos(blocking));
             enqueue(remaining);
             return null;
         }
