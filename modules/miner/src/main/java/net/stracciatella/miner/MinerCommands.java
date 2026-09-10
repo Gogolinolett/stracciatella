@@ -4,12 +4,12 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.arg
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
-import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.commands.SharedSuggestionProvider;
+import net.minecraft.commands.arguments.IdentifierArgument;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -78,18 +78,22 @@ public class MinerCommands {
                                                 IntegerArgumentType.getInteger(context, "fromY"),
                                                 IntegerArgumentType.getInteger(context, "toY"),
                                                 context.getSource())))))
+                // An identifier argument, not a string: Brigadier's unquoted
+                // string stops at the colon, so "minecraft:chest" parsed as
+                // "minecraft" with ":chest" left over and the command failed
+                // on exactly the ids the tab completion offers.
                 .then(literal("blacklist")
                         .then(literal("add")
-                                .then(argument("block", StringArgumentType.string())
+                                .then(argument("block", IdentifierArgument.id())
                                         .suggests(BLOCK_IDS)
                                         .executes(context -> blacklistAdd(
-                                                StringArgumentType.getString(context, "block"),
+                                                context.getArgument("block", Identifier.class),
                                                 context.getSource()))))
                         .then(literal("remove")
-                                .then(argument("block", StringArgumentType.string())
+                                .then(argument("block", IdentifierArgument.id())
                                         .suggests(BLACKLISTED)
                                         .executes(context -> blacklistRemove(
-                                                StringArgumentType.getString(context, "block"),
+                                                context.getArgument("block", Identifier.class),
                                                 context.getSource()))))
                         .then(literal("list")
                                 .executes(context -> blacklistList(context.getSource())))
@@ -119,8 +123,8 @@ public class MinerCommands {
         return 1;
     }
 
-    private static int blacklistAdd(String block, FabricClientCommandSource source) {
-        String id = normalize(block);
+    private static int blacklistAdd(Identifier block, FabricClientCommandSource source) {
+        String id = normalize(block.toString());
         if (id == null) {
             source.sendError(Component.literal("'" + block + "' is not a block"));
             return 0;
@@ -135,9 +139,9 @@ public class MinerCommands {
         return 1;
     }
 
-    private static int blacklistRemove(String block, FabricClientCommandSource source) {
-        String id = normalize(block);
-        if (id == null || !MinerSetup.CONFIG.chunkMinerBlacklist.remove(id)) {
+    private static int blacklistRemove(Identifier block, FabricClientCommandSource source) {
+        String id = block.toString();
+        if (!MinerSetup.CONFIG.chunkMinerBlacklist.remove(id)) {
             source.sendError(Component.literal("'" + block + "' is not on the blacklist"));
             return 0;
         }

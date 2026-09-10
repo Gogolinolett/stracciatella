@@ -1,11 +1,13 @@
 package net.stracciatella.bot.test;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
+import net.stracciatella.bot.BotConfig;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorRunner;
@@ -821,7 +823,546 @@ public class BotTests {
                 String.format("%.2f", lowestFeetY[0]), String.format("%.2f", furthestX[0]));
     }
 
+    // ================================================================
+    // Test 18: digging straight down keeps the heading
+    // ================================================================
+    /**
+     * Three blocks mined one under the other, each from the hole the last
+     * one left. The face aimed at is the top of the block underfoot, and the
+     * horizontal offset from the eye to any point on it is a few centimetres
+     * — the atan2 of that is a yaw in an arbitrary direction, re-rolled with
+     * the jitter for every block. The bot turned to a new random heading per
+     * block, up to half a turn, reported as wild spinning on the way down.
+     * The aim point is laid along the heading the bot already has instead;
+     * asserted as the total yaw travelled over the whole descent.
+     */
+    @MinecraftTest(name = "Bot digs down without turning", timeoutTicks = 300, order = -181)
+    public void digsDownWithoutTurning(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1900, 30, 1000);
+        final List<BlockPos> column = List.of(origin.below(), origin.below(2), origin.below(3));
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        // Stone three deep under the platform's two layers, so the shaft has
+        // walls all the way down and a floor under the last block.
+        ctx.runCommand("fill " + (origin.getX() - 1) + " " + (origin.getY() - 5) + " " + (origin.getZ() - 1)
+                + " " + (origin.getX() + 1) + " " + (origin.getY() - 3) + " " + (origin.getZ() + 1) + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        ctx.runOnClient(mc -> {
+            mc.player.setYRot(90.0f);
+            mc.player.setXRot(0.0f);
+        });
+
+        final float[] lastYaw = {90.0f};
+        final double[] yawTravel = {0.0};
+        ctx.runOnClient(mc -> {
+            for (BlockPos block : column) {
+                BotController.enqueueTask(new MineBlockTask(block));
+            }
+        });
+        ctx.waitFor(mc -> {
+            yawTravel[0] += yawStep(lastYaw, mc.player.getYRot());
+            return BotController.getPhase() == BotController.Phase.IDLE;
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+
+        for (BlockPos block : column) {
+            if (ctx.computeOnClient(mc -> !mc.level.getBlockState(block).isAir())) {
+                throw new AssertionError("Block " + block.toShortString() + " was not mined");
+            }
+        }
+        waitForItem(ctx, Items.COBBLESTONE, 3, "cobblestone");
+        if (yawTravel[0] > 45.0) {
+            throw new AssertionError("Bot turned " + String.format("%.0f", yawTravel[0])
+                    + " degrees digging three blocks straight down (expected under 45)");
+        }
+        LOGGER.info("Dig down test passed (yaw travel {} degrees)", String.format("%.1f", yawTravel[0]));
+    }
+
+    // ================================================================
+    // Test 19: a one-block rise on the way is jumped
+    // ================================================================
+    /**
+     * The bot starts one block down, in a dip in the platform, with its
+     * target five blocks off at platform level — close enough that the walk
+     * is POSITIONING's raw keys, not a path. Vanilla's auto-step is 0.6
+     * blocks, so without a jump the walk stands against the rim until the
+     * position timeout fails the task; that is how the bot got stuck after
+     * collecting a drop from a block lower down. Asserted as the block being
+     * mined, from the platform.
+     */
+    @MinecraftTest(name = "Bot steps up out of a dip", timeoutTicks = 300, order = -180)
+    public void stepsUpOutOfADip(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1950, 30, 1000);
+        final BlockPos dip = origin.below();
+        final BlockPos target = origin.offset(5, 0, 0);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, 10);
+        ctx.runCommand("setblock " + dip.getX() + " " + dip.getY() + " " + dip.getZ() + " air");
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " " + target.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, dip.getY());
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(target)));
+        waitForBotIdle(ctx);
+
+        if (ctx.computeOnClient(mc -> !mc.level.getBlockState(target).isAir())) {
+            throw new AssertionError("Target was not mined — the bot never got out of the dip");
+        }
+        double feetY = ctx.computeOnClient(mc -> mc.player.getY());
+        if (feetY < origin.getY() - 0.01) {
+            throw new AssertionError("Bot is still down at y=" + String.format("%.2f", feetY));
+        }
+        waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
+        LOGGER.info("Step-up test passed");
+    }
+
+    // ================================================================
+    // Test 20: a drop beside the bot, one block down: collect, come back
+    // ================================================================
+    /**
+     * A drop lies in a dip right beside the bot, well under a block off its
+     * centre and a block down — inside the horizontal pickup box, outside
+     * the vertical one. The 3-D distance that used to decide the walk said
+     * "walk", and the gaze aimed at a point that close swung with every
+     * step, the view-relative keys swung with it, and the bot spun into the
+     * wall of its own shaft. With the gaze held and the walk by geometry it
+     * steps down; the next task is then out of reach from the dip, so it has
+     * to jump the rim to get on with it. Asserts both pickups, the second
+     * block mined from platform level, and a collect well short of a spin.
+     */
+    @MinecraftTest(name = "Bot collects from a dip and climbs back", timeoutTicks = 400, order = -179)
+    public void collectsFromADipAndClimbsBack(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2000, 30, 1000);
+        final BlockPos first = origin.offset(0, 0, -2);
+        final BlockPos second = origin.offset(-4, 0, 0);
+        final BlockPos dip = origin.offset(1, -1, 0);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + first.getX() + " " + first.getY() + " " + first.getZ() + " stone");
+        ctx.runCommand("setblock " + second.getX() + " " + second.getY() + " " + second.getZ() + " stone");
+        ctx.runCommand("setblock " + dip.getX() + " " + dip.getY() + " " + dip.getZ() + " air");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        // 0.7 blocks east of the bot's centre: inside the half-block radius
+        // that holds the gaze, and clear of the platform block's edge.
+        ctx.runCommand("summon item " + (origin.getX() + 1.2) + " " + (dip.getY() + 0.2) + " "
+                + (origin.getZ() + 0.5) + " {Item:{id:\"minecraft:dirt\",count:1}}");
+        ctx.waitFor(mc -> !mc.level.getEntities(net.minecraft.world.entity.EntityType.ITEM,
+                new net.minecraft.world.phys.AABB(dip), e -> true).isEmpty());
+
+        final float[] lastYaw = {0.0f};
+        final double[] collectYawTravel = {0.0};
+        final boolean[] wentDown = {false};
+        ctx.runOnClient(mc -> {
+            lastYaw[0] = mc.player.getYRot();
+            BotController.enqueueTask(new MineBlockTask(first));
+            BotController.enqueueTask(new MineBlockTask(second));
+        });
+        ctx.waitFor(mc -> {
+            double step = yawStep(lastYaw, mc.player.getYRot());
+            if (BotController.getPhase() == BotController.Phase.COLLECTING) {
+                collectYawTravel[0] += step;
+            }
+            if (mc.player.getY() < origin.getY() - 0.5) {
+                wentDown[0] = true;
+            }
+            return BotController.getPhase() == BotController.Phase.IDLE;
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+
+        if (!wentDown[0]) {
+            throw new AssertionError("Bot never stepped down into the dip");
+        }
+        waitForItem(ctx, Items.DIRT, 1, "dirt from the dip");
+        if (ctx.computeOnClient(mc -> !mc.level.getBlockState(second).isAir())) {
+            throw new AssertionError("Second block was not mined — the bot never climbed back out");
+        }
+        waitForItem(ctx, Items.COBBLESTONE, 2, "cobblestone");
+        if (collectYawTravel[0] > 120.0) {
+            throw new AssertionError("Bot turned " + String.format("%.0f", collectYawTravel[0])
+                    + " degrees while collecting (expected under 120)");
+        }
+        LOGGER.info("Dip collect test passed (collect yaw travel {} degrees)",
+                String.format("%.1f", collectYawTravel[0]));
+    }
+
+    // ================================================================
+    // Test 21: what falls into the cell is mined as well
+    // ================================================================
+    /**
+     * Stone two blocks ahead at feet level with two gravel stacked on it.
+     * The stone going drops the first gravel into its cell a few ticks
+     * later, and the second onto that. A task that latched "air" the moment
+     * the stone went walked away from a cell that was full again — the
+     * chunk miner's first layer under a gravel patch — and every fallen
+     * block was then handled as a failed break. One task, asserted as the
+     * cell and the two above it being air at the end, with both gravel drops
+     * (gravel, or the flint it sometimes drops) collected.
+     */
+    @MinecraftTest(name = "Bot mines what falls into the cell", timeoutTicks = 400, order = -178)
+    public void minesWhatFallsIntoTheCell(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2050, 30, 1000);
+        final BlockPos target = origin.offset(2, 0, 0);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " " + target.getZ() + " stone");
+        ctx.runCommand("setblock " + target.getX() + " " + (target.getY() + 1) + " " + target.getZ() + " gravel");
+        ctx.runCommand("setblock " + target.getX() + " " + (target.getY() + 2) + " " + target.getZ() + " gravel");
+        ctx.runCommand("give @s diamond_pickaxe");
+        ctx.runCommand("give @s diamond_shovel");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(target)));
+        waitForBotIdle(ctx);
+
+        for (int dy = 0; dy <= 2; dy++) {
+            final BlockPos cell = target.above(dy);
+            String standing = ctx.computeOnClient(mc -> {
+                var state = mc.level.getBlockState(cell);
+                return state.isAir() ? null : state.getBlock().getName().getString();
+            });
+            if (standing != null) {
+                throw new AssertionError("Cell " + cell.toShortString() + " still holds " + standing);
+            }
+        }
+        waitForItem(ctx, Items.COBBLESTONE, 1, "cobblestone");
+        int gravelDrops = countItem(ctx, Items.GRAVEL) + countItem(ctx, Items.FLINT);
+        if (gravelDrops < 2) {
+            throw new AssertionError("Expected the drops of 2 gravel (gravel or flint), got " + gravelDrops);
+        }
+        LOGGER.info("Falling block test passed ({} gravel drops collected)", gravelDrops);
+    }
+
+    // ================================================================
+    // Test 22: an ignored drop is left where it fell, without a wait
+    // ================================================================
+    /**
+     * A drop on the ignore list is one the bot neither walks to nor waits
+     * for. The block is mined from three blocks out — in reach, and far
+     * enough that its cobblestone lands outside the vanilla pickup box, so
+     * only a walk could collect it. With cobblestone ignored the run has to
+     * end with the drop still on the ground, the bot still where it stood,
+     * and COLLECTING over inside the absence window rather than at
+     * {@code collectWaitMax}, which is what an uncollected drop in sight used
+     * to cost. The list is edited in place and restored, never saved: the
+     * test must not leave a real config behind with cobblestone on it.
+     */
+    @MinecraftTest(name = "Bot ignores a listed drop", timeoutTicks = 400, order = -177)
+    public void ignoresListedDrop(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2100, 30, 1000);
+        final BlockPos target = origin.offset(3, 0, 0);
+        final String cobblestone = "minecraft:cobblestone";
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " " + target.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.add(cobblestone));
+        try {
+            long startTick = ctx.computeOnClient(mc -> mc.level.getGameTime());
+            ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(target)));
+            waitForBotIdle(ctx);
+            final long elapsed = ctx.computeOnClient(mc -> mc.level.getGameTime()) - startTick;
+
+            if (ctx.computeOnClient(mc -> !mc.level.getBlockState(target).isAir())) {
+                throw new AssertionError("Block was never mined");
+            }
+            if (countItem(ctx, Items.COBBLESTONE) > 0) {
+                throw new AssertionError("The ignored cobblestone was collected");
+            }
+            int onGround = ctx.computeOnClient(mc -> mc.level.getEntities(
+                    net.minecraft.world.entity.EntityType.ITEM,
+                    new net.minecraft.world.phys.AABB(target).inflate(4.0), item -> true).size());
+            if (onGround != 1) {
+                throw new AssertionError("Expected the cobblestone lying at the block, found "
+                        + onGround + " drops there");
+            }
+            // The bot stood its ground: a collect walk ends inside the pickup
+            // box, one block from the drop. Only the box counts as having
+            // walked there: until the spawn of the drop reaches the client
+            // the phase walks at the mined block whatever is going to lie
+            // there, and under load that sync has taken long enough for a
+            // whole block of it (1.97 blocks left of 3, once, in a full run).
+            double toDrop = ctx.computeOnClient(mc -> {
+                var drop = mc.level.getEntities(net.minecraft.world.entity.EntityType.ITEM,
+                        new net.minecraft.world.phys.AABB(target).inflate(4.0), item -> true).get(0);
+                return horizDistTo(mc, drop.getX(), drop.getZ());
+            });
+            if (toDrop < 1.5) {
+                throw new AssertionError(String.format(
+                        "Bot walked to the ignored drop (%.2f blocks from it)", toDrop));
+            }
+            if (elapsed >= BotController.CONFIG.collectWaitMax) {
+                throw new AssertionError("COLLECTING waited for the ignored drop: " + elapsed
+                        + " ticks, collectWaitMax is " + BotController.CONFIG.collectWaitMax);
+            }
+            LOGGER.info("Ignored drop test passed ({} ticks, {} blocks from the drop)",
+                    elapsed, String.format("%.2f", toDrop));
+        } finally {
+            ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.remove(cobblestone));
+        }
+    }
+
+    // ================================================================
+    // Test 23: a hungry bot eats between tasks, and before anything else
+    // ================================================================
+    /**
+     * The food bar is run down under {@code eatBelowFoodLevel} with the
+     * hunger effect and the effect cleared again, so the run starts from a
+     * known, low level with bread in the inventory. The probe behavior asks
+     * for auto-eat, and the meal has to come at the task boundary — EATING
+     * before the first INTERACTING tick — cost exactly one bread, raise the
+     * bar, and leave the block mined afterwards.
+     */
+    @MinecraftTest(name = "Bot eats between tasks", timeoutTicks = 400, order = -176)
+    public void eatsBetweenTasks(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2150, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        final List<BlockPos> blocks = List.of(origin);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + origin.getX() + " " + origin.getY() + " " + origin.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        ctx.runCommand("give @s bread 4");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+        try {
+            final int hungry = runDownFoodBar(ctx);
+
+            final boolean[] sawEating = {false};
+            final boolean[] sawMining = {false};
+            final boolean[] ateFirst = {false};
+            startProbe(ctx, BotPolicy.none().withAutoEat(), blocks);
+            ctx.waitFor(mc -> {
+                BotController.Phase phase = BotController.getPhase();
+                if (phase == BotController.Phase.EATING) {
+                    sawEating[0] = true;
+                    ateFirst[0] |= !sawMining[0];
+                } else if (phase == BotController.Phase.INTERACTING) {
+                    sawMining[0] = true;
+                }
+                return !BehaviorRunner.isActive();
+            });
+
+            if (!sawEating[0]) {
+                throw new AssertionError("Bot never ate at food level " + hungry);
+            }
+            if (!ateFirst[0]) {
+                throw new AssertionError("Bot started mining before it ate");
+            }
+            if (ctx.computeOnClient(mc -> !mc.level.getBlockState(origin).isAir())) {
+                throw new AssertionError("Block was never mined after the meal");
+            }
+            int bread = countItem(ctx, Items.BREAD);
+            if (bread != 3) {
+                throw new AssertionError("Expected one bread eaten, " + (4 - bread) + " gone");
+            }
+            int foodLevel = ctx.computeOnClient(mc -> mc.player.getFoodData().getFoodLevel());
+            if (foodLevel <= hungry) {
+                throw new AssertionError("Food level did not rise: " + hungry + " -> " + foodLevel);
+            }
+            ctx.runOnClient(mc -> BotController.stop());
+            LOGGER.info("Auto-eat test passed (food level {} -> {})", hungry, foodLevel);
+        } finally {
+            ctx.runCommand("difficulty peaceful");
+        }
+    }
+
+    // ================================================================
+    // Test 24: hungry with nothing to eat — carry on, do not stand there
+    // ================================================================
+    /**
+     * The same bar, no bread. The run must not enter EATING at all — there
+     * is nothing to select, and holding the button on a pickaxe is a task
+     * timeout waiting to happen — and the block still has to come out: a
+     * missing meal is a warning to the player, not a reason to stop.
+     */
+    @MinecraftTest(name = "Bot works on hungry without food", timeoutTicks = 400, order = -175)
+    public void worksOnHungryWithoutFood(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2200, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        final List<BlockPos> blocks = List.of(origin);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + origin.getX() + " " + origin.getY() + " " + origin.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+        try {
+            final int hungry = runDownFoodBar(ctx);
+
+            final boolean[] sawEating = {false};
+            startProbe(ctx, BotPolicy.none().withAutoEat(), blocks);
+            ctx.waitFor(mc -> {
+                sawEating[0] |= BotController.getPhase() == BotController.Phase.EATING;
+                return !BehaviorRunner.isActive();
+            });
+
+            if (sawEating[0]) {
+                throw new AssertionError("Bot tried to eat with nothing to eat");
+            }
+            if (ctx.computeOnClient(mc -> !mc.level.getBlockState(origin).isAir())) {
+                throw new AssertionError("Block was never mined — the run stopped for want of food");
+            }
+            ctx.runOnClient(mc -> BotController.stop());
+            LOGGER.info("Hungry-without-food test passed (food level {})", hungry);
+        } finally {
+            ctx.runCommand("difficulty peaceful");
+        }
+    }
+
+    // ================================================================
+    // Test 25: hungry with only what the meal list rules out — carry on
+    // ================================================================
+    /**
+     * The exclusion list is the difference between food and a meal. Rotten
+     * flesh and a golden apple both carry a food component, and both have
+     * to stay where they are — the one for its hunger effect, the other for
+     * being worth more than the stone it would buy — so the run must look
+     * exactly like the one with no food at all: no EATING phase, both stacks
+     * untouched, the block mined regardless.
+     */
+    @MinecraftTest(name = "Bot leaves what is not a meal alone", timeoutTicks = 400, order = -174)
+    public void leavesNonMealsAlone(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2250, 30, 1000);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        final List<BlockPos> blocks = List.of(origin);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + origin.getX() + " " + origin.getY() + " " + origin.getZ()
+                + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        ctx.runCommand("give @s rotten_flesh 4");
+        ctx.runCommand("give @s golden_apple");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+        try {
+            final int hungry = runDownFoodBar(ctx);
+
+            final boolean[] sawEating = {false};
+            startProbe(ctx, BotPolicy.none().withAutoEat(), blocks);
+            ctx.waitFor(mc -> {
+                sawEating[0] |= BotController.getPhase() == BotController.Phase.EATING;
+                return !BehaviorRunner.isActive();
+            });
+
+            if (sawEating[0]) {
+                throw new AssertionError("Bot tried to eat what the meal list rules out");
+            }
+            int flesh = countItem(ctx, Items.ROTTEN_FLESH);
+            int apples = countItem(ctx, Items.GOLDEN_APPLE);
+            if (flesh != 4 || apples != 1) {
+                throw new AssertionError("Inventory changed: " + flesh + " rotten flesh and "
+                        + apples + " golden apple(s) left");
+            }
+            if (ctx.computeOnClient(mc -> !mc.level.getBlockState(origin).isAir())) {
+                throw new AssertionError("Block was never mined");
+            }
+            ctx.runOnClient(mc -> BotController.stop());
+            LOGGER.info("Not-a-meal test passed (food level {})", hungry);
+        } finally {
+            ctx.runCommand("difficulty peaceful");
+        }
+    }
+
+    // ================================================================
+    // Test 26: /bot ignore add, remove and clear edit the list and save it
+    // ================================================================
+    /**
+     * The command path end to end. A namespaced id has to get through the
+     * parser whole — a string argument stops at the colon, which is how
+     * {@code minecraft:cobblestone} once came back as an incomplete command
+     * — a bare name has to land as the same entry, a name that is no item
+     * has to be refused, and every change has to reach bot.json, where the
+     * list is read from at the next start. The player's own list is set
+     * aside first and put back at the end, file included.
+     */
+    @MinecraftTest(name = "Bot ignore commands edit the list", timeoutTicks = 200, order = -173)
+    public void ignoreCommandsEditTheList(TestContext ctx) {
+        final String cobblestone = "minecraft:cobblestone";
+        final String stick = "minecraft:stick";
+        final List<String> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(BotController.CONFIG.ignoredItems));
+        try {
+            ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.clear());
+
+            ctx.runCommand("bot ignore add minecraft:cobblestone");
+            assertIgnored(ctx, List.of(cobblestone), "after adding a namespaced id");
+            if (!BotConfig.load().ignoredItems.contains(cobblestone)) {
+                throw new AssertionError("The added item did not reach bot.json");
+            }
+            ctx.runCommand("bot ignore add cobblestone");
+            assertIgnored(ctx, List.of(cobblestone), "after adding the bare name of an entry");
+            ctx.runCommand("bot ignore add minecraft:not_an_item");
+            assertIgnored(ctx, List.of(cobblestone), "after a name that is no item");
+            ctx.runCommand("bot ignore add stick");
+            assertIgnored(ctx, List.of(cobblestone, stick), "after adding a bare name");
+            ctx.runCommand("bot ignore remove minecraft:cobblestone");
+            assertIgnored(ctx, List.of(stick), "after removing an entry");
+            if (BotConfig.load().ignoredItems.contains(cobblestone)) {
+                throw new AssertionError("The removed item is still in bot.json");
+            }
+            ctx.runCommand("bot ignore clear");
+            assertIgnored(ctx, List.of(), "after clearing");
+            if (!BotConfig.load().ignoredItems.isEmpty()) {
+                throw new AssertionError("bot.json still lists items after the clear");
+            }
+            LOGGER.info("Ignore command test passed");
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.CONFIG.ignoredItems.clear();
+                BotController.CONFIG.ignoredItems.addAll(before);
+                BotController.CONFIG.save();
+            });
+        }
+    }
+
+    private void assertIgnored(TestContext ctx, List<String> expected, String when) {
+        List<String> actual = ctx.computeOnClient(
+                mc -> new ArrayList<>(BotController.CONFIG.ignoredItems));
+        if (!actual.equals(expected)) {
+            throw new AssertionError("Ignore list " + when + " is " + actual
+                    + ", expected " + expected);
+        }
+    }
+
+    /**
+     * Run the food bar under {@code eatBelowFoodLevel} with the hunger
+     * effect, clear the effect, and return the level the bar was left at.
+     * Amplifier 255 is 1.28 exhaustion a tick — a food point every three
+     * ticks or so once the saturation is gone — so the bar is down within a
+     * few dozen ticks and the clear lands before it is empty.
+     * The test world is Peaceful, and Peaceful never takes a food point
+     * ({@code FoodData.tick} only drains saturation there), so the bar is
+     * run down on Easy; the caller restores Peaceful in a {@code finally}.
+     */
+    private int runDownFoodBar(TestContext ctx) {
+        final int threshold = BotController.CONFIG.eatBelowFoodLevel;
+        ctx.runCommand("difficulty easy");
+        ctx.runCommand("effect give @s minecraft:hunger 30 255");
+        ctx.waitFor(mc -> mc.player.getFoodData().getFoodLevel() < threshold);
+        ctx.runCommand("effect clear @s minecraft:hunger");
+        ctx.waitFor(mc -> !mc.player.hasEffect(net.minecraft.world.effect.MobEffects.HUNGER));
+        int level = ctx.computeOnClient(mc -> mc.player.getFoodData().getFoodLevel());
+        LOGGER.info("Food bar run down to {} (threshold {})", level, threshold);
+        return level;
+    }
+
     // --- Shared helpers ---
+
+    /** Shortest-way yaw change since the last sample; the sample is kept. */
+    private static double yawStep(float[] last, float yaw) {
+        double delta = Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - last[0]));
+        last[0] = yaw;
+        return delta;
+    }
 
     /**
      * Register and start a behavior that mines {@code blocks} under the given

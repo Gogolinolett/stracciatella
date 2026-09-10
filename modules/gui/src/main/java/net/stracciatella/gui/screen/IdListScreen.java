@@ -1,30 +1,59 @@
-package net.stracciatella.miner.gui;
+package net.stracciatella.gui.screen;
 
 import java.util.List;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
-import net.minecraft.world.phys.BlockHitResult;
-import net.minecraft.world.phys.HitResult;
-import net.stracciatella.miner.MinerCommands;
-import net.stracciatella.miner.MinerConfig;
 
 /**
- * Edit the chunk miner's blacklist: type an id, or add the block you were
- * last looking at.
+ * Edit a list of registry ids: type one, remove one, or add the one the
+ * game already has in front of the player — the block under the crosshair,
+ * the item in hand, whatever the page's {@link Spec#contextId()} reads.
  *
- * <p>"Looking at" reads {@code Minecraft.hitResult}, which still holds the
- * block the crosshair was on when the menu was opened. That is the whole
- * block-selection mode — aim at the block, open the menu, add it — and it
- * needs no click handling of its own, no mode the player can get stuck in,
- * and no way to accidentally blacklist something while walking around.
+ * <p>Every list a page here edits is the same list: block ids the chunk
+ * miner leaves standing, item ids the bot does not walk to. Both are a
+ * paged list of strings with a remove button each, a text box with
+ * validation, and one context button. What differs is what an id names,
+ * what the context button reads, and where the list is saved — and that is
+ * exactly what the {@link Spec} carries, so the widget code lives once and
+ * the feature modules keep only the wording and the lookups.
  */
-public class BlacklistScreen extends Screen {
+public final class IdListScreen extends Screen {
+
+    /**
+     * What one list needs from its page.
+     *
+     * @param title          heading and window title
+     * @param entries        the live list — edited in place, so the owner's
+     *                       config sees every change without a copy back
+     * @param normalize      canonical id for what the player typed, or null
+     *                       when it names nothing in the registry
+     * @param notAnId        what a rejected entry is not, e.g. "is not a block"
+     * @param emptyHint      shown while the list is empty
+     * @param inputHint      placeholder in the text box
+     * @param save           persists the list after every change
+     * @param contextLabel   the context button's label
+     * @param contextId      the id that button adds, or null when the game
+     *                       has nothing in front of the player right now
+     * @param contextMissing what to say when it returns null
+     */
+    public record Spec(String title,
+                       List<String> entries,
+                       Function<String, String> normalize,
+                       String notAnId,
+                       String emptyHint,
+                       String inputHint,
+                       Runnable save,
+                       String contextLabel,
+                       Supplier<String> contextId,
+                       String contextMissing) {
+    }
 
     private static final int ROWS_PER_PAGE = 7;
     private static final int ROW_HEIGHT = 22;
@@ -37,16 +66,16 @@ public class BlacklistScreen extends Screen {
     private static final int TEXT_COLOR = 0xFFFFFF;
 
     private final Screen parent;
-    private final MinerConfig config;
+    private final Spec spec;
 
     private EditBox input;
     private String status = "";
     private int page;
 
-    BlacklistScreen(Screen parent, MinerConfig config) {
-        super(Component.literal("Chunk miner blacklist"));
+    public IdListScreen(Screen parent, Spec spec) {
+        super(Component.literal(spec.title()));
         this.parent = parent;
-        this.config = config;
+        this.spec = spec;
     }
 
     @Override
@@ -54,8 +83,8 @@ public class BlacklistScreen extends Screen {
         int rowWidth = LIST_WIDTH + GAP + REMOVE_WIDTH;
         int left = this.width / 2 - rowWidth / 2;
 
-        List<String> entries = config.chunkMinerBlacklist;
-        int pages = Math.max(1, (entries.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE);
+        List<String> entries = spec.entries();
+        int pages = pages();
         page = Math.min(page, pages - 1);
         int first = page * ROWS_PER_PAGE;
 
@@ -87,10 +116,9 @@ public class BlacklistScreen extends Screen {
         }
 
         int inputY = controlsY + ROW_HEIGHT + GAP;
-        input = new EditBox(this.font, left, inputY, LIST_WIDTH, 20,
-                Component.literal("Block id"));
+        input = new EditBox(this.font, left, inputY, LIST_WIDTH, 20, Component.literal("Id"));
         input.setMaxLength(128);
-        input.setHint(Component.literal("minecraft:chest"));
+        input.setHint(Component.literal(spec.inputHint()));
         this.addRenderableWidget(input);
         this.addRenderableWidget(Button.builder(Component.literal("Add"),
                         button -> add(input.getValue()))
@@ -98,8 +126,8 @@ public class BlacklistScreen extends Screen {
                 .build());
 
         int bottomY = inputY + ROW_HEIGHT + GAP;
-        this.addRenderableWidget(Button.builder(Component.literal("Add block you're looking at"),
-                        button -> addLookedAt())
+        this.addRenderableWidget(Button.builder(Component.literal(spec.contextLabel()),
+                        button -> addFromContext())
                 .bounds(left, bottomY, rowWidth, 20)
                 .build());
         this.addRenderableWidget(Button.builder(Component.translatable("gui.done"),
@@ -115,18 +143,19 @@ public class BlacklistScreen extends Screen {
         if (!status.isEmpty()) {
             graphics.drawCenteredString(this.font, Component.literal(status),
                     this.width / 2, STATUS_Y, TEXT_COLOR);
-        } else if (config.chunkMinerBlacklist.isEmpty()) {
+        } else if (spec.entries().isEmpty()) {
             graphics.drawCenteredString(this.font,
-                    Component.literal("Blacklist is empty — the miner digs everything")
-                            .withStyle(ChatFormatting.GRAY),
+                    Component.literal(spec.emptyHint()).withStyle(ChatFormatting.GRAY),
                     this.width / 2, STATUS_Y, TEXT_COLOR);
         }
     }
 
+    private int pages() {
+        return Math.max(1, (spec.entries().size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE);
+    }
+
     private void turnPage(int delta) {
-        int pages = Math.max(1,
-                (config.chunkMinerBlacklist.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE);
-        page = Math.floorMod(page + delta, pages);
+        page = Math.floorMod(page + delta, pages());
         rebuild();
     }
 
@@ -134,35 +163,33 @@ public class BlacklistScreen extends Screen {
         if (raw == null || raw.isBlank()) {
             return;
         }
-        String id = MinerCommands.normalize(raw.trim());
+        String id = spec.normalize().apply(raw.trim());
         if (id == null) {
-            status = "'" + raw.trim() + "' is not a block";
+            status = "'" + raw.trim() + "' " + spec.notAnId();
             return;
         }
-        if (config.chunkMinerBlacklist.contains(id)) {
+        if (spec.entries().contains(id)) {
             status = id + " is already on the list";
             return;
         }
-        config.chunkMinerBlacklist.add(id);
-        config.save();
+        spec.entries().add(id);
+        spec.save().run();
         status = "Added " + id;
         rebuild();
     }
 
-    private void addLookedAt() {
-        HitResult hit = this.minecraft.hitResult;
-        if (!(hit instanceof BlockHitResult blockHit) || hit.getType() != HitResult.Type.BLOCK
-                || this.minecraft.level == null) {
-            status = "Aim at a block before opening this menu";
+    private void addFromContext() {
+        String id = spec.contextId().get();
+        if (id == null) {
+            status = spec.contextMissing();
             return;
         }
-        var state = this.minecraft.level.getBlockState(blockHit.getBlockPos());
-        add(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+        add(id);
     }
 
     private void remove(String id) {
-        if (config.chunkMinerBlacklist.remove(id)) {
-            config.save();
+        if (spec.entries().remove(id)) {
+            spec.save().run();
             status = "Removed " + id;
         }
         rebuild();
@@ -182,6 +209,10 @@ public class BlacklistScreen extends Screen {
         this.minecraft.setScreen(this.parent);
     }
 
+    /**
+     * Not a pause screen, like the root menu: the lists here are edited while
+     * a bot is working, and in singleplayer a pausing screen would stop it.
+     */
     @Override
     public boolean isPauseScreen() {
         return false;

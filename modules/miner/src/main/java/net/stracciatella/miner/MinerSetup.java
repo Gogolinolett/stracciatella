@@ -4,7 +4,6 @@ import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.gui.GuiRegistry;
 import net.stracciatella.miner.gui.BlacklistPage;
 import net.stracciatella.miner.test.ChunkMinerTests;
-import net.stracciatella.miner.test.MinerTests;
 import net.stracciatella.testing.runner.TestRunner;
 
 /**
@@ -44,7 +43,11 @@ public final class MinerSetup {
         BehaviorRunner.register(chunkMiner);
         MinerCommands.register();
         GuiRegistry.register(new BlacklistPage(CONFIG));
-        TestRunner.instance().registerSuite(MinerTests.class);
+        // MinerTests, the diamond miner's suite, is not registered for now:
+        // the behavior is unused and broken in real worlds, and its two
+        // tests — the longest of any run — guard code nobody is working on.
+        // The class stays, deep-mining sandbox included; registering it here
+        // is all it takes to bring the suite back.
         TestRunner.instance().registerSuite(ChunkMinerTests.class);
     }
 }

@@ -60,10 +60,26 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     private static final int CHUNK_SIZE = 16;
     private static final int SLAB_HEIGHT = 2;
-    /** Cap on a liquid flood fill — enough to tell a puddle from an ocean. */
-    private static final int FLOOD_FILL_LIMIT = 16;
+    /**
+     * Cap on a liquid flood fill — enough to tell a pool from an ocean. A
+     * body that fits under it has been surveyed whole, sources included; one
+     * that does not is dammed without asking where its water comes from. One
+     * source on a flat floor spreads into a diamond of 113 cells, so this is
+     * sized for a pool of one or two sources with their whole spread; it was
+     * 16 for a long time, which no spread pool ever fit under, and every one
+     * of them was dammed cell by cell across its flowing edge instead.
+     */
+    private static final int FLOOD_FILL_LIMIT = 128;
     /** At most this many sources get capped individually; beyond it, dam. */
-    private static final int MAX_SEALABLE_SOURCES = 5;
+    private static final int MAX_SEALABLE_SOURCES = 16;
+    /**
+     * How long flowing water with no source left is given to drain on its
+     * own before it is dammed after all. Water recedes one level per
+     * scheduled fluid tick, five ticks apart, so a capped pool's spread is
+     * gone in well under this; the bound is for water that keeps arriving
+     * from somewhere the survey did not reach.
+     */
+    private static final int RESIDUAL_WATER_TICKS = 100;
     /** Deepest drop the bot is allowed to open under its own feet. */
     private static final int MAX_SAFE_DROP = 2;
     /**
@@ -118,6 +134,10 @@ public class ChunkMinerBehavior implements BotBehavior {
     private int blocksMined;
     private String failReason;
     private int dropWaitTicks;
+    // Column at which sourceless water is being waited out, and for how long
+    // so far; see handleLiquidsAround.
+    private BlockPos residualWaterColumn;
+    private int residualWaterTicks;
 
     public ChunkMinerBehavior(MinerConfig config) {
         this.config = config;
@@ -165,7 +185,12 @@ public class ChunkMinerBehavior implements BotBehavior {
                 // corner of the next row is hidden behind its neighbour. This
                 // is what lets it walk the last stretch instead of skipping the
                 // corner and turning back for it.
-                .withApproachOccluded();
+                .withApproachOccluded()
+                // A chunk is hours of standing in one place, and a bot on an
+                // empty food bar stops regenerating without anyone noticing.
+                // The meal goes in between two columns, where the hand is off
+                // the button anyway.
+                .withAutoEat();
     }
 
     @Override
@@ -182,6 +207,8 @@ public class ChunkMinerBehavior implements BotBehavior {
         blocksMined = 0;
         failReason = null;
         dropWaitTicks = 0;
+        residualWaterColumn = null;
+        residualWaterTicks = 0;
 
         LocalPlayer player = client.player;
         if (player == null) {
@@ -987,37 +1014,79 @@ public class ChunkMinerBehavior implements BotBehavior {
                 sources.add(pos);
             }
         }
+        boolean surveyed = body.size() < FLOOD_FILL_LIMIT;
 
         List<BlockPos> toSeal;
-        boolean capping = !lava && !sources.isEmpty() && sources.size() <= MAX_SEALABLE_SOURCES
-                && body.size() < FLOOD_FILL_LIMIT;
+        boolean capping = !lava && surveyed && !sources.isEmpty()
+                && sources.size() <= MAX_SEALABLE_SOURCES;
         if (capping) {
-            // Small pool, fully surveyed: cap the sources themselves — an
-            // uncapped source next door refills the chunk as fast as it is dug.
+            // Pool fully surveyed: cap the sources themselves — an uncapped
+            // source next door refills the chunk as fast as it is dug — and
+            // only those. The spread drains by itself once they are gone, so
+            // a block on a flowing cell is a block for nothing, and that is
+            // what every spread pool got while the survey limit was 16: no
+            // pool with its spread fits under it, so none was ever surveyed
+            // whole, and each was walled up across its flowing edge instead.
             toSeal = sources;
+        } else if (!lava && surveyed && sources.isEmpty()) {
+            // Flowing water with no source anywhere in it is what a capped
+            // pool leaves behind, and it is on its way out — water recedes a
+            // level per fluid tick. Let it, for a while, standing still.
+            // Water still there past the bound is fed from somewhere the
+            // survey did not reach, and gets the dam after all.
+            if (!column.equals(residualWaterColumn)) {
+                residualWaterColumn = column;
+                residualWaterTicks = 0;
+                LOGGER.info("Chunk miner: waiting for sourceless water at {} to drain",
+                        shortPos(start));
+            }
+            if (residualWaterTicks++ < RESIDUAL_WATER_TICKS) {
+                return BehaviorStatus.RUNNING;
+            }
+            toSeal = damAcross(touching);
         } else {
-            // Dam: the cells the bot was about to occupy or walk past,
-            // wherever they lie. A column on the chunk border has half of them
-            // in the neighbouring chunk, and that is the side the water comes
-            // from — a dam that stops at the border is no dam at all, and the
-            // run died at the first lake it dug past.
-            toSeal = new ArrayList<>(touching);
-            // Cells beyond the chunk go first. A plug inside it is mined out
-            // again later and the liquid walks straight back in behind it, so
-            // the dam that holds is the one on the far side of the border.
-            toSeal.sort(Comparator.comparing(pos -> chunk.equals(new ChunkPos(pos))));
+            toSeal = damAcross(touching);
         }
         LOGGER.info("Chunk miner: {} {} block(s) against {} at {}",
                 capping ? "capping" : "damming", toSeal.size(),
                 lava ? "lava" : "water", shortPos(start));
         String what = capping ? "water cap" : (lava ? "lava dam" : "water dam");
+        // One placement per call; the next comes round once it is verified.
+        // A cell with nothing to build against yet is passed over for one
+        // that has: a source in the middle of a pool has only water round it
+        // until its neighbours are capped, and a two-deep pool's upper source
+        // stands on the lower one. Failing on the first such cell ended runs
+        // that the next placement would have made possible.
+        BlockPos unsupported = null;
         for (BlockPos pos : toSeal) {
-            BehaviorStatus placement = planPlacement(player, level, pos, what);
-            if (placement != null) {
-                return placement;
+            BlockPos support = PlaceBlockTask.findSupport(level, pos, player.getEyePosition());
+            if (support == null) {
+                if (unsupported == null) {
+                    unsupported = pos;
+                }
+                continue;
             }
+            return planPlacement(pos, support, what);
+        }
+        if (unsupported != null) {
+            return fail("nothing to build the " + what + " at " + shortPos(unsupported) + " against");
         }
         return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * Dam: the cells the bot was about to occupy or walk past, wherever they
+     * lie. A column on the chunk border has half of them in the neighbouring
+     * chunk, and that is the side the water comes from — a dam that stops at
+     * the border is no dam at all, and the run died at the first lake it dug
+     * past. Cells beyond the chunk go first: a plug inside it is mined out
+     * again later and the liquid walks straight back in behind it, so the dam
+     * that holds is the one on the far side of the border.
+     */
+    private List<BlockPos> damAcross(Set<BlockPos> touching) {
+        List<BlockPos> toSeal = new ArrayList<>(touching);
+        toSeal.sort(Comparator.comparing(pos -> chunk.equals(new ChunkPos(pos))));
+        return toSeal;
     }
 
     /**

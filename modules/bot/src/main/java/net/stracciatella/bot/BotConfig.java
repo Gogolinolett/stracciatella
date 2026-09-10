@@ -5,6 +5,8 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -76,6 +78,18 @@ public class BotConfig {
     // sighting before COLLECTING exits (see vault ticket STR-026).
     public int itemAbsenceTicks = 60;
 
+    // Item ids the bot neither walks to nor waits for: a drop on this list
+    // is left where it fell, unless it lands inside the vanilla pickup box,
+    // which takes it without anyone walking anywhere. Empty by default;
+    // edited by /bot ignore and the gui module's "Ignored items" page.
+    public List<String> ignoredItems = new ArrayList<>();
+
+    // A behavior that opted into BotPolicy.autoEat eats between two tasks
+    // once the food bar is below this many points (of 20). 14 is the level
+    // above which a player still regenerates health; one meal from there
+    // lands back at or over it.
+    public int eatBelowFoodLevel = 14;
+
     // Scanning: look toward distant target before walking
     public int scanTimeout = 30;
     public double scanFacingTolerance = 15.0;
@@ -122,6 +136,13 @@ public class BotConfig {
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;
+        // Contents, not the reference: the commands and the GUI page hold
+        // this list, and a file without the key leaves Gson's null behind.
+        this.ignoredItems.clear();
+        if (other.ignoredItems != null) {
+            this.ignoredItems.addAll(other.ignoredItems);
+        }
+        this.eatBelowFoodLevel = other.eatBelowFoodLevel;
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;
         this.scanRadius = other.scanRadius;

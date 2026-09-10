@@ -19,5 +19,6 @@ dependencies {
     compileOnly(projects.loader)
     compileOnly(project(":modules:camera"))
     compileOnly(project(":modules:pathfinding"))
+    compileOnly(project(":modules:gui"))
     compileOnly(project(":modules:testing"))
 }

@@ -25,10 +25,11 @@ public record BotPolicy(
         boolean opportunisticCollection,
         boolean fastCollectExit,
         boolean orderedTasks,
-        boolean approachOccluded) {
+        boolean approachOccluded,
+        boolean autoEat) {
 
     private static final BotPolicy NONE =
-            new BotPolicy(false, false, false, 0, false, false, false, false);
+            new BotPolicy(false, false, false, 0, false, false, false, false, false);
 
     /**
      * Everything off — the execution layer behaves exactly as it did before
@@ -41,19 +42,19 @@ public record BotPolicy(
     /** Stop the run on any health decrease. */
     public BotPolicy withDamageStop() {
         return new BotPolicy(true, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat);
     }
 
     /** Stop the run when a player attacks the bot, even for zero damage. */
     public BotPolicy withPlayerAttackStop() {
         return new BotPolicy(stopOnDamage, true, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat);
     }
 
     /** Stop the run once fewer than {@code minFreeSlots} main slots are empty. */
     public BotPolicy withInventoryFullStop(int minFreeSlots) {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, true, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat);
     }
 
     /**
@@ -62,7 +63,7 @@ public record BotPolicy(
      */
     public BotPolicy withOpportunisticCollection() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                true, fastCollectExit, orderedTasks, approachOccluded);
+                true, fastCollectExit, orderedTasks, approachOccluded, autoEat);
     }
 
     /**
@@ -72,7 +73,7 @@ public record BotPolicy(
      */
     public BotPolicy withFastCollectExit() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, true, orderedTasks, approachOccluded);
+                opportunisticCollection, true, orderedTasks, approachOccluded, autoEat);
     }
 
     /**
@@ -97,7 +98,7 @@ public record BotPolicy(
      */
     public BotPolicy withOrderedTasks() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, true, approachOccluded);
+                opportunisticCollection, fastCollectExit, true, approachOccluded, autoEat);
     }
 
     /**
@@ -128,6 +129,26 @@ public record BotPolicy(
      */
     public BotPolicy withApproachOccluded() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, true);
+                opportunisticCollection, fastCollectExit, orderedTasks, true, autoEat);
+    }
+
+    /**
+     * Eat between two tasks once the food bar is below
+     * {@code BotConfig.eatBelowFoodLevel}: the biggest stack of anything
+     * edible that is not poison or a golden apple, held down the way a
+     * player holds the button. Only ever between tasks — a seam continuation
+     * included, since the hand comes off the button there anyway — never in
+     * the middle of a break or a walk. With nothing to eat the run carries on
+     * and says so once, in yellow and with a low note; a behavior that runs
+     * unattended for an hour would otherwise stop regenerating and, at the
+     * bottom of the bar, stop sprinting, without anyone finding out.
+     *
+     * <p>Opt-in like the rest: a plain {@code /bot mine} or the diamond miner
+     * must not start eating the player's food, and a strategy that runs for
+     * one block has no use for it.
+     */
+    public BotPolicy withAutoEat() {
+        return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, true);
     }
 }

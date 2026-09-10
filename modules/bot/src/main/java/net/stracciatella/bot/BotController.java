@@ -2,10 +2,20 @@ package net.stracciatella.bot;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Set;
 
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
@@ -139,6 +149,36 @@ public class BotController {
     private static final double AIM_LOOKAHEAD_BIAS = 0.3;
     private static final double AIM_EDGE_MARGIN = 0.15;
 
+    // The vertical extent of vanilla's pickup box, relative to the feet: the
+    // player box inflated by 0.5 up and down meets a 0.25-high item lying
+    // between 0.75 below the feet and 2.3 above them. Both trimmed by a
+    // quarter block, the same allowance the horizontal 1.0 makes against
+    // 1.425 for the server seeing the walk a tick late.
+    private static final double PICKUP_BOX_BELOW = -0.5;
+    private static final double PICKUP_BOX_ABOVE = 2.0;
+    // How far above or below its feet COLLECTING will go for a drop. One
+    // block is what the raw-key walk can manage: a step down, and a step-up
+    // jump on the way back. Further than that needs a path, and COLLECTING
+    // does not have one — it used to try anyway, up to four blocks, and every
+    // such drop cost the walk-progress watchdog its full window.
+    private static final double COLLECT_REACH_VERTICAL = 1.5;
+
+    // Step-up jump for the raw-key walks. Vanilla's auto-step is 0.6 blocks,
+    // so a walk that meets a one-block rise stands against it until the
+    // position timeout — after collecting a drop from a block lower down,
+    // the bot never came back up. The wall has to be within this distance
+    // ahead for the jump to go: from further out it lands short of the top,
+    // and by the time the body is against the wall the cell ahead at foot
+    // height is the wall itself. The cooldown keeps the decision from
+    // re-firing while the jump it just made is still in the air.
+    private static final double STEP_UP_LOOKAHEAD = 0.6;
+    private static final int STEP_UP_COOLDOWN_TICKS = 10;
+    private static int stepUpCooldown = 0;
+    // The jump key is a one-tick pulse: pressed on the tick the decision
+    // falls, released at the top of the next whatever that tick does — a
+    // walk that ends, a phase that changes — so it can never be left down.
+    private static boolean jumpPressed = false;
+
     // Deferred-action mechanism: when a phase decides to transition, it can
     // request a Gaussian-distributed reaction delay first. During the delay
     // the current phase's tick logic is skipped (the bot "freezes" briefly,
@@ -206,6 +246,62 @@ public class BotController {
     // they say whether the server rejected the break or merely acked slowly.
     private static int stateReverts = 0;
     private static int firstDoneTick = -1;
+    // A block that will drop into the cell once it opens: gravel or sand
+    // resting on the target, or already on its way down as an entity.
+    // Latched over the break, because the block above turns into the entity
+    // and the entity into the block below inside single ticks, and a check
+    // that looks only once can land between two of them.
+    private static boolean fallExpected = false;
+    // Set once the break is confirmed and a fall is expected: the interaction
+    // is released and the phase idles, camera on the cell, until the fallen
+    // block stands in it (then it is the task's next sub-target) or nothing
+    // more comes down.
+    private static boolean awaitingFall = false;
+    private static int fallWaitTicks = 0;
+    // Upper bound on the wait. One block of fall takes under ten ticks, so
+    // this is the cap for a block that never arrives — a column that fell
+    // straight through because the cell below was open too.
+    private static final int FALL_WAIT_TICKS = 40;
+    // The first ticks of the wait are spent regardless of what is visible:
+    // the fall is scheduled two server ticks after the break, and until then
+    // there is nothing to see but the block that is about to go.
+    private static final int FALL_GRACE_TICKS = 4;
+    // How far up the column is searched for a falling-block entity. A fall
+    // that starts higher than this lands long after the wait has given up.
+    private static final int FALL_COLUMN_HEIGHT = 32;
+
+    // --- Eating (BotPolicy.autoEat) ---
+    // The transition that was about to happen when hunger got in the way;
+    // it runs the moment the meal is over.
+    private static Runnable afterEating = null;
+    private static boolean eatingStarted = false;
+    // The bar before the meal: the phase ends when it goes up, the server's
+    // word that the meal happened. The client never finishes a use itself —
+    // completion is server-only — and while the button is held vanilla
+    // re-arms the next bite in the tick the synced stop flag lands, so the
+    // hand never shows a gap an end-of-tick hook could catch.
+    private static int foodBeforeMeal = 0;
+    // Once per run each: said in chat with a low note when the bar is down
+    // and there is nothing to eat, and remembered when a meal never started,
+    // so a bot that cannot eat does not try again at every task.
+    private static boolean noFoodWarned = false;
+    private static boolean mealFailed = false;
+    /**
+     * Longer than any meal (32 ticks for food, 40 for a stew): the bound on
+     * a meal that never starts or never ends, after which the run carries on
+     * hungry rather than standing there with the button held.
+     */
+    private static final int EAT_TIMEOUT_TICKS = 60;
+    /**
+     * Edible but not a meal: what poisons or nauseates, what is worth far
+     * more than a food bar (golden apples), the chorus fruit's teleport, and
+     * the stew whose effect is a gamble. Anything else with a food component
+     * is eaten, biggest stack first.
+     */
+    private static final Set<Item> NOT_A_MEAL = Set.of(
+            Items.CHICKEN, Items.ROTTEN_FLESH, Items.PUFFERFISH, Items.SPIDER_EYE,
+            Items.POISONOUS_POTATO, Items.CHORUS_FRUIT, Items.GOLDEN_APPLE,
+            Items.ENCHANTED_GOLDEN_APPLE, Items.SUSPICIOUS_STEW);
 
     public enum Phase {
         IDLE,
@@ -214,7 +310,8 @@ public class BotController {
         POSITIONING,
         LOOKING,
         INTERACTING,
-        COLLECTING
+        COLLECTING,
+        EATING
     }
 
     // --- Public API ---
@@ -234,6 +331,9 @@ public class BotController {
      */
     public static void setPolicy(BotPolicy newPolicy) {
         policy = newPolicy != null ? newPolicy : BotPolicy.none();
+        // A new run gets its one warning and its one failed meal afresh.
+        noFoodWarned = false;
+        mealFailed = false;
     }
 
     public static BotPolicy policy() {
@@ -261,6 +361,12 @@ public class BotController {
         lastItemSeenTick = 0;
         stateConfirmTicks = 0;
         completionSequence = -1;
+        fallExpected = false;
+        awaitingFall = false;
+        fallWaitTicks = 0;
+        afterEating = null;
+        eatingStarted = false;
+        releaseUseKey();
         seamContinuation = false;
         ServerBlockSync.reset();
         deferredAction = null;
@@ -282,6 +388,9 @@ public class BotController {
         deferredAction = null;
         deferredActionDelay = 0;
         releaseMovementKeys();
+        // A meal in progress is abandoned with the button; EATING picks it up
+        // again on resume, from the start.
+        releaseUseKey();
         LOGGER.info("Bot paused");
     }
 
@@ -333,6 +442,15 @@ public class BotController {
         // on the lip of a hole has to keep crouching whatever the state
         // machine is doing, including nothing.
         updateBridging(client, player);
+        // Likewise ahead of both gates: a jump pressed last tick is released
+        // here regardless of what the state machine does next.
+        if (jumpPressed) {
+            client.options.keyJump.setDown(false);
+            jumpPressed = false;
+        }
+        if (stepUpCooldown > 0) {
+            stepUpCooldown--;
+        }
 
         if (paused || phase == Phase.IDLE) {
             return;
@@ -370,6 +488,7 @@ public class BotController {
             case LOOKING -> tickLooking(client, player);
             case INTERACTING -> tickInteracting(client, player);
             case COLLECTING -> tickCollecting();
+            case EATING -> tickEating(client, player);
             default -> { }
         }
     }
@@ -588,11 +707,19 @@ public class BotController {
             releaseMovementKeys();
             return;
         }
-        // Cleared first: the edge-step walk above drives all four keys, and a
-        // backwards one still held here would cancel this one out into
-        // standing still.
-        releaseMovementKeys();
-        client.options.keyUp.setDown(true);
+        // In view direction, through the same key quantisation as every other
+        // walk — it drives all four keys, so a backwards one the edge-step
+        // walk above still held cannot cancel this one out into standing
+        // still. A one-block rise on the way is jumped, unless the bot is
+        // crouching at an edge: a crouch-jump off a rim is the fall the
+        // crouch is there to prevent.
+        double yawRad = Math.toRadians(player.getYRot());
+        double dirX = -Math.sin(yawRad);
+        double dirZ = Math.cos(yawRad);
+        walkToward(client, player, dirX, dirZ);
+        if (!bridging) {
+            stepUpIfBlocked(client, player, dirX, dirZ);
+        }
     }
 
     private static void tickLooking(Minecraft client, LocalPlayer player) {
@@ -668,45 +795,14 @@ public class BotController {
             toolSelected = true;
             releaseMovementKeys();
         }
-        // Aim at the center of the face that's most directly visible from the
-        // bot's eye, not the block center. The center of a block in the middle
-        // of a stack (e.g. top log of a tree) sits behind the next block's
-        // face, so a raycast aimed at the center actually lands on the
-        // neighbor. Aiming at the exposed face guarantees the raycast clears
-        // intermediate blocks and lands on the target.
-        net.minecraft.core.Direction face = aimFace(client, currentTask);
-        double tx = target.getX() + 0.5 + face.getStepX() * 0.5;
-        double ty = target.getY() + 0.5 + face.getStepY() * 0.5;
-        double tz = target.getZ() + 0.5 + face.getStepZ() * 0.5;
-
-        // Apply human-aim jitter only on the two axes perpendicular to the
-        // face normal. Adding offset *along* the face normal pushes the aim
-        // point off the face plane, which makes the raycast graze just past
-        // the block's edge and land on a neighbor (or the platform below) —
-        // the hit-result gate then never matches and the bot stares forever.
-        double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
-        double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
-        double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
-
-        // Then slide the aim point across the face toward wherever the work
-        // goes next, so the camera is already leaning that way when the target
-        // switches. Mining a 2-high column, the two blocks sit one above the
-        // other: aiming at each face's centre swings the head through the
-        // whole angle between them, while aiming near their shared edge makes
-        // the switch a few degrees. Someone digging a corridor does the same —
-        // they look at the seam, not at two separate block centres. The bias
-        // stays inside AIM_EDGE_MARGIN of the rim, because the raycast has to
-        // keep landing on this block: past the edge it catches the neighbour
-        // and the hit-result gate never fires.
-        BotTask next = peekNextTask(player);
-        if (next != null) {
-            BlockPos toward = next.targetPos();
-            offX = biasTowardNext(offX, face.getStepX(), toward.getX() - target.getX());
-            offY = biasTowardNext(offY, face.getStepY(), toward.getY() - target.getY());
-            offZ = biasTowardNext(offZ, face.getStepZ(), toward.getZ() - target.getZ());
-        }
-
-        aimCameraAt(player, tx + offX, ty + offY, tz + offZ);
+        // Aim at the face that's most directly visible from the bot's eye, not
+        // the block center — see aimPoint for where on it. The center of a
+        // block in the middle of a stack (e.g. top log of a tree) sits behind
+        // the next block's face, so a raycast aimed at the center actually
+        // lands on the neighbor. Aiming at the exposed face guarantees the
+        // raycast clears intermediate blocks and lands on the target.
+        double[] aim = aimPoint(player, target, aimFace(client, currentTask), peekNextTask(player));
+        aimCameraAt(player, aim[0], aim[1], aim[2]);
 
         // Single gate before transitioning to INTERACTING: the client's
         // raycast actually lands on the target block. A human starts mining
@@ -739,7 +835,7 @@ public class BotController {
             // the crosshair keeps resting on the same other block — the
             // geometry won't change by staring, so step closer now instead
             // of waiting out the full lookTimeout.
-            boolean aimSettled = camera.isAimedAt(player, tx, ty, tz, offX, offY, offZ, 3.0f);
+            boolean aimSettled = camera.isAimedAt(player, aim[0], aim[1], aim[2], 3.0f);
             BlockPos hitBlock = client.hitResult instanceof BlockHitResult bhr
                     ? bhr.getBlockPos() : null;
             if (aimSettled && hitBlock != null && hitBlock.equals(lastWrongHit)) {
@@ -835,7 +931,10 @@ public class BotController {
     }
 
     private static void tickInteracting(Minecraft client, LocalPlayer player) {
-        if (phaseTicks > CONFIG.maxBreakTicks) {
+        // The break budget is for breaking. Waiting for a fallen block to
+        // land is bounded on its own (FALL_WAIT_TICKS) and must not turn a
+        // slow but finished break into a timeout.
+        if (!awaitingFall && phaseTicks > CONFIG.maxBreakTicks) {
             BlockInteractor.stopInteraction();
             releaseMovementKeys();
             // Failure-only diagnostics. The three ways a break can burn the
@@ -878,12 +977,18 @@ public class BotController {
             stateReverts = 0;
             firstDoneTick = -1;
             startInventoryCount = countMainInventory(player);
+            fallExpected = false;
+            awaitingFall = false;
+            fallWaitTicks = 0;
             // Sustained aim during mining is when "frozen gaze" reads as bot.
             // Saccades may have been enabled by LOOKING's hesitation gate;
             // ensure they're on here as well in case hesitation was 0.
             if (camera != null) {
                 camera.setMicroSaccadesEnabled(true);
             }
+        }
+        if (!placing && !fallExpected && fallIncoming(level, target)) {
+            fallExpected = true;
         }
 
         // Keep aiming at the target's exposed face (matches LOOKING's aim
@@ -903,7 +1008,7 @@ public class BotController {
         // sub-target, not a queue entry, and turning to a queued task there
         // would be a wrong turn rather than an early one.
         BotTask aimTask = currentTask;
-        if (!placing && targetDone && currentTask.isFullyComplete()) {
+        if (!placing && targetDone && currentTask.isFullyComplete() && !fallExpected) {
             BotTask ahead = peekNextTask(player);
             if (ahead != null && ahead.interactionType() == InteractionType.ATTACK
                     && isWithinReach(player, ahead.targetPos())) {
@@ -911,15 +1016,28 @@ public class BotController {
             }
         }
         if (camera != null) {
-            BlockPos aimPos = aimTask.targetPos();
-            net.minecraft.core.Direction face = aimFace(client, aimTask);
-            double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
-            double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
-            double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
-            aimCameraAt(player,
-                    aimPos.getX() + 0.5 + face.getStepX() * 0.5 + offX,
-                    aimPos.getY() + 0.5 + face.getStepY() * 0.5 + offY,
-                    aimPos.getZ() + 0.5 + face.getStepZ() * 0.5 + offZ);
+            double[] aim = aimPoint(player, aimTask.targetPos(), aimFace(client, aimTask), null);
+            aimCameraAt(player, aim[0], aim[1], aim[2]);
+        }
+
+        // The break is confirmed and something is on its way down into the
+        // cell. Nothing to break yet: the interaction has been released, the
+        // camera stays on the cell, and the phase idles until the fallen
+        // block stands in it or nothing more arrives.
+        if (awaitingFall) {
+            if (!targetDone) {
+                awaitingFall = false;
+                finishBreak(player, target, false);
+                return;
+            }
+            fallWaitTicks++;
+            if (fallWaitTicks < FALL_WAIT_TICKS
+                    && (fallWaitTicks <= FALL_GRACE_TICKS || fallIncoming(level, target))) {
+                return;
+            }
+            awaitingFall = false;
+            finishBreak(player, target, false);
+            return;
         }
 
         // Step toward drops without interrupting the break — the camera above
@@ -1038,46 +1156,90 @@ public class BotController {
             }
 
             // stateConfirmTicks resets on re-entry via the phaseTicks==1 branch above.
-            //
-            // Reaction beat between "the block broke" and the next phase —
-            // a human glances at the result for a moment before moving on.
-            // For sub-targets and same-reach next-targets we re-enter LOOKING;
-            // otherwise we COLLECT drops before walking.
 
-            // Sub-targets remaining in same task (e.g. tree logs) — mine next next
-            if (currentTask.advanceToNextTarget()) {
-                lookRetryUsed = false;
-                continueSeam();
+            // A block resting on the target drops into the hole the moment
+            // the server opens it. Deciding now would decide on a cell that
+            // is about to be full again: the task would be reported done, and
+            // whoever planned it would find gravel standing where it had
+            // been told there was air. Wait for the fall first.
+            if (!placing && fallExpected) {
+                awaitingFall = true;
+                fallWaitTicks = 0;
                 return;
             }
-
-            // A placement drops nothing, so there is nothing to collect —
-            // take the next task straight after the reaction beat.
-            if (placing) {
-                scheduleAction(BotController::completeCurrentTask);
-                return;
-            }
-
-            // Task fully done — decide what to do next based on the queue.
-            // The "next" task is always the one nearest to the player, not
-            // the queue head (see startNextTask).
-            lastMinedPos = target;
-            BotTask nextTask = peekNextTask(player);
-            if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
-                // Next target is within reach — mine it next, no beat
-                currentTask = pollNextTask(player);
-                taskTotalTicks = 0;
-                lookRetryUsed = false;
-                continueSeam();
-            } else {
-                // Need to walk (or nothing left) — collect drops first.
-                // Don't delay here: COLLECTING begins immediately so the bot
-                // starts pursuing drops while they're still falling.
-                itemsSeenThisCollect = false;
-                lastItemSeenTick = 0;
-                transitionTo(Phase.COLLECTING);
-            }
+            finishBreak(player, target, placing);
         }
+    }
+
+    /**
+     * Where to go once the cell is settled — the break confirmed and nothing
+     * left to fall into it. Reaction beat between "the block broke" and the
+     * next phase: a human glances at the result for a moment before moving
+     * on. For sub-targets and same-reach next-targets we re-enter LOOKING;
+     * otherwise we COLLECT drops before walking.
+     */
+    private static void finishBreak(LocalPlayer player, BlockPos target, boolean placing) {
+        // Sub-targets remaining in same task — the next log of a tree, or the
+        // block that just fell into the cell of a mine task.
+        if (currentTask.advanceToNextTarget()) {
+            lookRetryUsed = false;
+            continueSeam();
+            return;
+        }
+        // No next sub-target, and yet not done: the cell has refilled more
+        // often than falling blocks explain, and the task has stopped
+        // chasing it.
+        if (!currentTask.isFullyComplete()) {
+            failCurrentTask("Cell keeps refilling");
+            return;
+        }
+
+        // A placement drops nothing, so there is nothing to collect —
+        // take the next task straight after the reaction beat.
+        if (placing) {
+            scheduleAction(BotController::completeCurrentTask);
+            return;
+        }
+
+        // Task fully done — decide what to do next based on the queue.
+        // The "next" task is always the one nearest to the player, not
+        // the queue head (see startNextTask).
+        lastMinedPos = target;
+        BotTask nextTask = peekNextTask(player);
+        if (nextTask != null && isWithinReach(player, nextTask.targetPos())) {
+            // Next target is within reach — mine it next, no beat
+            currentTask = pollNextTask(player);
+            taskTotalTicks = 0;
+            lookRetryUsed = false;
+            continueSeam();
+        } else {
+            // Need to walk (or nothing left) — collect drops first.
+            // Don't delay here: COLLECTING begins immediately so the bot
+            // starts pursuing drops while they're still falling.
+            itemsSeenThisCollect = false;
+            lastItemSeenTick = 0;
+            transitionTo(Phase.COLLECTING);
+        }
+    }
+
+    /**
+     * Whether a block is about to drop into {@code target} once it is open:
+     * one that falls (gravel, sand, concrete powder, an anvil) resting
+     * directly on it, or one already falling down its column as an entity.
+     * Only the column directly above matters — a falling block never moves
+     * sideways — and only the block resting on the cell can start a fall,
+     * because it is the loss of support that triggers one.
+     */
+    private static boolean fallIncoming(Level level, BlockPos target) {
+        if (level.getBlockState(target.above()).getBlock()
+                instanceof net.minecraft.world.level.block.Fallable) {
+            return true;
+        }
+        net.minecraft.world.phys.AABB column = new net.minecraft.world.phys.AABB(
+                target.getX(), target.getY(), target.getZ(),
+                target.getX() + 1, target.getY() + FALL_COLUMN_HEIGHT, target.getZ() + 1);
+        return !level.getEntities(
+                net.minecraft.world.entity.EntityType.FALLING_BLOCK, column, e -> true).isEmpty();
     }
 
     /**
@@ -1115,6 +1277,9 @@ public class BotController {
         var box = player.getBoundingBox().inflate(OPPORTUNISTIC_ITEM_RANGE);
         for (var item : client.level.getEntities(
                 net.minecraft.world.entity.EntityType.ITEM, box, e -> true)) {
+            if (isIgnoredDrop(item)) {
+                continue;
+            }
             double dx = item.getX() - player.getX();
             double dy = item.getY() - player.getY();
             double dz = item.getZ() - player.getZ();
@@ -1174,6 +1339,77 @@ public class BotController {
         client.options.keyLeft.setDown(strafeDir < 0);
         client.options.keyRight.setDown(strafeDir > 0);
         client.options.keySprint.setDown(false);
+    }
+
+    /**
+     * Where on {@code face} of {@code aimPos} the camera points this tick.
+     *
+     * <p>The face centre, with this task's jitter on the two in-plane axes
+     * only — an offset <em>along</em> the normal pushes the aim point off the
+     * face plane, the raycast grazes past the edge onto a neighbour, and the
+     * hit-result gate never matches — then slid across the face toward
+     * {@code next} when there is one, so the camera is already leaning that
+     * way when the target switches. Mining a 2-high column, aiming at each
+     * face's centre swings the head through the whole angle between them,
+     * while aiming near their shared edge makes the switch a few degrees:
+     * someone digging a corridor looks at the seam, not at two block centres.
+     * The bias stays inside {@link #AIM_EDGE_MARGIN} of the rim so the
+     * raycast keeps landing on this block.
+     *
+     * <p>A face pointing up or down with the eye over it is the exception.
+     * There the horizontal offset from the eye to the aim point is nothing
+     * but the jitter, and the atan2 of a few centimetres is a yaw in an
+     * arbitrary compass direction — rolled afresh for every block, so a bot
+     * digging straight down turned to a new random heading per block, up to a
+     * half turn at 35°/tick. Reported as wild spinning on the way down. Any
+     * yaw looks at a block underfoot as long as the pitch is steep enough, so
+     * the aim point is laid out from the eye along the yaw the bot already
+     * has; the jitter keeps its magnitude and moves into the pitch. Shortened
+     * where that line would leave the face's margin, never below the smallest
+     * offset, which the margin has room for. From beside the block the
+     * geometry is the ordinary one and the ordinary rule applies.
+     */
+    private static double[] aimPoint(LocalPlayer player, BlockPos aimPos,
+                                     net.minecraft.core.Direction face, BotTask next) {
+        double faceY = aimPos.getY() + 0.5 + face.getStepY() * 0.5;
+        if (face.getAxis().isVertical()) {
+            double inX = player.getX() - aimPos.getX();
+            double inZ = player.getZ() - aimPos.getZ();
+            double lo = AIM_EDGE_MARGIN;
+            double hi = 1.0 - AIM_EDGE_MARGIN;
+            if (inX >= lo && inX <= hi && inZ >= lo && inZ <= hi) {
+                double yawRad = Math.toRadians(player.getYRot());
+                double dirX = -Math.sin(yawRad);
+                double dirZ = Math.cos(yawRad);
+                double reach = Math.abs(aimOffsetX);
+                if (dirX > 1.0e-6) {
+                    reach = Math.min(reach, (hi - inX) / dirX);
+                } else if (dirX < -1.0e-6) {
+                    reach = Math.min(reach, (lo - inX) / dirX);
+                }
+                if (dirZ > 1.0e-6) {
+                    reach = Math.min(reach, (hi - inZ) / dirZ);
+                } else if (dirZ < -1.0e-6) {
+                    reach = Math.min(reach, (lo - inZ) / dirZ);
+                }
+                reach = Math.max(reach, CONFIG.aimOffsetMin);
+                return new double[] {
+                    player.getX() + dirX * reach, faceY, player.getZ() + dirZ * reach};
+            }
+        }
+        double offX = face.getStepX() != 0 ? 0.0 : aimOffsetX;
+        double offY = face.getStepY() != 0 ? 0.0 : aimOffsetY;
+        double offZ = face.getStepZ() != 0 ? 0.0 : aimOffsetZ;
+        if (next != null) {
+            BlockPos toward = next.targetPos();
+            offX = biasTowardNext(offX, face.getStepX(), toward.getX() - aimPos.getX());
+            offY = biasTowardNext(offY, face.getStepY(), toward.getY() - aimPos.getY());
+            offZ = biasTowardNext(offZ, face.getStepZ(), toward.getZ() - aimPos.getZ());
+        }
+        return new double[] {
+            aimPos.getX() + 0.5 + face.getStepX() * 0.5 + offX,
+            faceY + offY,
+            aimPos.getZ() + 0.5 + face.getStepZ() * 0.5 + offZ};
     }
 
     /**
@@ -1302,6 +1538,46 @@ public class BotController {
         client.options.keyRight.setDown(strafing && rel > 0);
         client.options.keyLeft.setDown(strafing && rel < 0);
         client.options.keySprint.setDown(false);
+    }
+
+    /**
+     * Jump a one-block rise the walk along {@code (dirX, dirZ)} has met. The
+     * cell at foot height a short way ahead is solid, the two above it are
+     * free to stand in, and there is head room over the bot for the jump
+     * itself — then the jump key goes down for this one tick and the walk,
+     * still pressed, carries the body onto the ledge, the way vanilla's
+     * auto-jump does it. A two-high wall, a rise with no head room, or
+     * nothing ahead at all leave the key alone. Not for every walk: the
+     * bridging step crouches at an edge and must not jump off it, and the
+     * opportunistic step during a break has to keep the target in reach.
+     */
+    private static void stepUpIfBlocked(Minecraft client, LocalPlayer player,
+                                        double dirX, double dirZ) {
+        double length = Math.sqrt(dirX * dirX + dirZ * dirZ);
+        if (stepUpCooldown > 0 || !player.onGround() || length < 1.0e-6) {
+            return;
+        }
+        Level level = client.level;
+        BlockPos feet = player.blockPosition();
+        BlockPos ahead = BlockPos.containing(
+                player.getX() + dirX / length * STEP_UP_LOOKAHEAD,
+                player.getY(),
+                player.getZ() + dirZ / length * STEP_UP_LOOKAHEAD);
+        if (ahead.equals(feet) || !hasCollision(level, ahead)) {
+            return;
+        }
+        if (hasCollision(level, ahead.above()) || hasCollision(level, ahead.above(2))
+                || hasCollision(level, feet.above(2))) {
+            return;
+        }
+        client.options.keyJump.setDown(true);
+        jumpPressed = true;
+        stepUpCooldown = STEP_UP_COOLDOWN_TICKS;
+    }
+
+    private static boolean hasCollision(Level level, BlockPos pos) {
+        var state = level.getBlockState(pos);
+        return !state.getCollisionShape(level, pos).isEmpty();
     }
 
     /**
@@ -1434,23 +1710,34 @@ public class BotController {
             // Items frequently bounce into the dug-out hole below the bot or
             // onto a step above — a horizontal-only nearest skews toward an
             // item that's actually further away in 3D, and the bot ends up
-            // walking past closer drops. Items more than 4 blocks above/below
-            // the player are skipped: the bot can't walk up walls or fall
-            // safely into deep voids, so chasing them wastes the collect window.
+            // walking past closer drops. Items more than a block above or
+            // below the feet are skipped: that is as far as this walk can
+            // climb or step down (COLLECT_REACH_VERTICAL).
             net.minecraft.world.entity.item.ItemEntity nearest = null;
             double nearestDistSq = Double.MAX_VALUE;
             double nearestHorizDistSq = Double.MAX_VALUE;
+            double nearestDy = 0.0;
             for (var item : items) {
+                if (isIgnoredDrop(item)) {
+                    // Seen, and left there. The sighting still counts — the
+                    // break did produce its drop, which is what the exit
+                    // gate's first condition asks — but the drop is not
+                    // "nearby", and that is what lets the phase end without
+                    // a walk to it or a wait for it.
+                    itemsSeenThisCollect = true;
+                    continue;
+                }
                 double dx = item.getX() - player.getX();
                 double dy = item.getY() - player.getY();
                 double dz = item.getZ() - player.getZ();
-                if (Math.abs(dy) > 4.0) {
+                if (Math.abs(dy) > COLLECT_REACH_VERTICAL) {
                     continue;
                 }
                 double distSq = dx * dx + dy * dy + dz * dz;
                 if (distSq < nearestDistSq) {
                     nearestDistSq = distSq;
                     nearestHorizDistSq = dx * dx + dz * dz;
+                    nearestDy = dy;
                     nearest = item;
                 }
             }
@@ -1485,7 +1772,7 @@ public class BotController {
             }
 
             // Presence is measured on the same set the walk above uses. An
-            // item the loop rejected (>4 blocks up or down, or given up on as
+            // item the loop rejected (over a block up or down, or given up on as
             // unreachable) is one the bot has decided it will never approach —
             // counting it as "nearby" pins itemsNearby true forever, the exit
             // gate can never fire, and the phase burns the full collectWaitMax.
@@ -1510,7 +1797,12 @@ public class BotController {
             // requires — never becomes true. Inventory growth since the break
             // started is the same server-authoritative proof the break gate
             // already accepts, and it also covers a pickup during INTERACTING.
-            if (policy.fastCollectExit() && !itemsSeenThisCollect
+            // No opt-in: it changes nothing where the drop is observed (the
+            // absence window below still runs), and where it is not, the
+            // alternative is the full collectWaitMax — measured as 1201 ticks
+            // standing over a three-block shaft with every drop already in
+            // the inventory, on a plain task with no policy at all.
+            if (!itemsSeenThisCollect
                     && countMainInventory(player) > startInventoryCount) {
                 itemsSeenThisCollect = true;
             }
@@ -1527,22 +1819,48 @@ public class BotController {
             // all three drops on the ground). One block is inside the box on
             // every axis with room for the server seeing the walk a tick
             // later than the client does.
-            if (nearest != null && nearestDistSq > 1.0) {
-                walkToward(client, player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ(),
-                        nearestHorizDistSq);
+            //
+            // Measured per axis, because the box is not a sphere. A drop a
+            // block below the feet is inside the horizontal box and outside
+            // the vertical one, and the 3-D distance that used to decide this
+            // said "walk" for it whether there was anywhere to walk to or not:
+            // a drop lying straight down a shaft got the same walk as one in a
+            // dip beside the bot, into the shaft wall, with the gaze swinging
+            // on the near-zero horizontal offset. A drop with no horizontal
+            // offset at all is one the walk has no direction for, so it
+            // stands and lets the watchdog decide.
+            boolean outsidePickupBox = nearestHorizDistSq > 1.0
+                    || nearestDy < PICKUP_BOX_BELOW || nearestDy > PICKUP_BOX_ABOVE;
+            if (nearest != null && outsidePickupBox && nearestHorizDistSq > 0.01) {
+                if (nearestDy < PICKUP_BOX_BELOW) {
+                    // Stepping down to it: walk at the middle of its cell, not
+                    // at the item. A one-wide hole takes a 0.6-wide body only
+                    // through the middle 0.4 of it; walked at an item lying
+                    // 0.2 off centre, the body catches the rim of the block
+                    // next door and stands there — over the hole, out of
+                    // reach of everything below, and out of the drop's pickup
+                    // box too. The diamond miner's staircase did that three
+                    // steps in a row and then failed its descent from the lip.
+                    // The gaze stays on the drop: whether it is held or not
+                    // is a question about the drop, and asking it about the
+                    // cell's middle turned the head at a dip the bot had been
+                    // walking into without looking.
+                    aimCollectGaze(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
+                    walkDirection(client, player,
+                            Math.floor(nearest.getX()) + 0.5 - player.getX(),
+                            Math.floor(nearest.getZ()) + 0.5 - player.getZ(),
+                            nearestHorizDistSq);
+                } else {
+                    walkToward(client, player, nearest.getX(), nearest.getY() + 0.2,
+                            nearest.getZ(), nearestHorizDistSq);
+                }
             } else if (nearest != null) {
                 // In pickup range — stand still and watch the drop slide
-                // over. Skip the look when the item is almost directly
-                // underfoot: the yaw target becomes unstable there (tiny
-                // horizontal deltas flip it tick-to-tick) and craning
-                // straight down isn't what a player does anyway.
+                // over (aimCollectGaze declines the look when the item is
+                // almost directly underfoot).
                 client.options.keyUp.setDown(false);
                 client.options.keySprint.setDown(false);
-                if (nearestHorizDistSq > 0.5) {
-                    aimCollectGaze(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
-                } else if (hasLastAim) {
-                    aimCameraAt(player, lastAimX, lastAimY, lastAimZ);
-                }
+                aimCollectGaze(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
             } else if (!itemsSeenThisCollect && lastMinedPos != null) {
                 // No items visible yet, but we expect a drop at lastMinedPos.
                 // Walk there so the entity enters the AABB as soon as the server
@@ -1648,18 +1966,24 @@ public class BotController {
     private static void walkToward(Minecraft client, LocalPlayer player,
                                    double targetX, double targetY, double targetZ,
                                    double horizDistSq) {
-        // Look at what we're walking to — yaw steers the walk, pitch follows
-        // the target but is capped at the ground-scan angle so the head
-        // doesn't crane ever steeper as the bot closes in on a drop.
+        // Look at what we're walking to — pitch follows the target but is
+        // capped at the ground-scan angle so the head doesn't crane ever
+        // steeper as the bot closes in on a drop. From right beside it the
+        // gaze holds still (see aimCollectGaze), and that matters more here
+        // than when standing: the walk keys are expressed against the yaw,
+        // so a gaze that swings with every step swings the keys with it, the
+        // body turns, the yaw moves again — the bot spinning on the spot and
+        // walking into the shaft wall after a drop fell in beside it. With
+        // the gaze held, the walk goes by geometry.
         aimCollectGaze(player, targetX, targetY, targetZ);
 
-        // Refuse a step into thin air. This drives the body forward —
-        // sprinting, once the drop is more than two blocks out — on the gaze
-        // direction alone, and a drop lies wherever it rolled: over the lip of
-        // the shaft the bot just dug as readily as on the floor in front of
-        // it. Nothing else stops it, because COLLECTING has no pathfinder
-        // under it; it is the one phase that walks on raw key presses. That is
-        // how the bot sprinted off its own platform and died of the fall.
+        // Refuse a step into thin air. This drives the body toward the drop —
+        // sprinting, once it is more than two blocks out — and a drop lies
+        // wherever it rolled: over the lip of the shaft the bot just dug as
+        // readily as on the floor in front of it. Nothing else stops it,
+        // because COLLECTING has no pathfinder under it; it is the one phase
+        // that walks on raw key presses. That is how the bot sprinted off its
+        // own platform and died of the fall.
         //
         // Only the floor is tested, not whether the cell is standable: walking
         // into a wall costs nothing (the bot simply does not move), and
@@ -1667,14 +1991,30 @@ public class BotController {
         // the face it had just mined — it then stood still for the whole
         // collect window and the single-block test timed out. One block down
         // is a normal step and stays allowed; deeper is the hole, and a drop
-        // down there is worth less than the run.
-        if (!hasFloorAhead(client, player)) {
+        // down there is worth less than the run. One block up is a jump.
+        walkDirection(client, player, targetX - player.getX(), targetZ - player.getZ(),
+                horizDistSq);
+    }
+
+    /**
+     * The walk half of {@link #walkToward(Minecraft, LocalPlayer, double,
+     * double, double, double)}: the floor check, the keys, the sprint past two
+     * blocks and the jump at a one-block rise, with the gaze left to the
+     * caller. Stepping down to a drop walks at the middle of the drop's cell
+     * while looking at the drop itself — the two are different points, and
+     * the gaze hold for a drop right beside the bot must be decided on the
+     * drop, not on where the feet are going.
+     */
+    private static void walkDirection(Minecraft client, LocalPlayer player,
+                                      double dirX, double dirZ, double horizDistSq) {
+        if (!hasFloorToward(client, player, dirX, dirZ)) {
             releaseMovementKeys();
             return;
         }
 
-        client.options.keyUp.setDown(true);
+        walkToward(client, player, dirX, dirZ);
         client.options.keySprint.setDown(horizDistSq > 4.0);
+        stepUpIfBlocked(client, player, dirX, dirZ);
     }
 
     private static void tickScanning(Minecraft client, LocalPlayer player) {
@@ -1786,6 +2126,14 @@ public class BotController {
      * no pause"; the reaction delay had drifted in against that.
      */
     private static void continueSeam() {
+        // A seam is still a boundary between two blocks, and the hand is
+        // off the button here in any case: if the bar is down, the meal
+        // goes in now and the seam carries on as it was afterwards.
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player != null && shouldEat(player)) {
+            startEating(BotController::continueSeam);
+            return;
+        }
         seamContinuation = true;
         transitionTo(Phase.LOOKING);
     }
@@ -1872,6 +2220,19 @@ public class BotController {
             return;
         }
 
+        // A meal comes between two tasks, never inside one. The task is
+        // already taken, so the controller counts as active while the bot
+        // eats, and it begins the moment the meal is over.
+        if (shouldEat(player)) {
+            startEating(BotController::beginCurrentTask);
+            return;
+        }
+        beginCurrentTask();
+    }
+
+    /** The first phase of the task just taken: look at it, or walk first. */
+    private static void beginCurrentTask() {
+        LocalPlayer player = Minecraft.getInstance().player;
         BlockPos target = currentTask.targetPos();
 
         // Already within reach — skip navigation. In reach is not the same as
@@ -1948,22 +2309,26 @@ public class BotController {
     private static void aimCollectGaze(LocalPlayer player, double x, double y, double z) {
         double dx = x - player.getX();
         double dz = z - player.getZ();
+        // A point almost underfoot gets no look at all: the yaw to it flips
+        // with every few centimetres the body moves, and the capped aim point
+        // below is pushed out along that same unstable direction, so the
+        // camera swung to wherever the noise pointed — tick after tick while
+        // walking, which is the spin reported after a drop fell into the
+        // shaft. Craning straight down is not what a player does anyway; the
+        // last aim point is kept and the gaze finishes its swing there.
+        if (dx * dx + dz * dz <= 0.5) {
+            if (hasLastAim) {
+                aimCameraAt(player, lastAimX, lastAimY, lastAimZ);
+            }
+            return;
+        }
         double drop = player.getEyeY() - y;
         double horizDist = Math.sqrt(dx * dx + dz * dz);
         double pitchToTarget = Math.toDegrees(Math.atan2(drop, horizDist));
         if (pitchToTarget > collectGazePitch) {
-            double aimDist = drop / Math.tan(Math.toRadians(collectGazePitch));
-            if (horizDist > 1.0e-4) {
-                double scale = aimDist / horizDist;
-                x = player.getX() + dx * scale;
-                z = player.getZ() + dz * scale;
-            } else {
-                // Target directly underfoot — look down at the capped angle
-                // in the current view direction.
-                double yawRad = Math.toRadians(player.getYRot());
-                x = player.getX() - Math.sin(yawRad) * aimDist;
-                z = player.getZ() + Math.cos(yawRad) * aimDist;
-            }
+            double scale = drop / Math.tan(Math.toRadians(collectGazePitch)) / horizDist;
+            x = player.getX() + dx * scale;
+            z = player.getZ() + dz * scale;
         }
         aimCameraAt(player, x, y, z);
     }
@@ -1984,6 +2349,22 @@ public class BotController {
             count += player.getInventory().getItem(slot).getCount();
         }
         return count;
+    }
+
+    /**
+     * Whether a drop is on the ignore list ({@code BotConfig.ignoredItems}):
+     * one the bot neither walks to nor waits for. It is still taken if it
+     * lands inside the vanilla pickup box — that costs no walk and vanilla
+     * does it without asking — so the list decides where the bot goes, not
+     * what it keeps. The break confirmation keeps counting every drop for
+     * the same reason: an ignored drop is still proof that the block broke.
+     */
+    private static boolean isIgnoredDrop(net.minecraft.world.entity.item.ItemEntity item) {
+        if (CONFIG.ignoredItems.isEmpty()) {
+            return false;
+        }
+        return CONFIG.ignoredItems.contains(
+                BuiltInRegistries.ITEM.getKey(item.getItem().getItem()).toString());
     }
 
     private static double distanceToTarget(LocalPlayer player, BlockPos target) {
@@ -2103,6 +2484,125 @@ public class BotController {
         return nearest;
     }
 
+    // --- Eating ---
+
+    /**
+     * Whether a meal is due before the next block: the behavior asked for it,
+     * the bar is under {@code eatBelowFoodLevel}, and there is something to
+     * eat. With nothing to eat the answer is no, said once in chat and with a
+     * low note — the run carries on hungry, and a behavior that runs
+     * unattended for an hour would otherwise stop regenerating without
+     * anyone finding out. A meal that never started is remembered the same
+     * way, so a bot that cannot eat does not stand with the button held at
+     * every task.
+     */
+    private static boolean shouldEat(LocalPlayer player) {
+        if (!policy.autoEat() || mealFailed
+                || player.getFoodData().getFoodLevel() >= CONFIG.eatBelowFoodLevel) {
+            return false;
+        }
+        if (!hasMeal(player)) {
+            warnNoFood(player);
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean hasMeal(LocalPlayer player) {
+        for (int slot = 0; slot < 36; slot++) {
+            if (isMeal(player.getInventory().getItem(slot))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isMeal(ItemStack stack) {
+        return stack.has(DataComponents.FOOD) && !NOT_A_MEAL.contains(stack.getItem());
+    }
+
+    private static void warnNoFood(LocalPlayer player) {
+        if (noFoodWarned) {
+            return;
+        }
+        noFoodWarned = true;
+        player.displayClientMessage(Component.literal(
+                "Hungry and nothing to eat — carrying on").withStyle(ChatFormatting.YELLOW), false);
+        // forUI takes (pitch, volume), and a low bass note is nothing like
+        // the plings that mean the run has stopped.
+        Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(
+                SoundEvents.NOTE_BLOCK_BASS.value(), 0.5f, 1.0f));
+    }
+
+    /** Eat, then run {@code next} — the transition the meal interrupted. */
+    private static void startEating(Runnable next) {
+        afterEating = next;
+        eatingStarted = false;
+        BlockInteractor.stopInteraction();
+        releaseMovementKeys();
+        transitionTo(Phase.EATING);
+    }
+
+    /**
+     * The meal, the way a player has one: the food in hand and the use button
+     * held until the bar goes up. Held, not clicked — vanilla's
+     * {@code handleKeybinds} starts the use for a held button and releases
+     * the item the tick the button comes up, so the key is the whole
+     * mechanism and every packet on the wire is a player's. The camera keeps
+     * easing toward wherever it was looking, saccades and all; a gaze frozen
+     * for the length of a meal reads as a bot standing still.
+     */
+    private static void tickEating(Minecraft client, LocalPlayer player) {
+        if (phaseTicks == 1) {
+            foodBeforeMeal = player.getFoodData().getFoodLevel();
+            // Chosen here rather than in shouldEat so the slot swap goes out
+            // on the tick the button goes down. Biggest stack first, the way
+            // selectItem picks a filler: the pile in use over the singles.
+            if (InventoryHelper.selectItem(player, BotController::isMeal) < 0) {
+                finishEating();
+                return;
+            }
+        }
+        if (camera != null && hasLastAim) {
+            camera.aimAt(player, lastAimX, lastAimY, lastAimZ);
+        }
+        if (client.options != null) {
+            client.options.keyUse.setDown(true);
+        }
+        if (player.isUsingItem()) {
+            eatingStarted = true;
+        }
+        if (player.getFoodData().getFoodLevel() > foodBeforeMeal) {
+            // Eaten. Letting go now also cuts short the next bite the held
+            // button has already begun.
+            finishEating();
+            return;
+        }
+        if (phaseTicks > EAT_TIMEOUT_TICKS) {
+            LOGGER.warn("Meal timed out after {} ticks (started={}, food level {})",
+                    phaseTicks, eatingStarted, player.getFoodData().getFoodLevel());
+            mealFailed = true;
+            finishEating();
+        }
+    }
+
+    private static void finishEating() {
+        releaseUseKey();
+        Runnable next = afterEating;
+        afterEating = null;
+        eatingStarted = false;
+        if (next != null) {
+            next.run();
+        }
+    }
+
+    private static void releaseUseKey() {
+        Minecraft client = Minecraft.getInstance();
+        if (client.options != null) {
+            client.options.keyUse.setDown(false);
+        }
+    }
+
     private static void releaseMovementKeys() {
         Minecraft client = Minecraft.getInstance();
         if (client.options != null) {
@@ -2111,6 +2611,8 @@ public class BotController {
             client.options.keyLeft.setDown(false);
             client.options.keyRight.setDown(false);
             client.options.keySprint.setDown(false);
+            client.options.keyJump.setDown(false);
+            jumpPressed = false;
         }
     }
 }

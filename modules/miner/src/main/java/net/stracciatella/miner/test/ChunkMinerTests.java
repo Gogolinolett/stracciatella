@@ -1,14 +1,18 @@
 package net.stracciatella.miner.test;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.block.Blocks;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.behavior.BehaviorRunner;
+import net.stracciatella.miner.MinerConfig;
 import net.stracciatella.miner.MinerSetup;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
@@ -1691,6 +1695,259 @@ public class ChunkMinerTests {
         }
         LOGGER.info("Chunk miner staircase-bridge test passed (feet stayed at y={})",
                 lowestFeetY[0]);
+    }
+
+    // ================================================================
+    // Test 23: gravel from above the slab is mined once it has landed
+    // ================================================================
+    /**
+     * A column with two gravel stacked on its head block, the way the first
+     * layer of a run meets the gravel patches of the world above it. The
+     * head block going drops the first gravel into its cell, and the second
+     * onto that; each is a block the run has to take before the column is
+     * clear. Reported from a real world as the run stalling on the first
+     * layer: the fallen gravel was met as a failed break of the head block
+     * and retried at the price of a step retry each time, and the run died
+     * on the column after two of them. Asserted as the whole column, gravel
+     * included, being air at the end of a run that did not fail.
+     */
+    @MinecraftTest(name = "Chunk miner mines the gravel that falls into a column",
+            timeoutTicks = 2000, order = 33)
+    public void minesFallenGravel(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        BlockPos lower = stand.offset(1, 0, 0);
+        setBlock(ctx, lower, "stone");
+        setBlock(ctx, lower.above(), "stone");
+        setBlock(ctx, lower.above(2), "gravel");
+        setBlock(ctx, lower.above(3), "gravel");
+        ctx.runCommand("give @s diamond_shovel");
+
+        runChunkMiner(ctx, Y + 1, Y, true);
+
+        assertAir(ctx, lower.above(3), "the upper gravel's original cell");
+        assertAir(ctx, lower.above(2), "the lower gravel's original cell");
+        assertAir(ctx, lower.above(), "the head block's cell");
+        assertAir(ctx, lower, "the foot block's cell");
+        LOGGER.info("Chunk miner fallen gravel test passed");
+    }
+
+    // ================================================================
+    // Test 24: a spread pool is capped at its source, not across its spread
+    // ================================================================
+    /**
+     * One source on a flat floor and time to spread: the diamond of a hundred
+     * and more flowing cells that a single source makes, with the bot on a
+     * one-block pedestal in the middle of it. The pedestal is the bot's own
+     * column, the descent digs through it, and the water round it is what
+     * that column touches — the way a run meets a pool, from inside it. It is
+     * also what keeps the bot dry and where it is: flowing water carries a
+     * player off at a third of a block a second, and a bot that has drifted
+     * out of reach of the source while the world was being built tests the
+     * walk, not the cap. Reported from a real world as the bot walling up
+     * flowing water block by block: with the survey limit at 16 no pool with
+     * its spread ever fit under it, so none was surveyed whole, and each was
+     * dammed across whichever flowing cells touched the column — cells that
+     * drain by themselves the moment the source is gone.
+     *
+     * <p>Every filler block that ever stands in the pool has to be the cap on
+     * the source, and nothing else: a dam on a flowing cell at any point of
+     * the run — in the first plan, or after the cap while the spread is still
+     * draining — fails it. The column behind the pool then has to come down,
+     * which is the run outlasting the drain instead of walling it up, and
+     * the pool has to end dry.
+     */
+    @MinecraftTest(name = "Chunk miner caps a spread pool at its source",
+            timeoutTicks = 3000, order = 34)
+    public void capsSpreadPoolAtSource(TestContext ctx) {
+        // Floor under the whole diamond a source at chunk-local (7, 7)
+        // spreads to: seven cells each way, all of it inside the chunk.
+        final BlockPos stand = prepareWithFloor(ctx, 4, STAND_DZ, 0, 14, 0, 14);
+        final BlockPos pedestal = stand.offset(1, 0, 0);
+        final BlockPos source = stand.offset(3, 0, 0);
+        final BlockPos behind = stand.offset(4, 0, 0);
+        setBlock(ctx, pedestal, "stone");
+        setBlock(ctx, behind, "stone");
+        standAt(ctx, pedestal.above());
+        setBlock(ctx, source, "water");
+        // Let the spread reach its tips before the run starts — north and
+        // south, where nothing stands in the water's way.
+        final BlockPos northTip = source.offset(0, 0, -7);
+        final BlockPos southTip = source.offset(0, 0, 7);
+        ctx.waitFor(mc -> !mc.level.getFluidState(northTip).isEmpty()
+                && !mc.level.getFluidState(southTip).isEmpty());
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, Y + 1, Y);
+        final BlockPos poolMin = source.offset(-7, 0, -7);
+        final BlockPos poolMax = source.offset(7, 0, 7);
+        final Set<BlockPos> fillers = new LinkedHashSet<>();
+        ctx.waitFor(mc -> {
+            for (BlockPos cell : BlockPos.betweenClosed(poolMin, poolMax)) {
+                if (mc.level.getBlockState(cell).is(Blocks.COBBLESTONE)) {
+                    fillers.add(cell.immutable());
+                }
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        if (!fillers.remove(source)) {
+            throw new AssertionError("The source at " + source.toShortString()
+                    + " was never capped; filler blocks stood at " + shortList(fillers));
+        }
+        if (!fillers.isEmpty()) {
+            throw new AssertionError("Filler blocks stood on flowing cells at " + shortList(fillers)
+                    + " — a dam across the spread instead of a cap on the source");
+        }
+        assertAir(ctx, pedestal, "the pedestal the bot descended through");
+        assertAir(ctx, behind, "the column behind the pool");
+        // The spread drains on its own once the source is capped; give the
+        // last of it a moment, the run does not wait for cells it never
+        // touches.
+        ctx.waitFor(mc -> {
+            for (BlockPos cell : BlockPos.betweenClosed(poolMin, poolMax)) {
+                if (!mc.level.getFluidState(cell).isEmpty()) {
+                    return false;
+                }
+            }
+            return true;
+        }, 200);
+        LOGGER.info("Chunk miner spread pool test passed");
+    }
+
+    // ================================================================
+    // Test 25: /miner chunk blacklist add, remove and clear edit the list
+    // ================================================================
+    /**
+     * The command path end to end, for the same reason the bot's ignore
+     * list has one: a namespaced id has to get through the parser whole — a
+     * string argument stops at the colon, which is how {@code minecraft:chest}
+     * once came back as an incomplete command — a bare name has to land as
+     * the same entry, a name that is no block has to be refused, and every
+     * change has to reach miner.json. The player's own list is set aside
+     * first and put back at the end, file included.
+     */
+    @MinecraftTest(name = "Chunk miner blacklist commands edit the list",
+            timeoutTicks = 200, order = 35)
+    public void blacklistCommandsEditTheList(TestContext ctx) {
+        final String gold = "minecraft:gold_block";
+        final String spawner = "minecraft:spawner";
+        final List<String> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(MinerSetup.CONFIG.chunkMinerBlacklist));
+        try {
+            ctx.runOnClient(mc -> MinerSetup.CONFIG.chunkMinerBlacklist.clear());
+
+            ctx.runCommand("miner chunk blacklist add minecraft:gold_block");
+            assertBlacklist(ctx, List.of(gold), "after adding a namespaced id");
+            if (!MinerConfig.load().chunkMinerBlacklist.contains(gold)) {
+                throw new AssertionError("The added block did not reach miner.json");
+            }
+            ctx.runCommand("miner chunk blacklist add gold_block");
+            assertBlacklist(ctx, List.of(gold), "after adding the bare name of an entry");
+            ctx.runCommand("miner chunk blacklist add minecraft:not_a_block");
+            assertBlacklist(ctx, List.of(gold), "after a name that is no block");
+            ctx.runCommand("miner chunk blacklist add spawner");
+            assertBlacklist(ctx, List.of(gold, spawner), "after adding a bare name");
+            ctx.runCommand("miner chunk blacklist remove minecraft:gold_block");
+            assertBlacklist(ctx, List.of(spawner), "after removing an entry");
+            if (MinerConfig.load().chunkMinerBlacklist.contains(gold)) {
+                throw new AssertionError("The removed block is still in miner.json");
+            }
+            ctx.runCommand("miner chunk blacklist clear");
+            assertBlacklist(ctx, List.of(), "after clearing");
+            if (!MinerConfig.load().chunkMinerBlacklist.isEmpty()) {
+                throw new AssertionError("miner.json still lists blocks after the clear");
+            }
+            LOGGER.info("Chunk miner blacklist command test passed");
+        } finally {
+            ctx.runOnClient(mc -> {
+                MinerSetup.CONFIG.chunkMinerBlacklist.clear();
+                MinerSetup.CONFIG.chunkMinerBlacklist.addAll(before);
+                MinerSetup.CONFIG.save();
+            });
+        }
+    }
+
+    private void assertBlacklist(TestContext ctx, List<String> expected, String when) {
+        List<String> actual = ctx.computeOnClient(
+                mc -> new ArrayList<>(MinerSetup.CONFIG.chunkMinerBlacklist));
+        if (!actual.equals(expected)) {
+            throw new AssertionError("Blacklist " + when + " is " + actual
+                    + ", expected " + expected);
+        }
+    }
+
+    // ================================================================
+    // Test 26: water with no source left is waited out, never dammed
+    // ================================================================
+    /**
+     * The spread of the pool above with its source taken away: what a cap
+     * leaves behind, and what a run meets whenever it plans the next column
+     * before the last cap's spread has gone. The source goes with the world
+     * frozen, so the run begins against the whole spread and not one fluid
+     * tick of drain has happened. Flowing water with no source in it is on
+     * its way out by itself, and a block on it is a block for nothing: no
+     * filler may stand anywhere in the pool at any point of the run, the run
+     * has to outlast the drain instead — pedestal and the column behind
+     * mined — and the pool has to end dry.
+     */
+    @MinecraftTest(name = "Chunk miner waits out sourceless water",
+            timeoutTicks = 3000, order = 36)
+    public void waitsOutSourcelessWater(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, 4, STAND_DZ, 0, 14, 0, 14);
+        final BlockPos pedestal = stand.offset(1, 0, 0);
+        final BlockPos source = stand.offset(3, 0, 0);
+        final BlockPos behind = stand.offset(4, 0, 0);
+        setBlock(ctx, pedestal, "stone");
+        setBlock(ctx, behind, "stone");
+        standAt(ctx, pedestal.above());
+        setBlock(ctx, source, "water");
+        final BlockPos northTip = source.offset(0, 0, -7);
+        final BlockPos southTip = source.offset(0, 0, 7);
+        ctx.waitFor(mc -> !mc.level.getFluidState(northTip).isEmpty()
+                && !mc.level.getFluidState(southTip).isEmpty());
+        ctx.runCommand("give @s cobblestone 64");
+
+        ctx.runCommand("tick freeze");
+        ctx.runCommand("setblock " + source.getX() + " " + source.getY() + " " + source.getZ()
+                + " air");
+        ctx.waitFor(mc -> mc.level.getFluidState(source).isEmpty());
+        startChunkMiner(ctx, true, Y + 1, Y);
+        ctx.runCommand("tick unfreeze");
+
+        final BlockPos poolMin = source.offset(-7, 0, -7);
+        final BlockPos poolMax = source.offset(7, 0, 7);
+        final Set<BlockPos> fillers = new LinkedHashSet<>();
+        ctx.waitFor(mc -> {
+            for (BlockPos cell : BlockPos.betweenClosed(poolMin, poolMax)) {
+                if (mc.level.getBlockState(cell).is(Blocks.COBBLESTONE)) {
+                    fillers.add(cell.immutable());
+                }
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        if (!fillers.isEmpty()) {
+            throw new AssertionError("Filler blocks stood at " + shortList(fillers)
+                    + " — a dam on water that was draining by itself");
+        }
+        assertAir(ctx, pedestal, "the pedestal the bot descended through");
+        assertAir(ctx, behind, "the column behind the pool");
+        ctx.waitFor(mc -> {
+            for (BlockPos cell : BlockPos.betweenClosed(poolMin, poolMax)) {
+                if (!mc.level.getFluidState(cell).isEmpty()) {
+                    return false;
+                }
+            }
+            return true;
+        }, 200);
+        LOGGER.info("Chunk miner sourceless water test passed");
+    }
+
+    private static String shortList(Set<BlockPos> cells) {
+        return cells.isEmpty() ? "nowhere"
+                : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());
     }
 
     /** Item entities still on the ground anywhere near the working area. */
