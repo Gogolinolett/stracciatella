@@ -1,12 +1,15 @@
 package net.stracciatella.bot.interaction;
 
+import java.util.List;
 import java.util.function.Predicate;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
 
@@ -84,6 +87,68 @@ public class InventoryHelper {
         }
 
         return equip(player, bestSlot);
+    }
+
+    /**
+     * Matches any stack of a block on {@code blockIds} (registry ids, e.g.
+     * {@code minecraft:cobblestone}).
+     *
+     * <p>Holds the list by reference rather than copying it: every caller's list
+     * is a live config field edited by commands and the GUI, and a predicate
+     * built from a snapshot would keep matching yesterday's configuration for
+     * the rest of the session.
+     */
+    public static Predicate<ItemStack> blockIdMatcher(List<String> blockIds) {
+        return stack -> {
+            if (!(stack.getItem() instanceof BlockItem blockItem)) {
+                return false;
+            }
+            return blockIds.contains(BuiltInRegistries.BLOCK.getKey(blockItem.getBlock()).toString());
+        };
+    }
+
+    /**
+     * Whether the player carries anything that would actually drop
+     * {@code targetBlock}.
+     *
+     * <p>This is a different question from "is there a fast tool for it", which
+     * {@link #selectBestTool} answers, and the difference is the whole point: a
+     * bare hand breaks stone and an iron pickaxe breaks diamond ore, and in both
+     * cases the block vanishes and nothing drops. A bot that cannot tell those
+     * apart mines a whole chunk for nothing. Blocks that drop regardless —
+     * dirt, gravel, logs — answer true with an empty inventory, because they do.
+     */
+    public static boolean hasCorrectTool(LocalPlayer player, BlockState targetBlock) {
+        if (!targetBlock.requiresCorrectToolForDrops()) {
+            return true;
+        }
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < 36; i++) {
+            if (inv.getItem(i).isCorrectToolForDrops(targetBlock)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * How many matching <em>items</em> the player carries across the 36 main
+     * slots — the sum of the stack counts, not the number of stacks.
+     * <p>
+     * Items rather than stacks because that is the unit a restock manifest is
+     * written in: "64 filler blocks" and "1 pickaxe" are the same question asked
+     * of the same counter, where stacks would make the first one unanswerable.
+     */
+    public static int countMatching(LocalPlayer player, Predicate<ItemStack> matcher) {
+        Inventory inv = player.getInventory();
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getItem(i);
+            if (!stack.isEmpty() && matcher.test(stack)) {
+                count += stack.getCount();
+            }
+        }
+        return count;
     }
 
     /**

@@ -3,6 +3,7 @@ package net.stracciatella.miner;
 import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.gui.GuiRegistry;
 import net.stracciatella.miner.gui.BlacklistPage;
+import net.stracciatella.miner.gui.MinerSettingsPage;
 import net.stracciatella.miner.test.ChunkMinerTests;
 import net.stracciatella.testing.runner.TestRunner;
 
@@ -43,6 +44,7 @@ public final class MinerSetup {
         BehaviorRunner.register(chunkMiner);
         MinerCommands.register();
         GuiRegistry.register(new BlacklistPage(CONFIG));
+        GuiRegistry.register(new MinerSettingsPage(CONFIG));
         // MinerTests, the diamond miner's suite, is not registered for now:
         // the behavior is unused and broken in real worlds, and its two
         // tests — the longest of any run — guard code nobody is working on.

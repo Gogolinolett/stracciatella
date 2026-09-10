@@ -196,6 +196,15 @@ public class BotController {
     private static double lastAimZ;
     private static boolean hasLastAim = false;
 
+    // The name of a block the bot was about to mine while carrying nothing that
+    // would drop it. A latch rather than a query, because the fact is only
+    // knowable here — the controller is the only layer that knows which block is
+    // next — and only at the moment the tool is chosen. Consumed by
+    // BehaviorRunner, which is what turns it into a restock reason; see
+    // InventoryHelper.hasCorrectTool for why "no *correct* tool" is not the same
+    // question as "no fast tool".
+    private static Component missingToolBlock = null;
+
     // Collection state
     // Position of the last mined block — COLLECTING walks toward this to pick up drops
     private static BlockPos lastMinedPos = null;
@@ -338,6 +347,18 @@ public class BotController {
 
     public static BotPolicy policy() {
         return policy;
+    }
+
+    /**
+     * The name of a block the bot tried to mine without carrying anything that
+     * would drop it, or {@code null}. Reading it clears it — the caller decides
+     * what to do about it, and an unread latch must not fire at the start of the
+     * next run (the same rule {@code BotAlarm} follows).
+     */
+    public static Component consumeMissingTool() {
+        Component block = missingToolBlock;
+        missingToolBlock = null;
+        return block;
     }
 
     public static void enqueueTask(BotTask task) {
@@ -789,7 +810,15 @@ public class BotController {
                 if (required != null) {
                     InventoryHelper.selectItem(player, required);
                 } else {
-                    InventoryHelper.selectBestTool(player, client.level.getBlockState(target));
+                    var state = client.level.getBlockState(target);
+                    InventoryHelper.selectBestTool(player, state);
+                    // Breaking this block is about to drop nothing. Recorded, not
+                    // acted on: whether that is worth a trip to a chest is the
+                    // behavior layer's call, and a plain /bot mine should still
+                    // mine what it was told to.
+                    if (!InventoryHelper.hasCorrectTool(player, state)) {
+                        missingToolBlock = state.getBlock().getName();
+                    }
                 }
             }
             toolSelected = true;
@@ -1107,7 +1136,10 @@ public class BotController {
         if (placing) {
             // Creative never consumes the block, so the item count can't be
             // the signal there — the sustained-state window alone confirms it.
-            artifact = player.getAbilities().instabuild
+            // Nor can a USE that consumes nothing at all: opening a chest moves
+            // no item, and requiring one would leave the task waiting.
+            artifact = !currentTask.consumesItem()
+                    || player.getAbilities().instabuild
                     || countMainInventory(player) < startInventoryCount;
         } else {
             if (!dropSeenThisBreak) {
@@ -2517,7 +2549,9 @@ public class BotController {
         return false;
     }
 
-    private static boolean isMeal(ItemStack stack) {
+    /** Whether a stack is something the bot will actually eat — the restock
+     * manifest asks the same question, so the answer lives in one place. */
+    public static boolean isMeal(ItemStack stack) {
         return stack.has(DataComponents.FOOD) && !NOT_A_MEAL.contains(stack.getItem());
     }
 

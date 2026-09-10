@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -16,6 +17,9 @@ import net.stracciatella.bot.behavior.BotBehavior;
 import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
+import net.stracciatella.bot.server.ServerSettings;
+import net.stracciatella.bot.server.ServerSettingsStore;
+import net.stracciatella.bot.server.StorageSite;
 import net.stracciatella.bot.task.ChopTreeTask;
 import net.stracciatella.bot.task.MineBlockTask;
 import net.stracciatella.bot.task.PlaceBlockTask;
@@ -1321,6 +1325,415 @@ public class BotTests {
                 BotController.CONFIG.ignoredItems.addAll(before);
                 BotController.CONFIG.save();
             });
+        }
+    }
+
+    // ================================================================
+    // Test 25: /bot storage writes the chest into servers.json
+    // ================================================================
+
+    /**
+     * The commands that decide where a restock goes, end to end against the real
+     * store and the real file.
+     *
+     * <p>Pointing at the chest is the part worth testing rather than asserted
+     * away: {@code add} and {@code remove} read a live raycast, so the test has
+     * to aim the player the way a person does and a command that stopped reading
+     * the crosshair would come back "Not looking at a block". The scan is here
+     * because it is the one path that reads the world in bulk, and the reload is
+     * here because the list is only worth anything if it survives the session
+     * that wrote it.
+     *
+     * <p>The player's own storages for this world are set aside and put back,
+     * file included — these tests run against whatever world is lying about.
+     */
+    @MinecraftTest(name = "Bot storage commands edit servers.json",
+            timeoutTicks = 400, order = -172)
+    public void storageCommandsEditTheStore(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1400, 30, 1400);
+        final BlockPos chest = origin.offset(2, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + chest.getX() + " " + chest.getY() + " " + chest.getZ()
+                + " chest");
+        ctx.waitFor(mc -> mc.level.getBlockState(chest).is(Blocks.CHEST));
+
+        final List<StorageSite> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().storages));
+        try {
+            ctx.runOnClient(mc -> ServerSettingsStore.current().storages.clear());
+            lookAtBlock(ctx, origin, chest);
+
+            ctx.runCommand("bot storage add");
+            assertStorages(ctx, List.of(chest), "after adding the chest in the crosshair");
+            ctx.runCommand("bot storage add");
+            assertStorages(ctx, List.of(chest), "after adding the same chest twice");
+
+            ctx.runCommand("bot storage remove");
+            assertStorages(ctx, List.of(), "after removing it again");
+
+            ctx.runCommand("bot storage scan 4");
+            assertStorages(ctx, List.of(chest), "after a scan of the area");
+
+            // The reload is the assertion: it throws the in-memory map away and
+            // reads the file, so a list that survives it is a list that was
+            // actually written.
+            ctx.runOnClient(mc -> ServerSettingsStore.load());
+            assertStorages(ctx, List.of(chest), "after reloading servers.json from disk");
+
+            ctx.runCommand("bot storage clear");
+            assertStorages(ctx, List.of(), "after clearing");
+            ctx.runOnClient(mc -> ServerSettingsStore.load());
+            assertStorages(ctx, List.of(), "after reloading a cleared list");
+            LOGGER.info("Storage command test passed");
+        } finally {
+            ctx.runOnClient(mc -> {
+                ServerSettingsStore.current().storages.clear();
+                ServerSettingsStore.current().storages.addAll(before);
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    // ================================================================
+    // Test 26: a shortfall sends the bot to the chest and back
+    // ================================================================
+
+    /**
+     * The whole restock, from the tick the manifest is short to the tick the
+     * interrupted behavior is running again.
+     *
+     * <p>The probe asks for one diamond pickaxe and is given none, so the
+     * shortfall is there on its first tick; the pickaxe is in the chest and a
+     * stack of cobblestone is in the bot's pockets, which the manifest does not
+     * mention and which is therefore loot. That covers both halves of
+     * {@link net.stracciatella.bot.behavior.ContainerTransfer} in one trip — one
+     * stack out, one stack in — and it covers
+     * {@link net.stracciatella.bot.task.OpenContainerTask}, because neither half
+     * happens without the screen.
+     *
+     * <p><b>{@code starts == 2} is the assertion that matters.</b> Suspend is
+     * {@code abort()} and resume is {@code start()}, so the probe counting its own
+     * starts is the only direct evidence that the two-slot stack put it back; and
+     * {@code BehaviorRunner} only resumes a behavior whose shortfall is gone, so
+     * a second start also proves the withdrawal worked. A restock that failed
+     * anywhere leaves the count at one.
+     */
+    @MinecraftTest(name = "Bot restocks and resumes what it interrupted",
+            timeoutTicks = 1200, order = -171)
+    public void restockInterruptsAndResumes(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1440, 30, 1440);
+        final BlockPos chest = origin.offset(6, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + chest.getX() + " " + chest.getY() + " " + chest.getZ()
+                + " chest");
+        ctx.waitFor(mc -> mc.level.getBlockState(chest).is(Blocks.CHEST));
+        ctx.runCommand("item replace block " + chest.getX() + " " + chest.getY() + " "
+                + chest.getZ() + " container.0 with minecraft:diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        ctx.runCommand("give @s cobblestone 64");
+        ctx.waitFor(mc -> countItems(mc.player.getInventory(), Items.COBBLESTONE) >= 64);
+        generateMesh(ctx, origin);
+
+        final List<StorageSite> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().storages));
+        final RestockProbeBehavior probe = new RestockProbeBehavior();
+        try {
+            ctx.runOnClient(mc -> {
+                ServerSettings settings = ServerSettingsStore.current();
+                settings.storages.clear();
+                settings.exitStrategy = ServerSettings.ExitStrategy.STAIRCASE;
+                settings.storages.add(
+                        StorageSite.of(ServerSettingsStore.dimensionOf(mc), chest));
+                BehaviorRunner.register(probe);
+                BehaviorRunner.start(RestockProbeBehavior.ID);
+            });
+
+            ctx.waitFor(mc -> !BehaviorRunner.isActive());
+            ctx.runOnClient(mc -> BotController.stop());
+
+            if (probe.starts != 2) {
+                throw new AssertionError("The probe was started " + probe.starts
+                        + " times, expected 2 (start, then resume after the restock)");
+            }
+            if (countItem(ctx, Items.DIAMOND_PICKAXE) < 1) {
+                throw new AssertionError("The bot came back from the chest without the pickaxe"
+                        + " its manifest asked for");
+            }
+            if (countItem(ctx, Items.COBBLESTONE) > 0) {
+                throw new AssertionError("The bot kept " + countItem(ctx, Items.COBBLESTONE)
+                        + " cobblestone — loot the manifest does not mention belongs in the chest");
+            }
+            // Asked of the server, not of mc.level: a client-side
+            // ChestBlockEntity never holds its contents — getUpdateTag sends
+            // none — so the client's copy reads empty however the deposit went.
+            // Submitted to the server thread and joined on the test thread, so
+            // the read is both authoritative and not a torn off-thread peek.
+            final MinecraftServer server = ctx.computeOnClient(mc -> mc.getSingleplayerServer());
+            int inChest = server.submit(() -> {
+                if (!(server.overworld().getBlockEntity(chest)
+                        instanceof net.minecraft.world.level.block.entity.ChestBlockEntity box)) {
+                    return -1;
+                }
+                int found = 0;
+                for (int slot = 0; slot < box.getContainerSize(); slot++) {
+                    if (box.getItem(slot).is(Items.COBBLESTONE)) {
+                        found += box.getItem(slot).getCount();
+                    }
+                }
+                return found;
+            }).join();
+            if (inChest < 64) {
+                throw new AssertionError("The chest holds " + inChest
+                        + " cobblestone, expected the whole deposited stack of 64");
+            }
+            double home = ctx.computeOnClient(mc -> horizDistTo(mc, origin.getX() + 0.5,
+                    origin.getZ() + 0.5));
+            if (home > 2.5) {
+                throw new AssertionError("The bot resumed " + String.format("%.2f", home)
+                        + " blocks from the work site; the run has to carry on where it stopped");
+            }
+            LOGGER.info("Restock test passed: probe started {} times, back within {} blocks",
+                    probe.starts, String.format("%.2f", home));
+        } finally {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+                ServerSettingsStore.current().storages.clear();
+                ServerSettingsStore.current().storages.addAll(before);
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    // ================================================================
+    // Test 27: a shortfall nobody can serve is not a reason to stop
+    // ================================================================
+
+    /**
+     * The same probe with the same shortfall and no chest configured anywhere.
+     *
+     * <p>This is what makes a restock safe to have on by default. The manifest is
+     * short from the first tick, and if that alone ended the run, the first
+     * {@code /miner chunk start} on a server nobody has configured would fail
+     * instead of mining — a bot handed a pickaxe is short of everything else it
+     * asks for. So the runner asks whether a trip is possible before it suspends
+     * anybody, says so once, and lets the behavior carry on and end on its own
+     * terms.
+     */
+    @MinecraftTest(name = "Bot carries on when a restock has nowhere to go",
+            timeoutTicks = 400, order = -170)
+    public void restockWithoutStorageDoesNotStopTheRun(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1480, 30, 1480);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        final List<StorageSite> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().storages));
+        final RestockProbeBehavior probe = new RestockProbeBehavior();
+        try {
+            ctx.runOnClient(mc -> {
+                ServerSettingsStore.current().storages.clear();
+                BehaviorRunner.register(probe);
+                BehaviorRunner.start(RestockProbeBehavior.ID);
+            });
+
+            // Long enough for a restock to have been attempted and failed: the
+            // trip's own first failure (no storage) lands on its first tick.
+            ctx.waitTicks(60);
+            boolean running = ctx.computeOnClient(mc -> BehaviorRunner.isActive());
+            String active = ctx.computeOnClient(mc -> BehaviorRunner.activeId());
+            if (!running || !RestockProbeBehavior.ID.equals(active)) {
+                throw new AssertionError("The run ended over a restock that could not happen:"
+                        + " active behavior is " + active);
+            }
+            if (probe.starts != 1) {
+                throw new AssertionError("The probe was started " + probe.starts
+                        + " times; with no chest to go to nothing should have interrupted it");
+            }
+            LOGGER.info("Unserved-restock test passed: the probe is still running");
+        } finally {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+                ServerSettingsStore.current().storages.clear();
+                ServerSettingsStore.current().storages.addAll(before);
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    // ================================================================
+    // Test 28: /bot server exit command writes the command it was given
+    // ================================================================
+
+    /**
+     * The exit command end to end. Three things can go wrong and none of them
+     * is visible until a restock actually tries to leave a pit: the command is
+     * several tokens and a plain string argument would keep only the first, a
+     * player types it with the leading slash that {@code sendCommand} must not
+     * see, and a second one has to <em>replace</em> the first rather than queue
+     * behind it. The reload is the assertion for all three — it throws the
+     * in-memory settings away and reads servers.json back.
+     */
+    @MinecraftTest(name = "Bot exit command reaches servers.json",
+            timeoutTicks = 200, order = -169)
+    public void exitCommandReachesTheStore(TestContext ctx) {
+        final ServerSettings.ExitStrategy beforeStrategy = ctx.computeOnClient(
+                mc -> ServerSettingsStore.current().exitStrategy);
+        final List<String> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().exitCommands));
+        try {
+            ctx.runOnClient(mc -> {
+                ServerSettingsStore.current().exitCommands.clear();
+                ServerSettingsStore.current().exitStrategy =
+                        ServerSettings.ExitStrategy.STAIRCASE;
+            });
+
+            ctx.runCommand("bot server exit command tp 1 1 1");
+            assertExitCommands(ctx, List.of("tp 1 1 1"), "after a command of several words");
+            assertExitStrategy(ctx, ServerSettings.ExitStrategy.COMMAND,
+                    "after naming a command");
+
+            ctx.runOnClient(mc -> ServerSettingsStore.load());
+            assertExitCommands(ctx, List.of("tp 1 1 1"), "after reloading servers.json");
+            assertExitStrategy(ctx, ServerSettings.ExitStrategy.COMMAND,
+                    "after reloading servers.json");
+
+            ctx.runCommand("bot server exit command /t spawn");
+            assertExitCommands(ctx, List.of("t spawn"),
+                    "after a command typed with its leading slash");
+
+            // Switching away and back must not lose it: the command is a fact
+            // about the server and the strategy is the choice to use it.
+            ctx.runCommand("bot server exit staircase");
+            assertExitStrategy(ctx, ServerSettings.ExitStrategy.STAIRCASE,
+                    "after switching back to the staircase");
+            assertExitCommands(ctx, List.of("t spawn"), "after switching back to the staircase");
+            LOGGER.info("Exit command test passed");
+        } finally {
+            ctx.runOnClient(mc -> {
+                ServerSettingsStore.current().exitCommands.clear();
+                ServerSettingsStore.current().exitCommands.addAll(before);
+                ServerSettingsStore.current().exitStrategy = beforeStrategy;
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    private void assertExitCommands(TestContext ctx, List<String> expected, String when) {
+        List<String> actual = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().exitCommands));
+        if (!actual.equals(expected)) {
+            throw new AssertionError("Exit commands " + when + " are " + actual
+                    + ", expected " + expected);
+        }
+    }
+
+    private void assertExitStrategy(TestContext ctx, ServerSettings.ExitStrategy expected,
+                                    String when) {
+        ServerSettings.ExitStrategy actual = ctx.computeOnClient(
+                mc -> ServerSettingsStore.current().exitStrategy);
+        if (actual != expected) {
+            throw new AssertionError("Exit strategy " + when + " is " + actual
+                    + ", expected " + expected);
+        }
+    }
+
+    /**
+     * A behavior that wants one diamond pickaxe and does nothing else. It counts
+     * its own starts, because that is the only thing that tells a resumed run
+     * from a run that was never interrupted — the runner suspends with
+     * {@code abort()} and resumes with {@code start()}, and neither leaves any
+     * other trace.
+     */
+    private static final class RestockProbeBehavior implements BotBehavior {
+
+        private static final String ID = "restock_probe";
+
+        private int starts;
+
+        @Override
+        public String id() {
+            return ID;
+        }
+
+        @Override
+        public BotPolicy policy() {
+            // No guards at all: the point is the manifest, and an inventory-full
+            // or damage stop would end the run before the trip could.
+            return BotPolicy.none();
+        }
+
+        @Override
+        public net.stracciatella.bot.behavior.RestockNeeds restockNeeds() {
+            return new net.stracciatella.bot.behavior.RestockNeeds.Builder()
+                    .need("a pickaxe", stack -> stack.is(Items.DIAMOND_PICKAXE), 1)
+                    .build();
+        }
+
+        @Override
+        public void start(net.minecraft.client.Minecraft client) {
+            starts++;
+        }
+
+        @Override
+        public void abort() {
+            BotController.stop();
+        }
+
+        @Override
+        public String statusLine() {
+            return "started " + starts + " times";
+        }
+
+        @Override
+        public BehaviorStatus tick(net.minecraft.client.Minecraft client) {
+            // Finished once it has been put back on its feet. Before that it
+            // simply waits, so the shortfall is what drives the whole test.
+            return starts >= 2 ? BehaviorStatus.SUCCEEDED : BehaviorStatus.RUNNING;
+        }
+    }
+
+    /**
+     * Aim the player at a block from {@code standPos} and wait until its own
+     * raycast agrees. The commands under test read a live raycast, not
+     * {@code Minecraft.hitResult}, so the rotation has to be real — and waiting
+     * for the raycast rather than for a tick count keeps the test off the
+     * rotation-sync timing.
+     */
+    private void lookAtBlock(TestContext ctx, BlockPos standPos, BlockPos target) {
+        double eyeX = standPos.getX() + 0.5;
+        double eyeY = standPos.getY() + 1.62;
+        double eyeZ = standPos.getZ() + 0.5;
+        double dx = target.getX() + 0.5 - eyeX;
+        double dy = target.getY() + 0.5 - eyeY;
+        double dz = target.getZ() + 0.5 - eyeZ;
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double pitch = -Math.toDegrees(Math.atan2(dy, horizontal));
+        ctx.runCommand("tp @s " + eyeX + " " + standPos.getY() + " " + eyeZ
+                + " " + yaw + " " + pitch);
+        ctx.waitFor(mc -> {
+            var hit = mc.player.raycastHitResult(0, mc.player);
+            return hit instanceof net.minecraft.world.phys.BlockHitResult block
+                    && block.getBlockPos().equals(target);
+        });
+    }
+
+    private void assertStorages(TestContext ctx, List<BlockPos> expected, String when) {
+        List<BlockPos> actual = ctx.computeOnClient(mc -> {
+            List<BlockPos> positions = new ArrayList<>();
+            for (StorageSite site : ServerSettingsStore.current().storages) {
+                positions.add(site.pos());
+            }
+            return positions;
+        });
+        if (!actual.equals(expected)) {
+            throw new AssertionError("Storage list " + when + " is " + actual
+                    + ", expected " + expected);
         }
     }
 

@@ -64,8 +64,20 @@ public class MinerConfig {
     // vanilla overworld; clamped to the world floor at runtime.
     public int chunkMinerBottomY = -59;
 
-    // The run stops when fewer than this many inventory slots are empty.
+    // With fewer than this many empty slots the chunk miner restocks, or — with
+    // restocking off — stops. One threshold for both, because it is the same
+    // question: from here on, everything mined is lost.
     public int chunkMinerMinFreeSlots = 2;
+
+    // Whether the chunk miner walks to a chest when it runs out of room, tools,
+    // filler or food instead of ending the run. On by default: a run that stops
+    // two slabs in because the inventory filled up is the thing this exists to
+    // prevent, and the bot does nothing on an unconfigured server anyway —
+    // `servers.json` starts with no storages, so the restock has nowhere to go
+    // and says so rather than wandering off. The two defaults are a pair: if
+    // this one is ever turned off by default, the tame server defaults stop
+    // being the safety net they are here for.
+    public boolean chunkMinerRestock = true;
 
     public void applyFrom(MinerConfig other) {
         this.floorOffsetAboveBedrock = other.floorOffsetAboveBedrock;
@@ -76,6 +88,7 @@ public class MinerConfig {
         this.fillerBlocks = new ArrayList<>(other.fillerBlocks);
         this.chunkMinerBottomY = other.chunkMinerBottomY;
         this.chunkMinerMinFreeSlots = other.chunkMinerMinFreeSlots;
+        this.chunkMinerRestock = other.chunkMinerRestock;
     }
 
     public static MinerConfig load() {

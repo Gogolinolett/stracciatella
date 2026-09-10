@@ -14,8 +14,8 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.util.Mth;
-import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ClipContext;
@@ -31,7 +31,9 @@ import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorStatus;
 import net.stracciatella.bot.behavior.BotBehavior;
+import net.stracciatella.bot.behavior.RestockNeeds;
 import net.stracciatella.bot.humanize.HumanBehavior;
+import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.task.BotTask;
 import net.stracciatella.bot.task.MineBlockTask;
 import net.stracciatella.bot.task.PlaceBlockTask;
@@ -53,6 +55,12 @@ import org.slf4j.LoggerFactory;
  * <p>The bot never mines outside the target chunk. It does place outside it
  * where a liquid leaves no choice: to cap a source that would otherwise pour
  * in, and to dam the face a liquid at the chunk border flows through.
+ *
+ * <p>One thing inside the chunk is left standing too: the spiral staircase (see
+ * {@link SpiralStairs}), one cell of every layer, so the bot can walk out of its
+ * own pit and back in. {@link #isMinable} is where that happens, and it is the
+ * only place it needs to — the sweep, the column scan and the finish condition
+ * all ask it.
  */
 public class ChunkMinerBehavior implements BotBehavior {
 
@@ -92,6 +100,25 @@ public class ChunkMinerBehavior implements BotBehavior {
     private static final int MAX_BRIDGE_STEPS = 12;
     /** Ticks to wait for the bot to fall into an opened cell before giving up. */
     private static final int MAX_DROP_WAIT_TICKS = 100;
+    /**
+     * How far above the current slab the staircase repair looks for missing
+     * steps. Two layers would be enough for the usual case — a descent digs
+     * exactly the two cells of the new slab in the bot's own column, so a step
+     * it took is in the slab now being cleared. Four covers the one cell the
+     * repair can legitimately decline: a step in the cell the bot's own body
+     * occupies, which is skipped rather than failed and is then two layers
+     * above the next slab's floor, out of the way and still in view.
+     */
+    private static final int STAIR_REPAIR_LOOKBACK = 4;
+    /**
+     * Filler blocks the run wants to carry. A stack, because a cap, a dam or a
+     * bridged floor is one block at a time and a chunk rarely needs dozens —
+     * fetching a second stack would only mean more of the inventory unavailable
+     * for what is being mined.
+     */
+    private static final int FILLER_TARGET = 64;
+    /** Meals to carry. Enough to keep the food bar up for hours of digging. */
+    private static final int MEAL_TARGET = 16;
 
     private enum Phase {
         SELECT_SLAB,
@@ -106,6 +133,22 @@ public class ChunkMinerBehavior implements BotBehavior {
     private int fromY;
     private int toY;
     private int slabFeetY;
+    /**
+     * Height of the staircase's first step — see {@link SpiralStairs}. Two below
+     * the top of the range, which is the layer the bot was standing on when the
+     * run started: {@code fromY} is the bot's <em>head</em> layer, so the floor
+     * under its feet is {@code fromY - 2}, and a ramp whose top step is that
+     * floor can be walked onto from the surface without a climb. One layer
+     * higher would put a block in the foot layer of the topmost slab, whose
+     * headroom is the untouched terrain above the range — a step nobody can
+     * stand on.
+     *
+     * <p>It also means a run pinned to a single slab has no steps at all: the top
+     * step is then below {@code toY} and outside the range, so the chunk comes
+     * out empty. That is the right answer rather than a coincidence — a two-deep
+     * pit needs no ramp to climb out of.
+     */
+    private int stairTopY;
     private int requestedFromY;
     private int requestedToY;
     private boolean rangeRequested;
@@ -128,6 +171,14 @@ public class ChunkMinerBehavior implements BotBehavior {
     // the next one is chosen next to. Null until the slab's first column, and
     // again after every descent, where the bot's own cell is the anchor.
     private BlockPos sweepColumn;
+    // Steps the repair has already reported as unbuildable. A log latch only —
+    // the cell is looked at again every time, because a dam or a floor laid
+    // next to it can give it the face it was missing.
+    private final Set<BlockPos> stepsWithoutSupport = new HashSet<>();
+    // Whether the "no filler to rebuild a step with" line has been said. One per
+    // run, like the controller's no-food warning: with nothing to place, every
+    // column of the slab would repeat it.
+    private boolean stairFillerWarned;
     private int stepRetries;
     private int breatherTicks;
 
@@ -168,10 +219,9 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     @Override
     public BotPolicy policy() {
-        return BotPolicy.none()
+        BotPolicy policy = BotPolicy.none()
                 .withDamageStop()
                 .withPlayerAttackStop()
-                .withInventoryFullStop(config.chunkMinerMinFreeSlots)
                 .withOpportunisticCollection()
                 .withFastCollectExit()
                 // The serpentine already is the order, and it is the one thing
@@ -191,6 +241,56 @@ public class ChunkMinerBehavior implements BotBehavior {
                 // The meal goes in between two columns, where the hand is off
                 // the button anyway.
                 .withAutoEat();
+        // Unconditional, restock or no restock: the runner asks the manifest
+        // first and only falls through to this when the trip cannot happen (no
+        // chest configured for this server). So the same threshold reads as
+        // "go and empty your pockets" where that is possible and as "stop, from
+        // here on everything you mine is lost" where it is not — and a server
+        // nobody has configured behaves exactly as it did before restocking
+        // existed.
+        return policy.withInventoryFullStop(config.chunkMinerMinFreeSlots);
+    }
+
+    /**
+     * What the run needs in the inventory to carry on: a pickaxe, a shovel,
+     * something to place and something to eat, plus room for what it digs.
+     *
+     * <p>Opting in at all is a claim about this behavior, not a preference: a
+     * restock suspends a run with {@code abort()} and resumes it with
+     * {@code start()}, so only a behavior that finds its place again by reading
+     * the world may declare a manifest. This one stores no progress whatsoever —
+     * the slab is re-derived from what is still standing — which is exactly the
+     * property that makes a trip to a chest free. The staircase is the other
+     * half of it: without a way up its own pit the bot could not take the trip.
+     *
+     * <p>Both tools are wanted <b>one</b> at a time, and that is deliberate
+     * rather than thrifty. {@code target} is read twice — as the trigger and as
+     * the amount to fetch — so asking for three pickaxes would also mean a trip
+     * to the chest the moment one of the three broke. The run mines until it has
+     * nothing that drops the block in front of it, which is the reason the user
+     * asked for ("kein Werkzeug ist ein Restock-Grund"), and the execution
+     * layer reports that case by name through
+     * {@code BotController.consumeMissingTool} before this count ever reaches
+     * zero.
+     *
+     * <p>The filler entry doubles as the deposit rule by complement: everything
+     * not on this list is loot and goes in the chest. That is why food is here
+     * even though nothing about mining needs it — a bot with {@code autoEat}
+     * that deposited its own bread would be hungry for the rest of the session.
+     */
+    @Override
+    public RestockNeeds restockNeeds() {
+        if (!config.chunkMinerRestock) {
+            return RestockNeeds.none();
+        }
+        return new RestockNeeds.Builder()
+                .need("a pickaxe", stack -> stack.is(ItemTags.PICKAXES), 1)
+                .need("a shovel", stack -> stack.is(ItemTags.SHOVELS), 1)
+                .need("filler blocks", InventoryHelper.blockIdMatcher(config.fillerBlocks),
+                        FILLER_TARGET)
+                .need("food", BotController::isMeal, MEAL_TARGET)
+                .minFreeSlots(config.chunkMinerMinFreeSlots)
+                .build();
     }
 
     @Override
@@ -202,6 +302,8 @@ public class ChunkMinerBehavior implements BotBehavior {
         pendingPlacement = null;
         groundworkAfterOpening = null;
         sweepColumn = null;
+        stepsWithoutSupport.clear();
+        stairFillerWarned = false;
         stepRetries = 0;
         breatherTicks = 0;
         blocksMined = 0;
@@ -217,7 +319,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         chunk = new ChunkPos(player.blockPosition());
         int worldFloor = client.level != null ? client.level.getMinY() : Integer.MIN_VALUE;
         // "From here down" reaches from the bot's head, not from its feet. The
-        // top of the range is the *head* layer of the topmost slab — isInRange
+        // top of the range is the *head* layer of the topmost slab — isMinable
         // caps there and tickSelectSlab starts the grid at fromY - 1 — so
         // taking the feet layer anchored the whole grid one level too low: the
         // slab the bot occupies could never be picked, and every start
@@ -230,7 +332,9 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (toY < worldFloor) {
             toY = worldFloor;
         }
-        LOGGER.info("Chunk miner: chunk {} layers {}..{}", chunk, toY, fromY);
+        stairTopY = fromY - 2;
+        LOGGER.info("Chunk miner: chunk {} layers {}..{}, staircase from y={}",
+                chunk, toY, fromY, stairTopY);
     }
 
     @Override
@@ -379,6 +483,16 @@ public class ChunkMinerBehavior implements BotBehavior {
      * Get the bot's feet down to the slab it is about to clear by digging
      * through its own column — one block per batch, so the bot drops a single
      * level at a time and always lands on something it has already looked at.
+     *
+     * <p>This is the one thing in the run that may break a step of the
+     * staircase, and it is allowed to. The column holding the bot up is
+     * sometimes a ring column, and refusing to dig it would leave the bot
+     * standing on a step with solid rock on every side and no way down — there
+     * is nothing here that can make it take a sideways pace. So the step comes
+     * out and {@link #repairStairs} puts it back, which it can do as soon as the
+     * sweep's first column has moved the bot off the cell. Both cells a descent
+     * opens belong to the slab about to be cleared, so the repair is looking at
+     * exactly them.
      */
     private BehaviorStatus tickDescend(LocalPlayer player, Level level) {
         BlockPos feet = player.blockPosition();
@@ -478,6 +592,10 @@ public class ChunkMinerBehavior implements BotBehavior {
                 return footing;
             }
             groundworkAfterOpening = null;
+        }
+        BehaviorStatus stair = repairStairs(player, level);
+        if (stair != null) {
+            return stair;
         }
         BlockPos column = nextColumn(player, level);
         if (column == null) {
@@ -596,7 +714,7 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     private void addColumn(Level level, BlockPos column, List<BlockPos> into) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-            if (isInRange(pos) && !plannedBlocks.contains(pos)
+            if (isMinable(pos) && !plannedBlocks.contains(pos)
                     && isDiggable(level.getBlockState(pos))) {
                 into.add(pos);
             }
@@ -624,7 +742,7 @@ public class ChunkMinerBehavior implements BotBehavior {
     private boolean slabHasWork(Level level, int feetY) {
         for (BlockPos column : slabColumns(feetY)) {
             for (BlockPos pos : new BlockPos[] {column, column.above()}) {
-                if (isInRange(pos) && isDiggable(level.getBlockState(pos))) {
+                if (isMinable(pos) && isDiggable(level.getBlockState(pos))) {
                     return true;
                 }
             }
@@ -738,7 +856,7 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     private boolean hasWork(Level level, BlockPos column) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-            if (isInRange(pos) && !plannedBlocks.contains(pos)
+            if (isMinable(pos) && !plannedBlocks.contains(pos)
                     && isDiggable(level.getBlockState(pos))) {
                 return true;
             }
@@ -798,6 +916,93 @@ public class ChunkMinerBehavior implements BotBehavior {
                     chunk.getMinBlockZ() + (packed / CHUNK_SIZE)));
         }
         return columns;
+    }
+
+    // --- Staircase ---
+
+    /**
+     * Put back any step of the staircase that is missing from the layers the bot
+     * can still reach, or null when the ramp is whole. One placement per call,
+     * like every other placement here.
+     *
+     * <p>A step goes missing two ways. A cave took it, which is the case the
+     * user asked for — and the bot has to walk through that cave to get out, so
+     * an empty ring cell there is a two-block climb the mesh cannot make. Or the
+     * descent took it: {@code tickDescend} digs through whatever is holding the
+     * bot up, and that is sometimes a ring column, which is why this runs
+     * <em>during</em> the sweep rather than at the end of it. The sweep's first
+     * column moves the bot off the cell it landed in, and the step goes back in
+     * on the next call — early, while the slab is still being cleared, so a run
+     * stopped in the middle of one leaves a ramp that can be climbed.
+     *
+     * <p>Derived from the world, not remembered: the repair asks
+     * {@link SpiralStairs#stepAt} which cell each layer owes and looks. No record
+     * of what was dug has to agree with anything.
+     *
+     * <p>Bounded above by {@link #STAIR_REPAIR_LOOKBACK}, and the bound is the
+     * known limit of this: a step further up than that is out of reach from the
+     * slab floor, and there is nothing to stand on in between to get to it. The
+     * window covers the slab being cleared and the one above it, so a cave up to
+     * a slab tall is mended; a taller void leaves the ramp broken, and what
+     * reports that is the restock's own walk failing, not a guess made here.
+     *
+     * <p>A step that <em>cannot</em> be attempted — nothing to build against,
+     * nothing in the inventory to build with — is skipped rather than fatal,
+     * unlike a floor. A floor is planned because the bot is about to walk
+     * somewhere it would otherwise fall; a step is the way out of a hole the bot
+     * is not in yet, and ending the run on the spot would turn every cave that
+     * happens to cross the chunk's edge into a failure. In a cave the step's
+     * every neighbour is gone — the cell below it is in range and mined, the
+     * ring cells beside it too, and the one face that is normally there, the
+     * chunk wall outside, is what the cave took. A step that <em>is</em>
+     * attempted is held to the same bar as every other placement: it goes
+     * through {@link #verifyPlacement}, and one that keeps failing ends the run,
+     * because then the bot is digging itself into a pit it has been unable to
+     * leave a way out of.
+     */
+    private BehaviorStatus repairStairs(LocalPlayer player, Level level) {
+        // A placement takes the plan with it (planPlacement clears it), so the
+        // same rule the groundwork follows: never while a block is under the
+        // pick.
+        if (!plannedBlocks.isEmpty()) {
+            return null;
+        }
+        int top = Math.min(slabFeetY + STAIR_REPAIR_LOOKBACK - 1, fromY);
+        for (int y = Math.max(slabFeetY, toY); y <= top; y++) {
+            BlockPos step = SpiralStairs.stepAt(chunk, stairTopY, y);
+            if (step == null || !isPassable(level.getBlockState(step))) {
+                continue;
+            }
+            // The cell the bot is standing or breathing in. Nothing can be
+            // placed there, and the sweep is about to move it: the lookback
+            // window still covers this layer from the next slab down, where the
+            // bot is two levels under it.
+            if (player.getBoundingBox().intersects(new AABB(step))) {
+                continue;
+            }
+            if (InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
+                if (!stairFillerWarned) {
+                    stairFillerWarned = true;
+                    LOGGER.warn("Chunk miner: the step at {} is missing and there is no filler"
+                            + " block to rebuild it with", shortPos(step));
+                }
+                return null;
+            }
+            BlockPos support = PlaceBlockTask.findSupport(level, step, player.getEyePosition());
+            if (support == null) {
+                // Said once per cell, not once per column: this is asked before
+                // every column of the slab, and a cave at the chunk edge would
+                // otherwise fill the log with the same line a thousand times.
+                if (stepsWithoutSupport.add(step)) {
+                    LOGGER.warn("Chunk miner: the step at {} is missing and has nothing to build"
+                            + " against — the way out has a gap there", shortPos(step));
+                }
+                continue;
+            }
+            LOGGER.info("Chunk miner: rebuilding the missing step at {}", shortPos(step));
+            return planPlacement(step, support, "step");
+        }
+        return null;
     }
 
     // --- Safety ---
@@ -1203,15 +1408,13 @@ public class ChunkMinerBehavior implements BotBehavior {
                 + " — " + stepRetries + " attempts failed, see the task diagnostics above");
     }
 
-    /** Matches any stack of a configured filler block. */
+    /**
+     * Matches any stack of a configured filler block. The same predicate the
+     * restock manifest carries, so what the bot places and what it fetches
+     * cannot drift apart.
+     */
     private Predicate<ItemStack> fillerPredicate() {
-        return stack -> {
-            if (!(stack.getItem() instanceof BlockItem blockItem)) {
-                return false;
-            }
-            String id = BuiltInRegistries.BLOCK.getKey(blockItem.getBlock()).toString();
-            return config.fillerBlocks.contains(id);
-        };
+        return InventoryHelper.blockIdMatcher(config.fillerBlocks);
     }
 
     // --- Execution plumbing ---
@@ -1327,8 +1530,22 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     // --- Block predicates ---
 
-    private boolean isInRange(BlockPos pos) {
-        return pos.getY() >= toY && pos.getY() <= fromY && chunk.equals(new ChunkPos(pos));
+    /**
+     * Whether a cell is this run's work: inside the chunk, inside the layer
+     * range, and not a step of the staircase.
+     *
+     * <p>The three callers of this are the whole of the question "may this cell
+     * be mined as slab work" — the sweep's plan ({@link #addColumn}), the
+     * column scan ({@link #hasWork}) and the finish condition
+     * ({@link #slabHasWork}) — which is why the staircase is carved out here and
+     * nowhere else. Excluding it in one place makes the sweep walk past a step,
+     * the slab read as finished with the step still standing, and the bot never
+     * end a slab on a column it is about to be told to mine; excluding it in
+     * three would be three chances to disagree.
+     */
+    private boolean isMinable(BlockPos pos) {
+        return pos.getY() >= toY && pos.getY() <= fromY && chunk.equals(new ChunkPos(pos))
+                && !SpiralStairs.isStairCell(chunk, stairTopY, pos);
     }
 
     /**

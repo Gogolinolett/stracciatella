@@ -75,4 +75,20 @@ public interface BotTask {
     default Direction preferredFace() {
         return null;
     }
+
+    /**
+     * Whether completing this task takes an item out of the inventory.
+     *
+     * <p>The controller confirms a USE task with two signals: the destination
+     * looking finished for a sustained window, <em>and</em> the main inventory
+     * having shrunk by the block that was consumed — a client-predicted
+     * placement the server rejects never moves the item count. A USE that
+     * consumes nothing, like opening a chest, can never produce that second
+     * signal, and would then be left waiting for a server acknowledgement it has
+     * no reason to trust as the only evidence. Saying "no item changes hands
+     * here" is the honest way out; the sustained-state window still has to pass.
+     */
+    default boolean consumesItem() {
+        return true;
+    }
 }

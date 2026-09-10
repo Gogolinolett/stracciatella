@@ -101,6 +101,15 @@ public class HumanBehavior {
     }
 
     /**
+     * Gap in ticks between two shift-clicks inside an open container, uniform in
+     * [restockClickDelayMin, restockClickDelayMax]. Emptying thirty stacks into a
+     * chest in thirty consecutive ticks is not something a person's hand does.
+     */
+    public static int randomRestockClickDelay(BotConfig config) {
+        return randomIntInRange(config.restockClickDelayMin, config.restockClickDelayMax);
+    }
+
+    /**
      * Downward gaze pitch (degrees below horizon) used while collecting
      * drops, uniform in [collectGazePitchMinDeg, collectGazePitchMaxDeg].
      * Rolled once per COLLECTING phase — the "scanning the ground ahead"

@@ -1,6 +1,7 @@
 package net.stracciatella.gui.test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import net.minecraft.client.gui.components.Button;
@@ -12,6 +13,7 @@ import net.stracciatella.gui.GuiPage;
 import net.stracciatella.gui.GuiRegistry;
 import net.stracciatella.gui.screen.GuiRootScreen;
 import net.stracciatella.gui.screen.IdListScreen;
+import net.stracciatella.gui.screen.SettingsScreen;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
 import net.stracciatella.testing.api.TestSuite;
@@ -107,6 +109,75 @@ public class GuiTests {
         LOGGER.info("Id list screen edited its list through its widgets");
     }
 
+    // ================================================================
+    // Test 4: the settings page cycles its rows and pages through them
+    // ================================================================
+    /**
+     * The settings page every config knob is built on, driven the way a player
+     * drives it: click a row, click it again, turn the page, click a row over
+     * there, Done.
+     *
+     * <p>Two of its properties are worth a test and neither is visible from the
+     * code that uses it. A click has to <b>relabel</b> the row: the button was
+     * built with the old value baked into its message, so without the rebuild the
+     * setting changes and the menu goes on showing the old value, which reads as
+     * a broken menu rather than as a broken screen. And a second page has to bind
+     * its buttons to the settings it is <b>showing</b> — an off-by-{@code first}
+     * there silently advances a row from page one, which no amount of looking at
+     * page two would reveal.
+     */
+    @MinecraftTest(name = "Settings screen cycles and pages", timeoutTicks = 200, order = 103)
+    public void settingsScreenCyclesAndPages(TestContext ctx) {
+        closeAnyScreen(ctx);
+        // One more than a page holds, so the paging controls exist at all.
+        final int rows = 9;
+        final int[] values = new int[rows];
+        final int[] saves = {0};
+        final List<SettingsScreen.Setting> settings = new ArrayList<>();
+        for (int i = 0; i < rows; i++) {
+            final int row = i;
+            settings.add(new SettingsScreen.Setting("Row " + (row + 1), "Probe row " + (row + 1),
+                    () -> String.valueOf(values[row]), () -> values[row]++));
+        }
+        final ProbeScreen parent = new ProbeScreen();
+        ctx.runOnClient(mc -> mc.setScreen(new SettingsScreen(parent,
+                new SettingsScreen.Spec("Probe settings", settings, () -> saves[0]++))));
+        ctx.waitFor(mc -> mc.screen instanceof SettingsScreen);
+
+        // The label each press has to find is the one the last press wrote.
+        press(ctx, "Row 1: 0");
+        assertRows(ctx, values, saves, "[1, 0, 0, 0, 0, 0, 0, 0, 0]", 1, "after one click");
+        press(ctx, "Row 1: 1");
+        assertRows(ctx, values, saves, "[2, 0, 0, 0, 0, 0, 0, 0, 0]", 2, "after clicking again");
+
+        press(ctx, "Page 1/2");
+        boolean stale = ctx.computeOnClient(mc -> findButton(mc.screen, "Row 1: 2", -1) != null);
+        if (stale) {
+            throw new AssertionError("Page 2 still shows the first page's rows");
+        }
+        press(ctx, "Row 9: 0");
+        assertRows(ctx, values, saves, "[2, 0, 0, 0, 0, 0, 0, 0, 1]", 3,
+                "after clicking the last row on page 2");
+
+        press(ctx, "Done");
+        ctx.waitFor(mc -> mc.screen == parent);
+        LOGGER.info("Settings screen cycled and paged through its rows");
+    }
+
+    private void assertRows(TestContext ctx, int[] values, int[] saves,
+                            String expected, int expectedSaves, String when) {
+        String actual = ctx.computeOnClient(mc -> Arrays.toString(values));
+        int saved = ctx.computeOnClient(mc -> saves[0]);
+        if (!actual.equals(expected)) {
+            throw new AssertionError("Settings " + when + " read " + actual + ", expected "
+                    + expected);
+        }
+        if (saved != expectedSaves) {
+            throw new AssertionError("Saved " + saved + " time(s) " + when + ", expected "
+                    + expectedSaves);
+        }
+    }
+
     /** Put {@code text} in the screen's text box and press Add. */
     private void typeAndAdd(TestContext ctx, String text) {
         ctx.runOnClient(mc -> {
@@ -134,13 +205,22 @@ public class GuiTests {
 
     /** The button with the given label, on the given row when {@code y} is not -1. */
     private static Button button(Screen screen, String label, int y) {
+        Button found = findButton(screen, label, y);
+        if (found == null) {
+            throw new AssertionError("No '" + label + "' button on the screen");
+        }
+        return found;
+    }
+
+    /** The same lookup where the button's absence is the thing being asserted. */
+    private static Button findButton(Screen screen, String label, int y) {
         for (var child : screen.children()) {
             if (child instanceof Button button && button.getMessage().getString().equals(label)
                     && (y < 0 || button.getY() == y)) {
                 return button;
             }
         }
-        throw new AssertionError("No '" + label + "' button on the screen");
+        return null;
     }
 
     private void assertList(TestContext ctx, List<String> entries, List<String> expected,

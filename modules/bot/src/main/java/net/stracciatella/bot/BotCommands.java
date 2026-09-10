@@ -6,6 +6,7 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.lit
 import java.util.List;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -24,6 +25,7 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.bot.scan.BlockScanner;
+import net.stracciatella.bot.server.ServerSettings;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
 import net.stracciatella.bot.task.ChopTreeTask;
@@ -179,7 +181,73 @@ public class BotCommands {
                         .then(literal("list")
                                 .executes(context -> ignoreList(context.getSource())))
                         .then(literal("clear")
-                                .executes(context -> ignoreClear(context.getSource()))));
+                                .executes(context -> ignoreClear(context.getSource()))))
+
+                // /bot storage add|remove|list|clear|scan — the chests this
+                // server's restocks may use. Add and remove work on the block
+                // in the crosshair: pointing at a chest is how a player says
+                // "that one", and a typed coordinate is the same answer with
+                // three chances to get a digit wrong.
+                .then(literal("storage")
+                        .then(literal("add").executes(context -> StorageCommands.add(
+                                context.getSource().getPlayer(),
+                                context.getSource().getWorld(),
+                                context.getSource())))
+                        .then(literal("remove").executes(context -> StorageCommands.remove(
+                                context.getSource().getPlayer(), context.getSource())))
+                        .then(literal("list")
+                                .executes(context -> StorageCommands.list(context.getSource())))
+                        .then(literal("clear")
+                                .executes(context -> StorageCommands.clear(context.getSource())))
+                        .then(literal("scan")
+                                .then(argument("radius",
+                                                IntegerArgumentType.integer(1, StorageCommands.MAX_SCAN_RADIUS))
+                                        .executes(context -> StorageCommands.scan(
+                                                context.getSource().getPlayer(),
+                                                context.getSource().getWorld(),
+                                                IntegerArgumentType.getInteger(context, "radius"),
+                                                context.getSource())))))
+
+                // /bot server — what the bot may do here, and everything that
+                // changes it. Per server, because every one of those answers is
+                // a fact about the server rather than a preference.
+                .then(literal("server")
+                        .executes(context -> StorageCommands.server(context.getSource()))
+                        .then(literal("exit")
+                                .then(literal("staircase").executes(context ->
+                                        StorageCommands.setExitStrategy(
+                                                ServerSettings.ExitStrategy.STAIRCASE,
+                                                context.getSource())))
+                                // Greedy, and the command itself is optional:
+                                // "t spawn" and "tp 1 1 1" are several tokens,
+                                // and a player types them the way they would
+                                // type them into chat. Without one the strategy
+                                // still switches and whatever was configured
+                                // stays.
+                                .then(literal("command")
+                                        .executes(context -> StorageCommands.setExitStrategy(
+                                                ServerSettings.ExitStrategy.COMMAND,
+                                                context.getSource()))
+                                        .then(argument("command", StringArgumentType.greedyString())
+                                                .executes(context -> StorageCommands.setExitCommand(
+                                                        StringArgumentType.getString(context, "command"),
+                                                        context.getSource())))))
+                        .then(literal("placement")
+                                .then(literal("on").executes(context ->
+                                        StorageCommands.setPlacement(true, context.getSource())))
+                                .then(literal("off").executes(context ->
+                                        StorageCommands.setPlacement(false, context.getSource())))))
+
+                // /bot restock — go and do it now, without waiting to run out.
+                .then(literal("restock").executes(context -> {
+                    if (!BehaviorRunner.requestRestock(net.minecraft.client.Minecraft.getInstance())) {
+                        context.getSource().sendError(Component.literal(
+                                "Already restocking"));
+                        return 0;
+                    }
+                    context.getSource().sendFeedback(Component.literal("Restocking"));
+                    return 1;
+                }));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(command);

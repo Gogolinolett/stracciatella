@@ -39,6 +39,30 @@ public interface BotBehavior {
     BotPolicy policy();
 
     /**
+     * What this strategy needs in its inventory to keep working. A shortfall
+     * against this manifest suspends the run, sends the bot to a storage block
+     * to deposit and restock, and then starts it again.
+     *
+     * <p>Defaulted, unlike {@link #policy()}, because the two defaults point in
+     * opposite directions. A silent policy default would hand a new behavior
+     * "no safety at all"; the silent default here is "never leaves its work
+     * site", which is the conservative answer and the only correct one for most
+     * strategies.
+     *
+     * <p><b>The contract for opting in:</b> a restock <em>suspends</em> the
+     * behavior by calling {@link #abort()} and resumes it by calling
+     * {@link #start(Minecraft)} again — there is no save/restore hook. So only a
+     * strategy that can pick up where it left off <em>by reading the world</em>
+     * may declare a manifest. The chunk miner can (it finds its next slab by
+     * looking at what is already mined); the diamond miner cannot (its tunnel
+     * position lives in fields that {@code start} resets), and it therefore
+     * keeps the default.
+     */
+    default RestockNeeds restockNeeds() {
+        return RestockNeeds.none();
+    }
+
+    /**
      * Called once when the behavior is started. Reset all internal state here.
      */
     void start(Minecraft client);

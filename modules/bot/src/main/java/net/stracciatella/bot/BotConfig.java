@@ -90,6 +90,47 @@ public class BotConfig {
     // lands back at or over it.
     public int eatBelowFoodLevel = 14;
 
+    // --- Restock ---
+
+    // Block ids the pathfinder may place to open a route — filling the step in
+    // front of the bot's feet when there is no way around. The first one the bot
+    // actually carries is used. Only ever consulted when the current server
+    // permits route placement at all; see servers.json.
+    //
+    // Deliberately its own list and not the chunk miner's fillerBlocks: that one
+    // answers "what do I seal water and bridge my slab with", owned by the miner
+    // and governed by no permission. Same contents by default, different owner,
+    // different question.
+    public List<String> routeBlocks = new ArrayList<>(List.of(
+            "minecraft:cobblestone",
+            "minecraft:dirt",
+            "minecraft:deepslate",
+            "minecraft:stone",
+            "minecraft:netherrack"));
+
+    // Block ids that count as storage for a restock. Ids rather than "any block
+    // entity that is a Container": that would also catch hoppers, droppers and
+    // furnaces, and a bot tipping its diamonds into a hopper is a bug report.
+    public List<String> storageBlocks = new ArrayList<>(List.of(
+            "minecraft:chest",
+            "minecraft:trapped_chest",
+            "minecraft:barrel"));
+
+    // Gap between two stack moves inside an open container, drawn uniformly.
+    // Shift-clicking thirty stacks in one tick is not a person.
+    public int restockClickDelayMin = 2;
+    public int restockClickDelayMax = 5;
+
+    // Ticks the bot stands perfectly still before sending the commands that get
+    // it out of a hole, for servers that require a standstill before teleporting.
+    public int teleportStandStillTicks = 240;
+
+    // Ticks to wait for the teleport to actually happen after the commands went
+    // out. Arrival is detected by the position jumping, not by this running out —
+    // the standstill requirement is a server setting and the next server's is a
+    // different number.
+    public int teleportWaitTicks = 200;
+
     // Scanning: look toward distant target before walking
     public int scanTimeout = 30;
     public double scanFacingTolerance = 15.0;
@@ -136,13 +177,14 @@ public class BotConfig {
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;
-        // Contents, not the reference: the commands and the GUI page hold
-        // this list, and a file without the key leaves Gson's null behind.
-        this.ignoredItems.clear();
-        if (other.ignoredItems != null) {
-            this.ignoredItems.addAll(other.ignoredItems);
-        }
+        copyInto(this.ignoredItems, other.ignoredItems);
         this.eatBelowFoodLevel = other.eatBelowFoodLevel;
+        copyInto(this.routeBlocks, other.routeBlocks);
+        copyInto(this.storageBlocks, other.storageBlocks);
+        this.restockClickDelayMin = other.restockClickDelayMin;
+        this.restockClickDelayMax = other.restockClickDelayMax;
+        this.teleportStandStillTicks = other.teleportStandStillTicks;
+        this.teleportWaitTicks = other.teleportWaitTicks;
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;
         this.scanRadius = other.scanRadius;
@@ -152,6 +194,24 @@ public class BotConfig {
         this.positionTimeout = other.positionTimeout;
         this.lookTimeout = other.lookTimeout;
         this.debugEnabled = other.debugEnabled;
+    }
+
+    /**
+     * Copy list contents rather than the reference — the commands and the GUI
+     * pages hold on to these lists, so replacing the reference would leave them
+     * editing a list nobody reads.
+     *
+     * <p>A {@code null} source means the loaded file predates the key, and the
+     * defaults are kept. That distinction matters: clearing on null is harmless
+     * for a list that defaults to empty, and would silently wipe one that does
+     * not.
+     */
+    private static void copyInto(List<String> target, List<String> source) {
+        if (source == null) {
+            return;
+        }
+        target.clear();
+        target.addAll(source);
     }
 
     public static BotConfig load() {

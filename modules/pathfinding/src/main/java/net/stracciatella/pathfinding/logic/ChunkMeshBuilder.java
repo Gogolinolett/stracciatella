@@ -35,6 +35,25 @@ public class ChunkMeshBuilder {
     private static final int[][] DIRECTION_VECTORS = buildDirectionVectors(1);
 
     public Mesh generatePathfindingMesh(ChunkAccess chunk, Entity entity) {
+        return generatePathfindingMesh(chunk, entity, Integer.MIN_VALUE, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Same, but only scanning layers inside {@code [bandMinY, bandMaxY]}.
+     *
+     * <p>The full-column variant above reads the entire build height — 16x16x384
+     * block states per chunk, roughly 98,000 of them, plus the neighbour pass.
+     * That is the right default and stays the default: a caller that does not
+     * say otherwise gets every walkable layer, and the diamond miner pathing far
+     * underground depends on exactly that.
+     *
+     * <p>It is the wrong price for a long overland route, where the only layers
+     * anyone will walk sit in a band around the traveller's own height. Hence a
+     * parameter rather than a narrower default — a globally capped band would
+     * silently take nodes away from callers that never asked for a band, which
+     * is a regression in a place that has nothing to do with travelling.
+     */
+    public Mesh generatePathfindingMesh(ChunkAccess chunk, Entity entity, int bandMinY, int bandMaxY) {
         Mesh newMesh = new Mesh();
         // Temporäre Map für schnellen Zugriff beim Verknüpfen der Nachbarn
         Map<BlockPos, MeshNode> nodeMap = new HashMap<>();
@@ -43,8 +62,8 @@ public class ChunkMeshBuilder {
         int minX = chunk.getPos().getMinBlockX();
         int minZ = chunk.getPos().getMinBlockZ();
 
-        int maxY = calculateMaxChunkY(chunk);
-        int minY = calculateMinChunkY(chunk);
+        int maxY = Math.min(calculateMaxChunkY(chunk), bandMaxY);
+        int minY = Math.max(calculateMinChunkY(chunk), bandMinY);
 
         BlockPos.MutableBlockPos baseBlock = new BlockPos.MutableBlockPos();
         BlockPos.MutableBlockPos oneAbove = new BlockPos.MutableBlockPos();

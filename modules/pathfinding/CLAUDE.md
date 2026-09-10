@@ -23,16 +23,21 @@ net.stracciatella.pathfinding
 │       ├── MeshNode.java             # Graph vertex: x, y, z + List<Neighbor>. Has equals/hashCode on (x,y,z)
 │       ├── Neighbor.java             # Weighted edge: target node + cost
 │       └── IMeshProvider.java        # Interface for mesh sources
+├── place/
+│   ├── BlockPlacer.java              # Interface: "put a block here, against that" — implemented by the bot
+│   └── PathPlacement.java            # Static hand-off + the per-server permission gate
 ├── travel/
 │   ├── TravelMethod.java             # Interface: pluggable movement method (id, canUse, cost, start, tick, abort)
 │   ├── TravelStatus.java             # Enum: IN_PROGRESS, SUCCEEDED, FAILED
 │   ├── Navigator.java                # Static coordinator: auto-selects best method, manages fallback chain
+│   ├── Journey.java                  # Long-distance travel in legs, re-planning after each one
 │   ├── WalkTravelMethod.java         # Wraps PathWalker for mesh-based walking
 │   └── EnderPearlTravelMethod.java   # Ender pearl throw with trajectory simulation
 ├── mixin/
 │   └── LevelChunkMixin.java          # Triggers mesh generation on chunk load
 └── test/
     ├── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
+    ├── JourneyTests.java             # In-game tests: a 400-block bridge, and an unloaded target
     └── EnderPearlTests.java          # In-game tests: ender pearl throwing at various distances/elevations
 ```
 
@@ -203,6 +208,60 @@ Static coordinator (like PathWalker). Registered on `ClientTickEvents.END_CLIENT
 | `navigate to <x> <y> <z>` | Navigate to coordinates using best method |
 | `navigate stop` | Stop navigation |
 | `navigate methods` | List registered methods and availability |
+
+## Journey — travel that does not know the way yet
+
+`Navigator` plans one path and walks it. That is the wrong shape for a destination
+hundreds of blocks away: **a route into an unloaded chunk cannot be planned at
+all.** The client holds no block data out there, so the mesh has no nodes — not a
+matter of search effort. `Journey` therefore walks in **legs**: aim at the best
+node the mesh currently has in the target's direction
+(`MeshPathfinder.findPathTowards`, the partial-answer variant of the same A*),
+walk it, mesh whatever streamed in on the way, ask again.
+
+Two things the module was missing fall out of that for free. **Re-planning**:
+`PathWalker` keeps the node list it was handed whatever happens to the world — the
+chunk mixin invalidates the mesh on a block change and nobody ever planned again.
+Every leg does. **A verdict**: `PathWalker.isActive()` going false means the walk
+ended, not that it worked, so every caller measured the distance itself;
+`Journey.status()` is `RUNNING` / `ARRIVED` / `FAILED` with a `failReason()`.
+
+`status()` is initialised to `ARRIVED` — the honest answer to "are you
+travelling" — so it must not be read as "have I arrived" before `start()`. Both of
+`RestockBehavior`'s travel phases completed instantly on that, and each caller now
+keeps its own "has it been started" flag.
+
+Bounds, all of them because an unattended bot must not walk forever: `CHUNKS_PER_TICK`
+(2) meshes under a per-tick budget so a long route is not paid for in one frame,
+`BAND_ABOVE`/`BAND_BELOW` (16/32) mesh only the Y band a route uses — the band is
+a **parameter** of mesh generation, not a new default, so ordinary `/path` meshing
+is unchanged — `KEEP_RADIUS` (8) evicts meshes outside a window around the player,
+`LEG_TIMEOUT_TICKS` (600), `TOTAL_TIMEOUT_TICKS` (12000), and `STALLED_LEGS_LIMIT`
+(2): a leg that ends no closer than it started is a stall, and the **second** one
+ends the journey — the first is what triggers an attempt to mend the way ahead,
+and that attempt deserves a leg to prove itself.
+
+### Placement: the pathfinder may build, if it is allowed to
+
+`BlockPlacer` is declared *here* and implemented in the bot module (`RoutePlacer`),
+registered through `PathPlacement.register` — the same inversion as
+`Navigator.register` and `BehaviorRunner.register`, and the reason it is that way
+round is that the dependency already points bot → pathfinding and must not
+turn around. Knowing *how* to place a block like a person is the bot's knowledge;
+knowing *where* a route needs one is the pathfinder's.
+
+`PathPlacement.setAllowed(boolean)` gates it and **defaults to off**. Reshaping
+terrain on a server the player has not configured is not something a pathfinder
+should start doing on its own; the bot module drives the flag from its per-server
+settings before each journey. `isAvailable()` is checked *before* a route that
+depends on placement is planned, so a forbidden placement shows up as "no path"
+rather than as a half-built bridge. `MAX_BRIDGE_CELLS` is 2, deliberately tiny:
+the equivalent logic in the chunk miner took five rounds to get right and every
+wrong version walked the bot somewhere it should not have gone.
+
+This governs the **pathfinder** placing blocks to open a route and nothing else.
+The chunk miner's own placements — damming water, bridging a gap in its slab,
+rebuilding a step — are a different permission and do not pass through here.
 
 ## PathDisplay — rendering
 

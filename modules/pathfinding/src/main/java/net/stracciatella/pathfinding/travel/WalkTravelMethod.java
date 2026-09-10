@@ -3,21 +3,21 @@ package net.stracciatella.pathfinding.travel;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
-import net.stracciatella.pathfinding.display.PathDisplay;
 import net.stracciatella.pathfinding.logic.MeshManager;
-import net.stracciatella.pathfinding.logic.MeshPathfinder;
-import net.stracciatella.pathfinding.logic.PathWalker;
-import net.stracciatella.pathfinding.logic.mesh.MeshNode;
 
-import java.util.List;
-
+/**
+ * Walking, as a travel method. A thin shell over {@link Journey}, which does the
+ * actual work of planning leg by leg and re-planning after each one.
+ *
+ * <p>It used to plan a single path up front and hand it to the walker. That only
+ * ever worked inside the chunks whose meshes happened to exist — roughly the
+ * 3x3 around the bot — and gave no verdict beyond "the walker stopped". Both of
+ * those belong to the journey now, so there is nothing left here but the
+ * {@code TravelMethod} shape Navigator needs.
+ */
 public class WalkTravelMethod implements TravelMethod {
 
     private static final double WALK_SPEED = 0.215; // blocks per tick (sprint average)
-    private static final double SUCCESS_RADIUS_SQ = 4.0; // 2 blocks
-
-    private BlockPos target;
-    private boolean started;
 
     @Override
     public String id() {
@@ -30,14 +30,12 @@ public class WalkTravelMethod implements TravelMethod {
         if (player == null || client.level == null) {
             return false;
         }
-        MeshNode startNode = MeshManager.findOrBuildNearestNode(client.level, player, from);
-        MeshNode endNode = MeshManager.findOrBuildNearestNode(client.level, player, to);
-        if (startNode == null || endNode == null) {
-            return false;
-        }
-        MeshPathfinder pathfinder = new MeshPathfinder();
-        List<MeshNode> path = pathfinder.findPath(startNode, endNode);
-        return !path.isEmpty();
+        // Deliberately only "can I start": a journey walks before it can know
+        // whether the far end is reachable, because the terrain out there has not
+        // been sent to the client yet. Answering the old question — is there a
+        // complete path right now — would rule out every destination worth a
+        // journey, and it ran a full A* on every fallback check to do it.
+        return MeshManager.findOrBuildNearestNode(client.level, player, from) != null;
     }
 
     @Override
@@ -51,49 +49,22 @@ public class WalkTravelMethod implements TravelMethod {
 
     @Override
     public void start(Minecraft client, BlockPos from, BlockPos to) {
-        LocalPlayer player = client.player;
-        if (player == null || client.level == null) {
-            return;
-        }
-        this.target = to;
-        this.started = false;
-
-        MeshNode startNode = MeshManager.findOrBuildNearestNode(client.level, player, from);
-        MeshNode endNode = MeshManager.findOrBuildNearestNode(client.level, player, to);
-        if (startNode == null || endNode == null) {
-            return;
-        }
-
-        MeshPathfinder pathfinder = new MeshPathfinder();
-        List<MeshNode> path = pathfinder.findPath(startNode, endNode);
-        if (path.isEmpty()) {
-            return;
-        }
-
-        PathDisplay.setHighlightedPath(path);
-        PathWalker.start(path);
-        this.started = true;
+        Journey.start(to);
     }
 
     @Override
     public TravelStatus tick(Minecraft client) {
-        if (!started) {
-            return TravelStatus.FAILED;
-        }
-        if (PathWalker.isActive()) {
-            return TravelStatus.IN_PROGRESS;
-        }
-        // PathWalker stopped — check if we're near the target
-        LocalPlayer player = client.player;
-        if (player != null && player.blockPosition().distSqr(target) <= SUCCESS_RADIUS_SQ) {
-            return TravelStatus.SUCCEEDED;
-        }
-        return TravelStatus.FAILED;
+        // Journey is ticked by the module, the same way PathWalker is; this only
+        // reads the verdict.
+        return switch (Journey.status()) {
+            case RUNNING -> TravelStatus.IN_PROGRESS;
+            case ARRIVED -> TravelStatus.SUCCEEDED;
+            case FAILED -> TravelStatus.FAILED;
+        };
     }
 
     @Override
     public void abort() {
-        PathWalker.stop();
-        started = false;
+        Journey.stop();
     }
 }

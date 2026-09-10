@@ -15,7 +15,8 @@ net.stracciatella.gui
 ├── GuiCommands.java            # /gui and /gui <page>
 ├── screen/
 │   ├── GuiRootScreen.java      # Menu listing every registered page
-│   └── IdListScreen.java       # Shared editor for a list of registry ids
+│   ├── IdListScreen.java       # Shared editor for a list of registry ids
+│   └── SettingsScreen.java     # Shared page of click-to-cycle settings
 └── test/
     └── GuiTests.java           # In-game smoke tests
 ```
@@ -70,8 +71,23 @@ callback, and the context button's label, id supplier and missing-message.
 The module still learns nothing about the features: the spec is data, the
 lookups are the page's.
 
-Like the root menu it is not a pause screen — these lists are edited while
-a bot is working.
+`SettingsScreen` is the companion for everything that is not a list: a page of
+rows, each one a label, a tooltip, something that reads the current value and
+something that moves it on. There is **one** row type and no generics, which is
+the whole design — a boolean is two values, an enum is however many it has, and
+a numeric knob is a handful of sensible steps, so the screen needs no case for
+any of them. The obvious alternative (`Toggle`, `Choice<E>`, `Slider` row types)
+was rejected: it would put this module in the business of knowing what a value
+*is*, which is the owning module's knowledge, and every new kind of setting
+would add a case here. The owner therefore supplies the cycling — one lambda per
+row — and `advance` runs it, calls the page's `save`, writes a status line and
+**rebuilds the widgets**. That last step is not optional: a button's message is
+built with the value baked in, so without it the setting changes and the row
+goes on showing the old value, which reads as a broken menu. Rows past seven go
+onto further pages; page controls only appear when there is more than one.
+
+Like the root menu neither of them is a pause screen — a list is edited and a
+setting is flipped while a bot is working.
 
 ## Dependencies
 
@@ -84,7 +100,7 @@ No dependency on any feature module; the arrow always points the other way.
 
 `./gradlew runMinecraftTests -Psuites=gui`. Two smoke tests driving the
 real command → deferred-open path because that is the part that fails
-silently if it regresses, and one test of the shared list editor:
+silently if it regresses, and one test per shared screen:
 
 - **Gui command opens root menu** — `/gui` leaves a `GuiRootScreen` on screen.
 - **Gui page reachable by id** — a probe page registered at runtime is found
@@ -96,3 +112,9 @@ silently if it regresses, and one test of the shared list editor:
   button and a row's Remove go through the same path, and Done returns to the
   parent. The stand-in normalize has to be idempotent — the context button's
   id goes through it like typed text does.
+- **Settings screen cycles and pages** — `SettingsScreen` on nine probe rows, so
+  the paging controls exist: a click advances that row's value, saves once and
+  **relabels the button** (the next click has to find the label the last one
+  wrote, which is what fails if the rebuild goes), page two binds its buttons to
+  the rows it shows rather than to the first seven, and Done hands back to the
+  parent screen rather than to the game.

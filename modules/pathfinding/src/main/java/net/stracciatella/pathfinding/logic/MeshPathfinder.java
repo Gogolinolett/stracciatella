@@ -16,6 +16,32 @@ import net.stracciatella.pathfinding.logic.mesh.Neighbor;
 public class MeshPathfinder {
 
     public List<MeshNode> findPath(MeshNode start, MeshNode end) {
+        return search(start, end, false);
+    }
+
+    /**
+     * The path to {@code end} if it is reachable, otherwise the path to the node
+     * closest to {@code end} among everything reachable from {@code start}.
+     *
+     * <p>This is what lets a journey head for a target whose chunk the client has
+     * not been sent yet. There is nothing to plan through out there — the mesh
+     * has no nodes at all for an unloaded chunk — so the leg aims at the best
+     * node the mesh <em>does</em> have, walks it, and asks again once the chunks
+     * that streamed in on the way have been meshed.
+     *
+     * <p>It costs nothing extra: an unreachable target makes {@link #findPath}
+     * drain the open set anyway, visiting exactly the same nodes. The only
+     * addition is remembering the best one while passing it.
+     *
+     * <p>Returns empty when even that is nothing — no node but the start itself
+     * was reachable. Callers need that distinction: it is the difference between
+     * "walk a stretch and reconsider" and "there is no way out of here".
+     */
+    public List<MeshNode> findPathTowards(MeshNode start, MeshNode end) {
+        return search(start, end, true);
+    }
+
+    private List<MeshNode> search(MeshNode start, MeshNode end, boolean allowPartial) {
         // Return empty if invalid inputs
         if (start == null || end == null) return Collections.emptyList();
 
@@ -32,6 +58,12 @@ public class MeshPathfinder {
 
         Set<MeshNode> closedSet = new HashSet<>();
 
+        // Closest approach seen so far, for the partial answer. Seeded with the
+        // start so the comparison needs no null case; a result that is still the
+        // start at the end means nothing better was reachable.
+        MeshNode bestTowards = start;
+        double bestTowardsDistance = heuristic(start, end);
+
         while (!openSet.isEmpty()) {
             // Get node with lowest F score
             MeshNode current = openSet.poll().node;
@@ -41,6 +73,14 @@ public class MeshPathfinder {
                 continue;
             }
             closedSet.add(current);
+
+            if (allowPartial) {
+                double distance = heuristic(current, end);
+                if (distance < bestTowardsDistance) {
+                    bestTowardsDistance = distance;
+                    bestTowards = current;
+                }
+            }
 
             // Reached destination?
             if (current.equals(end)) {
@@ -68,7 +108,11 @@ public class MeshPathfinder {
             }
         }
 
-        // No path found
+        // No path found. For a partial answer, hand back the closest approach —
+        // unless that is still the start, which means there was nowhere to go.
+        if (allowPartial && !bestTowards.equals(start)) {
+            return reconstructPath(cameFrom, bestTowards);
+        }
         return Collections.emptyList();
     }
 

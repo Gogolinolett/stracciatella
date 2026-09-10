@@ -19,8 +19,10 @@ import net.stracciatella.pathfinding.commands.PathCommands;
 import net.stracciatella.pathfinding.display.PathDisplay;
 import net.stracciatella.pathfinding.logic.PathWalker;
 import net.stracciatella.pathfinding.test.EnderPearlTests;
+import net.stracciatella.pathfinding.test.JourneyTests;
 import net.stracciatella.pathfinding.test.PathWalkerTests;
 import net.stracciatella.pathfinding.travel.EnderPearlTravelMethod;
+import net.stracciatella.pathfinding.travel.Journey;
 import net.stracciatella.pathfinding.travel.Navigator;
 import net.stracciatella.pathfinding.travel.WalkTravelMethod;
 import net.stracciatella.testing.runner.TestRunner;
@@ -39,6 +41,11 @@ public class PathfindingModule implements Module {
         ClientTickEvents.END_CLIENT_TICK.register(PathWalker::tick);
         TestRunner.instance().registerSuite(PathWalkerTests.class);
         TestRunner.instance().registerSuite(EnderPearlTests.class);
+        TestRunner.instance().registerSuite(JourneyTests.class);
+
+        // Journey drives PathWalker the way Navigator does, so it is ticked here
+        // rather than by its callers — one journey at a time, one tick source.
+        ClientTickEvents.END_CLIENT_TICK.register(Journey::tick);
 
         Navigator.register(new EnderPearlTravelMethod());
         Navigator.register(new WalkTravelMethod());

@@ -7,18 +7,19 @@ Automation bot that uses pathfinding to navigate and perform tasks like mining o
 Two layers, strictly separated:
 
 1. **Task layer** (`BotController` + `BotTask` queue) — executes one block interaction at a time with human-like camera movement, timing, tool selection and drop collection.
-2. **Behavior layer** (`behavior/`) — long-running strategies (strip mining, future farming/building) that decide *what to work on next*. A `BotBehavior` plans by enqueuing tasks and waiting for the controller to go idle; it must never simulate input itself. Registered via `BehaviorRunner.register(...)` (typically from a specialized module's init, e.g. `modules/miner`), started by id, at most one active. `BehaviorRunner.tick` runs before `BotController.tick` so a plan made this tick executes this tick. Stopping flows top-down: `/bot stop` stops the runner (which aborts the behavior) and then the controller — never the other way around.
+2. **Behavior layer** (`behavior/`) — long-running strategies (strip mining, future farming/building) that decide *what to work on next*. A `BotBehavior` plans by enqueuing tasks and waiting for the controller to go idle; it must never simulate input itself. Registered via `BehaviorRunner.register(...)` (typically from a specialized module's init, e.g. `modules/miner`), started by id, at most one *running* — with one exception, a behavior suspended under a restock (see *Restocking*). `BehaviorRunner.tick` runs before `BotController.tick` so a plan made this tick executes this tick. Stopping flows top-down: `/bot stop` stops the runner (which aborts the behavior) and then the controller — never the other way around.
 
 ## Architecture
 
 ```
 net.stracciatella.bot
 ├── BotModule.java                  # Entry point (trivial — see BotSetup)
-├── BotSetup.java                   # Wiring: config, commands, tick hooks, GUI page, tests
+├── BotSetup.java                   # Wiring: config, commands, tick hooks, GUI pages, placer, tests
 ├── BotController.java              # Static tick-driven state machine (like PathWalker)
 ├── BotConfig.java                  # GSON-persisted config (bot.json), humanization knobs
 ├── BotPolicy.java                  # Record: per-behavior safety/collection opt-ins
 ├── BotCommands.java                # /bot subcommands
+├── StorageCommands.java            # /bot storage and /bot server — everything that edits servers.json
 ├── task/
 │   ├── BotTask.java                # Interface: targetPos, interactionType, isComplete
 │   ├── TaskQueue.java              # ArrayDeque<BotTask>; pollNearest/peekNearest for human-like routing
@@ -27,21 +28,34 @@ net.stracciatella.bot
 │   ├── MineBlockTask.java          # Mine single block (complete when → air)
 │   ├── ChopTreeTask.java           # Mine tree logs top-to-bottom (multi-target)
 │   ├── PlaceBlockTask.java         # Place a block against a support face (USE)
+│   ├── OpenContainerTask.java      # Right-click a chest/barrel and wait for its screen (USE)
 │   └── GatherAreaTask.java         # Meta-task: scan + enqueue mine/chop subtasks
 ├── behavior/
-│   ├── BotBehavior.java            # Interface for long-running strategies (id, policy, start, tick, abort, statusLine)
+│   ├── BotBehavior.java            # Interface for long-running strategies (id, policy, restockNeeds, start, tick, abort, statusLine)
 │   ├── BehaviorStatus.java         # Enum: RUNNING, SUCCEEDED, FAILED
-│   └── BehaviorRunner.java         # Static registry + executor, one active behavior, owns the policy + stop guards
+│   ├── BehaviorRunner.java         # Static registry + executor, two slots, owns the policy + stop guards
+│   ├── RestockNeeds.java           # Record: a behavior's manifest — trigger and shopping list in one
+│   ├── RestockBehavior.java        # BotBehavior: LEAVE_SITE → TO_STORAGE → OPEN → TRANSFER → CLOSE → RETURN
+│   └── ContainerTransfer.java      # Decides and clicks one stack at a time in an open container
+├── server/
+│   ├── ServerSettings.java         # What the bot may do on one server; every default the tame one
+│   ├── ServerSettingsStore.java    # stracciatella/servers.json, keyed by server identity
+│   └── StorageSite.java            # Record: one storage block, with its dimension
 ├── gui/
-│   └── IgnoredItemsPage.java       # GuiPage contributed to the gui module: edits ignoredItems on its IdListScreen
+│   ├── IgnoredItemsPage.java       # GuiPage contributed to the gui module: edits ignoredItems on its IdListScreen
+│   ├── StoragePage.java            # Which block kinds count as storage, on the same IdListScreen
+│   └── ServerPage.java             # This server's exit strategy and placement permission, on SettingsScreen
 ├── safety/
 │   └── BotAlarm.java               # Latches damage / player-attack events for the runner
 ├── mixin/
 │   ├── ClientPacketListenerMixin.java  # Damage + attack-sound + block-ack packets
+│   ├── ClientCommonPacketListenerImplMixin.java  # Outgoing packets, for the wire trace
 │   └── ClientLevelAccessor.java    # @Invoker for the package-private prediction handler
 ├── interaction/
 │   ├── BlockInteractor.java        # Drives destroy/use via gameMode with an explicit target
 │   ├── InventoryHelper.java        # Reads hotbar, selects best tool, counts free slots
+│   ├── RoutePlacer.java            # The pathfinder's BlockPlacer, implemented as a PlaceBlockTask
+│   ├── BlockWireTrace.java         # Logs the block-breaking packets (see *Mining*); noisy by design
 │   └── ServerBlockSync.java        # Highest block-prediction sequence the server has settled
 ├── scan/
 │   ├── BlockScanner.java           # Finds blocks by predicate within radius
@@ -310,6 +324,213 @@ All pre-existing, all burning the full `collectWaitMax`. Only the absence-window
 2. **Unreachable drop, vertically.** `itemsNearby` was computed from the *unfiltered* entity list while the walk loop skips anything more than 4 blocks above or below. An item the bot has explicitly decided never to approach kept `itemsNearby` true forever, so `doneCollecting` could never fire. Fix: measure presence on the same filtered set the walk uses.
 3. **Unreachable drop, horizontally.** The same thing one axis over, and not covered by that filter: a drop landing behind a block the bot will never mine — a blacklisted block, bedrock, the far side of a dammed liquid — sits inside the AABB and inside the walk filter, but outside the vanilla pickup box and behind a wall, so `walkToward` pushes into the obstruction and the distance never shrinks. Six of fourteen collects in one chunk-suite run burned `collectWaitMax` this way. Fix: a walk-progress watchdog (nearest item's entity id, best distance reached, ticks since it improved) drops the item after `itemAbsenceTicks` without closing 0.05 blocks. It nulls `nearest` rather than only clearing `itemsNearby`, so the walk stops too — otherwise the movement keys are still down on the exit tick, and `transitionTo` does not release them. A `level.clip` line-of-sight test was rejected: it would abandon drops behind a corner that are perfectly reachable by walking around.
 
+## Restocking (`RestockBehavior`, `RestockNeeds`, `ContainerTransfer`)
+
+Running out of pickaxes, filler blocks or empty slots is not a reason to end a
+run — it is a reason to walk to a chest and come back. So it is a `BotBehavior`
+like any other rather than a mode inside one: the chunk miner needed it first,
+but nothing in it knows what mining is.
+
+### Two slots, not a stack
+
+`BehaviorRunner` holds **two** slots: the behavior being ticked, and one
+suspended underneath it. A shortfall against the active behavior's
+`restockNeeds()` moves it into the lower slot and puts `RestockBehavior` in the
+upper one; when that succeeds the lower one is started again. Two rather than a
+`Deque` of N because a restock cannot itself need a restock, and anything deeper
+would be a bug rather than a use case — a fixed pair says so in the type.
+
+**Suspend is `abort()` and resume is `start()`.** No new interface method, no
+saved state. That is a real constraint on who may opt in, and it is stated on
+`BotBehavior.restockNeeds()`: a behavior that cannot find its place again by
+reading the world must keep the default and never declare a manifest. The chunk
+miner can, because it already resumes by reading the world rather than saving a
+cursor. A `suspend`/`resume` pair on the interface was the alternative and was
+rejected: every behavior would then implement two more methods to say "I do not
+do that", and a wrong implementation of them fails exactly like a wrong `start`
+— with no compiler help either way.
+
+### One manifest, both directions
+
+`RestockNeeds` is a list of `Need(label, matcher, target)` plus a `minFreeSlots`,
+declared beside `policy()`. It does two jobs, and that is why it is one type.
+It is the **trigger**: `shortfall(player)` phrases the first unmet entry for the
+supervising player ("out of a pickaxe", "inventory full (1 empty slots left)").
+It is also the **shopping list** at the chest: the trip brings every entry up to
+its target and nothing else. A separate config list for "what to fetch" would be
+a second place to edit and would drift from the first one the moment somebody
+changed only one of them.
+
+The deposit rule then falls out by complement: anything the manifest does not
+want is loot — and so is the *excess* of anything it does. A miner whose manifest
+asks for 64 cobblestone is carrying the other 300 as loot, and a rule that
+simply kept everything matching the manifest would come away from the chest with
+an inventory as full as it arrived. Excess counts as loot only when **every**
+need that matches the stack would still be satisfied without it, so a stack two
+needs both claim is kept while either still wants it. A hand-written deposit
+list was the alternative and is worse: every ore nobody thought of while writing
+it stays in the inventory, and the bot is full again two slabs later.
+
+### Supplies before the supply guard
+
+The order inside `BehaviorRunner.tick` is load-bearing and was wrong once:
+
+1. **Safety** — damage and player-attack. A bot that is being hit stops; it does
+   not go shopping.
+2. **Restock** — `restockReason`, skipped entirely while a trip is in flight
+   (that is what a non-empty lower slot means).
+3. **`stopWhenInventoryFull`** — and only now. A full inventory is a reason to
+   walk to a chest where there is one, and only a reason to stop where there is
+   not, so asking it *after* the restock lets one threshold serve both. Asked up
+   with the safety checks it pre-empted the trip: the run ended on the very tick
+   a trip should have started. The fix was deliberately not a conditional
+   policy — `withInventoryFullStop` stays unconditional, and the behavior needs no
+   second number to say what it already said once.
+
+`restockReason` also folds in the execution layer's `consumeMissingTool()` — the
+name of a block `BotController` just tried to mine while carrying nothing that
+would drop it. The controller records it and does not act on it, because whether
+that is worth a trip is the behavior layer's call and a plain `/bot mine` must
+still mine what it was told to. "No tool" means no *correct* tool for a block
+that needs one; there is deliberately **no durability threshold**, which would
+need a number nobody can defend and would send the bot home with a pickaxe that
+had plenty of work left in it.
+
+### A shortfall nobody can serve is not a reason to stop
+
+`restockReason` asks `RestockBehavior.hasStorage` before it suspends anybody, and
+returns null with a **one-per-run warning** when this server and dimension have
+no chest on record. Without it, a manifest that is on by default turns the first
+`/miner chunk start` on a fresh install into an instant failure — a bot that has
+just been handed a pickaxe is short of everything else on its list, and
+`RestockBehavior.start` would fail with "no storage configured". With it the run
+carries on and ends on its own terms: the inventory-full guard, or a block it has
+nothing to break with. This is what makes `chunkMinerRestock` safe to default to
+on, and it is the same question `start` asks when it picks a chest — one answer
+in one place, because the two disagreeing would mean a run suspended for a trip
+that then reports it cannot happen.
+
+`endRestock` carries the other guard: a trip that comes back **still** short
+fails the run instead of resuming. Resuming into the same shortfall would suspend
+again on the next tick and the bot would shuttle to the chest forever — a bot
+that looks busy and never mines a block.
+
+### The trip
+
+| Phase | Behavior |
+|-------|----------|
+| **LEAVE_SITE** | Nothing at all under `STAIRCASE`. Under `COMMAND`: stop everything, hold the spot for `teleportStandStillTicks`, send `exitCommands`, then wait for the position to **jump** (`TELEPORT_JUMP_DISTANCE`, 32 blocks). Any movement restarts the count rather than sending a command the server is about to refuse. |
+| **TO_STORAGE** | `Journey.start(nearest chest in this dimension)` — the pathfinding module's layer for a target that may not even be loaded yet. |
+| **OPEN** | One `OpenContainerTask`. A block that is no longer a storage block, or a task that ran without a screen appearing, fails with a named reason instead of clicking forever. |
+| **TRANSFER** | One shift-click per `restockClickDelay`: deposit first, then withdraw. Deposit before withdraw because a withdrawal needs somewhere to land, and the loot is what is filling the slots. |
+| **CLOSE** | `closeContainer()`. `abort()` does it too — a chest screen left open holds the bot's hands for the rest of the session, and the next behavior's clicks go into the container instead of into the world. |
+| **RETURN** | `Journey` back to the anchor, which is simply where the bot stood when the shortfall was noticed: the runner suspends on that tick, so nothing has moved yet and nobody has to remember to record it earlier. |
+
+**The way out is per server; the way back is always on foot.** Which exit exists
+is a fact about the server, not a preference — `/t spawn` and its standstill rule
+either exist or they do not. And there is no `/back`: the command exists on some
+servers and returns the player to where they teleported *from*, which after a
+deposit is the camp, not the pit, so a run would resume at the wrong
+coordinates. Nothing is *built* here either: a staircase laid by the restock
+would be a second implementation of the one the miner already leaves standing,
+and the two would disagree.
+
+`/bot restock` asks for a trip by hand. With a behavior running it is the
+ordinary interruption and the run resumes afterwards; with nothing running there
+is no suspended manifest, so the trip deposits the whole inventory and brings
+nothing back — "go and empty your pockets", which is a useful thing to be able
+to ask for.
+
+### `ContainerTransfer`: whole stacks, and which slots are the bot's
+
+Every move is a shift-click (`ClickType.QUICK_MOVE`), one per cooldown, which is
+what a person actually does at a chest. Moving exact counts would need
+pick-up/place-half/put-down sequences nobody performs thirty times in a row, and
+the precision buys nothing: a restock that comes back with 64 cobblestone instead
+of 37 is not a worse restock. `move` then checks that the slot actually changed —
+a chest with no room answers a shift-click by doing nothing at all, and the same
+slot would come back from the planner forever; `TRANSFER_STALL_TICKS` (60) closes
+up instead. The check reads the slot straight after the click, i.e. it reads the
+client's own prediction, which is exactly what is wanted: a click the client
+could not satisfy is one the server will not satisfy either.
+
+**The carry-slot test must use `Slot.getContainerSlot()`, not `Slot.index`.** In
+modern Minecraft `Slot.index` is the slot's position in the *menu*, assigned by
+`addSlot`; the container index is the private field behind `getContainerSlot()`.
+`ChestMenu` lays out 27 chest slots and then hands the player's own `Inventory` to
+`addStandardInventorySlots`, so the bot's 36 carrying slots sit at menu positions
+27–62 while their container indices are 9–35 and then 0–8. Measured against
+`index`, a `>= 0 && < 36` bound accepted nine of the thirty-six — the first
+storage row — so a bot whose loot sat in its hotbar deposited **nothing** and came
+home with the chest's contents on top of a full inventory, while the withdraw half
+worked perfectly (that one tests container identity only). The bound itself is not
+decoration either: armour, the offhand and the saddle belong to the same
+`Inventory` container at indices 36 and up, so the container test alone would
+shift-click a chestplate into the chest, no manifest mentioning armour.
+`isContainerSlot` is deliberately *not* the negation of `isCarrySlot` — "not a
+carry slot" would make the bot's own boots look like stock.
+
+### Opening a container is a task
+
+`OpenContainerTask` exists because the hard part of clicking a block is what the
+task layer already does: turning the head toward it at a human rate, waiting until
+the crosshair really lands on *that* block, stepping closer when something is in
+the way, failing with a diagnostic instead of hanging. A restock that opened
+containers itself would either duplicate all of that or snap its gaze and click
+through a wall. Its `requiredItem()` matches nothing, which leaves the hand
+alone — returning null would have the controller put an axe in the bot's hand to
+open a chest, and run the missing-tool check against a block nobody is mining.
+Completion is `containerMenu` being something other than `InventoryMenu`: the
+client's own state, set by the server's open packet, so it is the server's answer
+and not a prediction.
+
+### `servers.json`: per server, tame by default
+
+`ServerSettingsStore` keeps one `ServerSettings` per server in
+`stracciatella/servers.json`, keyed by the server address or
+`singleplayer/<world name>` — the two identities the client actually has, decided
+in `keyFor` and nowhere else, so a key that turns out wrong is wrong in one spot.
+A map in one file rather than a file per server, because the point is to see at a
+glance which servers the bot may build on. An unconfigured server is not an error
+and writes no entry: `current()` answers with a fresh tame `ServerSettings`.
+
+Every field is a fact about the server rather than a preference, and **every
+default is the tame one, and they are tame together**: no storages, no exit
+commands, `STAIRCASE` rather than a teleport, and no permission to place blocks.
+Joining an unknown server therefore gets a bot that neither types into a
+stranger's chat nor reshapes their terrain, and one that cannot start a restock at
+all until somebody points it at a chest. The opposite arrangement — useful
+defaults, with the player expected to lock them down — fails in the direction that
+gets someone banned. These defaults are what make `chunkMinerRestock` default to
+**on** safe (see the miner module): the manifest is declared, the trip is simply
+unserved until a chest exists. Loosening one of the two without the other is what
+the pairing exists to prevent.
+
+A `StorageSite` carries its dimension, because a barrel in the nether is not
+somewhere an overworld run can walk to and a position alone cannot say which it
+is. It is a record for its equality: `/bot storage scan` has to drop the second
+half of every double chest, and "have I got this position already" is the whole of
+that check. `/bot storage scan` reads **loaded chunks only** — on the client
+`level.getBlockState` in a chunk it does not have answers air rather than saying
+so, so a scan past the loaded edge would quietly find nothing and report success;
+it asks `MeshManager.isChunkLoaded` per column and counts what it skipped. The
+radius cap (`MAX_SCAN_RADIUS`, 32) is a guard against a typo, not a taste: the
+cost is the cube of it.
+
+### `RoutePlacer`: the pathfinder's placement, done by the bot
+
+`PathPlacement` declares a `BlockPlacer` in the pathfinding module and this module
+registers the implementation — one class whose `place` enqueues an ordinary
+`PlaceBlockTask`. That one line is the entire reason the interface lives in the
+other module: everything that makes a placement work against a real server (the
+pinned face, the crouch out past the rim, the inventory-shrink confirmation, the
+retry on a dropped use packet) already lives in `BotController`. Busy-ness is
+tracked with the task it issued rather than by asking whether the controller is
+doing *something*, because the controller is shared and a behavior's own mining
+task would otherwise read as this placement still being in flight. It draws from
+its own `routeBlocks` list, and it only ever runs where the current server permits
+placement at all.
+
 ## Test setup: waiting on gamemode sync
 
 A separate race used to produce the same "block broken, no drop" symptom: the test runs `/gamemode survival` and then immediately enqueues a mining task on the client. On the heavily-loaded accelerated-tick server, `/gamemode` can be queued behind other command packets. When the bot starts attacking, the server still has the player in creative — block breaks are instant client-side and drop nothing. `BotTests.switchToSurvivalAt` now waits on `!mc.player.getAbilities().instabuild` (the server→client ack of the mode change) before starting the bot, which eliminates the whole class of failure without any timing tuning.
@@ -344,8 +565,38 @@ The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 
 | `/bot debug on\|off` | Toggle debug logging |
 | `/bot ignore add\|remove <item>` | Edit the ignored-drops list; a bare name is accepted and `minecraft:` filled in |
 | `/bot ignore list\|clear` | Show or empty the ignored-drops list |
+| `/bot restock` | Walk to a chest now: deposit the loot, take back what the manifest wants, come back |
+| `/bot storage add` / `/bot storage remove` | Add or remove the block in the crosshair as a storage for this server and dimension |
+| `/bot storage list` / `/bot storage clear` | Show or empty this server's storage list |
+| `/bot storage scan <radius>` | Add every storage block in loaded chunks within the radius (cap 32), one half per double chest |
+| `/bot server` | Print what the bot may do here: key, dimension, exit strategy, exit commands, placement, storages |
+| `/bot server exit staircase\|command` | Choose how the bot leaves a pit on this server |
+| `/bot server exit command <command>` | Same, and say which command to send — `/bot server exit command tp 1 1 1`, a leading slash accepted and stripped |
+| `/bot server placement on\|off` | Whether the pathfinder may place blocks here |
 
 The `ignore` arguments are `IdentifierArgument`s, not strings — Brigadier's unquoted string stops at the colon, so `minecraft:cobblestone` would parse as `minecraft` with `:cobblestone` left over (the miner's blacklist command had exactly that bug). The list is also a page in the gui module (`/gui ignored_items`, or the root menu) with an "add item in hand" button.
+
+The exit command is a **greedy** string argument for the same family of reasons:
+`tp 1 1 1` is four tokens, and a single-word argument keeps only the first and
+then fails the parse on the rest, so the command silently does nothing. It is
+optional — `/bot server exit command` on its own still switches the strategy and
+leaves what was configured — and a leading slash is stripped, because a player
+types the command the way they type it in chat while
+`ClientPacketListener.sendCommand` wants it without one. Giving a command
+**replaces** what was there rather than appending: typing it twice means "no,
+that one", and a second command would in any case arrive after the first had
+already teleported the bot away. A server that genuinely needs a sequence still
+has one — the field is a list and `servers.json` takes as many entries as it
+likes.
+
+`/bot storage` and `/bot server` are commands rather than menu pages for the acts
+that need the world: which chest the bot should use is answered by *looking at
+it*, and a coordinate typed into a text box is the same answer with three chances
+to get a digit wrong. The exit command belongs with them because it is a fact
+about the server that has to be *typed*, which a cycling settings row cannot do.
+What is a standing preference does live in the menu — which *kinds* of block
+count as storage (`/gui storage_blocks`, on the shared `IdListScreen`) and this
+server's two switches (`/gui bot_server`, on the shared `SettingsScreen`).
 
 ## Config
 
@@ -372,12 +623,19 @@ Phases / timing:
 - `maxBreakTicks` — interaction timeout (default 100 = 5 s; fail-fast, below the unenchanted break time of obsidian and ancient debris — see *Mining*)
 - `navigateTimeout` / `positionTimeout` / `lookTimeout` — per-phase deadlines
 
+Restocking (see *Restocking*; where a chest **is** is per server in `servers.json`, not here):
+- `storageBlocks` — block ids a restock may open (default chest, trapped chest, barrel). Ids rather than "any block entity that is a `Container`": that would also catch hoppers, droppers and furnaces, and a bot tipping its diamonds into a hopper is a bug report
+- `routeBlocks` — what `RoutePlacer` bridges a route with, first one carried wins. Deliberately its own list and not the miner's `fillerBlocks`: same contents by default, different owner, different question, and only this one is governed by a per-server permission
+- `restockClickDelayMin` / `restockClickDelayMax` — uniform gap between two stack moves in an open container (default 2–5). Shift-clicking thirty stacks in one tick is not a person
+- `teleportStandStillTicks` — ticks held perfectly still before the exit commands go out (default 240), for servers that cancel a teleport on movement
+- `teleportWaitTicks` — bound on believing in the teleport afterwards (default 200). Arrival is the position jumping, not this running out — the standstill requirement is a server's setting and the next server's is a different number
+
 ## Dependencies
 
 - `loader` (compileOnly) — Module interface
 - `camera` (compileOnly) — CameraController, AngleUtil
-- `pathfinding` (compileOnly) — PathWalker, MeshManager, MeshPathfinder
-- `gui` (compileOnly) — GuiPage/GuiRegistry and IdListScreen for the ignored-items page
+- `pathfinding` (compileOnly) — PathWalker, MeshManager, MeshPathfinder, plus `travel/Journey` and `place/PathPlacement` for the restock trip
+- `gui` (compileOnly) — GuiPage/GuiRegistry, IdListScreen for the ignored-items and storage-blocks pages, SettingsScreen for the server page
 - `testing` (compileOnly) — TestRunner, test annotations
 
 ## Testing
@@ -385,11 +643,48 @@ Phases / timing:
 Tests in `test/BotTests.java`, registered via `TestRunner.instance().registerSuite(BotTests.class)`.
 Run via `./gradlew runMinecraftTests`. Each test builds its environment with `/fill` + `/setblock`.
 
-Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json.
+Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, and the `/bot server exit command` argument against servers.json.
 
 The policy tests drive a `PolicyProbeBehavior` defined inside `BotTests` — the policy layer is only reachable through a behavior, so the guards need one to be testable at all. The three eating tests run the food bar down with the hunger effect at amplifier 255 (a food point every three ticks or so) and clear it again before the run, so the bar is low and stays put — on Easy, switched for the test and back to Peaceful in a `finally`, because the test world is Peaceful and Peaceful never takes a food point (`FoodData.tick` drains saturation only there).
 
 - **fast collect exit** summons a `NoGravity` item 6 blocks up (inside the 8-block collect query, outside the 4-block walk filter) and asserts the run finishes in fewer than `collectWaitMax` ticks with the decoy still present, the block actually mined, and the cobblestone in the inventory. Without the flag the decoy's mere presence pins the phase until the timeout; the last two assertions exist so "exits sooner" can't quietly become "exits without collecting".
 - **opportunistic collection** puts a drop 2.5 blocks to the bot's *side* — perpendicular to the block being mined, so reaching it is a pure strafe — and asserts the bot closes at least 0.5 blocks **while still in INTERACTING**. This is what pins down the view-relative sign convention, which has no other coverage. It mines **obsidian with a diamond pickaxe**: ~187 ticks of INTERACTING, long enough to observe the walk, and it still drops. Mining bare-handed for a slow break does not work — stone without a pickaxe drops nothing, so the break never produces an artifact, never confirms, and ends in a `maxBreakTicks` timeout instead of the phase the test needs to watch.
+
+The three restock tests drive a `RestockProbeBehavior`, also defined inside
+`BotTests`: a manifest of one diamond pickaxe, `BotPolicy.none()`, and a `tick`
+that counts its own starts and succeeds on the second. Counting starts is how
+"suspended and resumed" is observable at all, given that resume *is* `start()`.
+
+- **storage commands edit servers.json** — `/bot storage add`, `remove`, `list`,
+  `clear` and `scan` end to end against the real store, with the player aimed at
+  the chest by teleport-and-wait (`lookAtBlock` computes the yaw and pitch, then
+  waits until the client's own raycast reports that block, because the commands
+  read `hitResult` and nothing else). The server's storage list is set aside and
+  restored in a `finally`, file included.
+- **restocks and resumes what it interrupted** — a chest six blocks away holding
+  a diamond pickaxe, a bot carrying 64 cobblestone and no pickaxe. Asserts the
+  probe started **twice**, that the pickaxe came back, that the cobblestone did
+  not, that the chest now holds all 64, and that the bot resumed within 2.5
+  blocks of where it was suspended. The chest's contents are read from the
+  **singleplayer server**, submitted to its own thread and joined on the test
+  thread: a client-side `ChestBlockEntity` never holds its items (`getUpdateTag`
+  sends none), so asking `mc.level` reads empty however the deposit went — which
+  is exactly what it did while `isCarrySlot` was broken, and the reason that
+  assertion had to move rather than be dropped.
+- **carries on when a restock has nowhere to go** — the same probe and the same
+  shortfall with no chest configured anywhere. Asserts the run is **not** ended
+  by it: this is the test that makes a manifest safe to have on by default, and
+  it is the one that would have caught `chunkMinerRestock = true` turning a fresh
+  install's first run into an instant failure.
+
+**exit command reaches servers.json** covers the one thing about
+`/bot server exit command` that is invisible until a restock actually tries to
+leave a pit: nothing reads `exitCommands` until then, so a command that was
+mangled on the way in looks fine in chat and fails hours later. It asserts a
+four-token command survives whole (a non-greedy argument leaves the list empty —
+verified by making it one), that a leading slash is stripped (verified by
+removing the strip: `[/t spawn]`), that a second command replaces the first, and
+that switching to `staircase` and back keeps it. The reload from disk is the
+assertion for all of them.
 
 **The player-attack path has no in-game test** — it needs a second player swinging at the bot. Its two real failure modes (never firing, firing on the bot's own swing) are covered by plain JUnit in `src/test/.../safety/BotAlarmTest.java`, which is why `BotAlarm.isAttackerInRange` takes bare doubles instead of Minecraft types. Run with `./gradlew :modules:bot:test`.

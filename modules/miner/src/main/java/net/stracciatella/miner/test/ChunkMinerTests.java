@@ -1945,6 +1945,77 @@ public class ChunkMinerTests {
         LOGGER.info("Chunk miner sourceless water test passed");
     }
 
+    // ================================================================
+    // Test 27: the way out of the pit is left standing, and mended
+    // ================================================================
+
+    /**
+     * Two claims about {@link SpiralStairs} in one run, because one fixture
+     * proves both and the second one cannot be set up by hand.
+     *
+     * <p><b>The ramp is left standing.</b> The top step sits on the layer the
+     * bot's feet started above — {@code Y - 1} here — at the chunk's minimum
+     * corner, and each following step is one cell further along the north edge
+     * and one layer down. So with a range of {@code Y+1 .. Y-2} exactly two
+     * cells in the chunk are spared, {@code (0,0)} at {@code Y-1} and
+     * {@code (1,0)} at {@code Y-2}, and every other cell of the fixture has to
+     * come out. Asserted cell by cell rather than spot-checked: a predicate that
+     * claims one cell too many leaves a pillar the sweep reports as finished, and
+     * nothing else in this suite would notice.
+     *
+     * <p><b>A step the descent digs is put back.</b> The bot starts on
+     * {@code (1,0)}, and that column's cell at {@code Y-2} is the second step —
+     * so digging down into the lower slab takes the bot's own way out with it.
+     * Nothing here can make the bot take a sideways pace instead, which is why
+     * the descent is allowed to break it and {@code repairStairs} rebuilds it
+     * once the sweep has moved the bot off the cell. The fixture is stone and the
+     * bot carries cobblestone, so the rebuilt step reads as
+     * <b>cobblestone</b> — "still there" would also be satisfied by a step that
+     * was never dug, which is the one thing this must not accept.
+     *
+     * <p>Eight columns wide on purpose. The bot clears everything within reach
+     * without stepping, so a short fixture would let it empty the slab from the
+     * cell it landed in and never free the step at all.
+     */
+    @MinecraftTest(name = "Chunk miner leaves a staircase and mends it",
+            timeoutTicks = 4000, order = 37)
+    public void leavesAndMendsAStaircase(TestContext ctx) {
+        prepareWithFloor(ctx, 1, 0, 0, 7, 0, 1);
+        // The lower slab's foot layer, plus the floor under it. Y - 3 is below
+        // the range, so it is never mined and is what the rebuilt step is
+        // placed against.
+        fill(ctx, 0, Y - 3, 0, 7, Y - 2, 1, "stone");
+        ctx.runCommand("give @s cobblestone 64");
+        final BlockPos lastFilled = new BlockPos(BASE_X + 7, Y - 2, BASE_Z + 1);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastFilled).isAir());
+
+        runChunkMiner(ctx, Y + 1, Y - 2, true);
+
+        final BlockPos topStep = new BlockPos(BASE_X, Y - 1, BASE_Z);
+        final BlockPos dugStep = new BlockPos(BASE_X + 1, Y - 2, BASE_Z);
+        assertNotAir(ctx, topStep, "the staircase's top step");
+        boolean rebuilt = ctx.computeOnClient(mc ->
+                mc.level.getBlockState(dugStep).is(Blocks.COBBLESTONE));
+        if (!rebuilt) {
+            String block = ctx.computeOnClient(mc ->
+                    mc.level.getBlockState(dugStep).getBlock().toString());
+            throw new AssertionError("The step the descent dug at " + dugStep
+                    + " was not rebuilt: found " + block + ", expected cobblestone");
+        }
+        for (int dx = 0; dx <= 7; dx++) {
+            for (int dz = 0; dz <= 1; dz++) {
+                for (int y = Y - 2; y <= Y + 1; y++) {
+                    BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (cell.equals(topStep) || cell.equals(dugStep)) {
+                        continue;
+                    }
+                    assertAir(ctx, cell, "cell beside the staircase");
+                }
+            }
+        }
+        LOGGER.info("Chunk miner staircase test passed");
+    }
+
     private static String shortList(Set<BlockPos> cells) {
         return cells.isEmpty() ? "nowhere"
                 : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());
