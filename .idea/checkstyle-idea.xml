@@ -10,8 +10,8 @@
     </option>
     <option name="locations">
       <list>
-        <ConfigurationLocation id="bundled-sun-checks" type="BUNDLED" scope="All" description="Sun Checks">(bundled)</ConfigurationLocation>
-        <ConfigurationLocation id="bundled-google-checks" type="BUNDLED" scope="All" description="Google Checks">(bundled)</ConfigurationLocation>
+        <ConfigurationLocation id="bundled-sun-checks" type="BUNDLED" scope="All" description="Sun Checks">bundled-sun-checks</ConfigurationLocation>
+        <ConfigurationLocation id="bundled-google-checks" type="BUNDLED" scope="All" description="Google Checks">bundled-google-checks</ConfigurationLocation>
         <ConfigurationLocation id="04c359e0-e544-4d3a-bdfe-6a4391ccf982" type="HTTP_URL" scope="All" description="Stracciatella Checks">
           https://github.com/stracciatella-client/data/raw/master/checkstyle.xml
           <option name="properties">

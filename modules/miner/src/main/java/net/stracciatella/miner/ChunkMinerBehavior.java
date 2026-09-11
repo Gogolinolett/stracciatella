@@ -710,15 +710,97 @@ public class ChunkMinerBehavior implements BotBehavior {
      * Append the diggable, in-range cells of one column. Head before feet:
      * while the head block stands, the foot block's upward face is covered and
      * its side faces are hidden by the corridor wall, so aiming at it first
-     * only burns a look timeout.
+     * only burns a look timeout. Which is why the head being in this very batch
+     * is what makes the foot plannable — see {@link #hasOpenFace}.
      */
     private void addColumn(Level level, BlockPos column, List<BlockPos> into) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
             if (isMinable(pos) && !plannedBlocks.contains(pos)
-                    && isDiggable(level.getBlockState(pos))) {
+                    && isDiggable(level.getBlockState(pos))
+                    && hasOpenFace(level, pos, into)) {
                 into.add(pos);
             }
         }
+    }
+
+    /** The faces a bot inside a two-layer slab can ever put a ray on. */
+    private static final Direction[] AIMABLE_FACES = {
+        Direction.UP, Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
+
+    /**
+     * Whether {@code pos} has a face a ray can reach: one of its top or four
+     * sides already open, or open by the time the bot aims at it because this
+     * plan takes that neighbour out first. Its underside does not count — inside
+     * a two-layer slab the eye is never below the cell, so no standing spot can
+     * see it.
+     *
+     * <p>The head-before-feet order of {@link #addColumn} is the special case
+     * this generalises, and the staircase is what made the general rule
+     * necessary. A step is never mined, so the cell <em>under</em> a step has a
+     * lid that no batch will ever lift; the step one layer down sits on the next
+     * ring cell along, which covers a second face; and the remaining two are
+     * solid rock until the sweep reaches them. {@code faceTowardPlayer} then
+     * does what its own javadoc says it does when every candidate is covered —
+     * it hands back the dominant face anyway, "callers clear the blockers
+     * first" — and this caller cannot: the blocker is the staircase. The bot
+     * climbed onto the step, aimed at the lid under its own feet, and the run
+     * died on {@code cannot break -30, 84, -64} after 1334 blocks, with the
+     * hit result naming the step every time.
+     *
+     * <p>Deferring is safe because it is not a retry after a failure — the
+     * distinction that matters against the alternative rejected in STR-063.
+     * Nothing is given up on: the cell stays work, {@link #slabHasWork} asks the
+     * same question so the slab is not declared finished over it, and the
+     * sweep's own back pass picks it up once the neighbour it was waiting for is
+     * gone. Only if a cell still has no open face when everything else in the
+     * slab is mined does the run move on without it, and then it really is
+     * sealed — wedged between the staircase and bedrock or a blacklisted seam.
+     * Asking the question in {@code slabHasWork} too is what keeps that case
+     * from becoming the hang it would otherwise be: a slab that reports work no
+     * column will accept loops SELECT_SLAB → CLEAR → SELECT_SLAB forever.
+     *
+     * <p>A face also has to be one an <b>eye</b> can get in front of, which is
+     * not the same as being open, and a real run is what made the difference
+     * explicit. At the chunk's own corner the cell under the first step has that
+     * step for a lid, the second step for its east neighbour and unmined rock to
+     * the south — but west and north it opens into the ground outside the chunk,
+     * where the quarry's rim leaves air at the slab's level under standing rock.
+     * Both of those counted as faces, so the cell was planned; the bot walked up
+     * the staircase to reach the only thing it could get near, which put it on
+     * the lid, and the run died on {@code cannot break -16, 106, -64 (blocks
+     * mined: 138)} with {@code hitResult} naming the step under its own feet
+     * every time. Hence the one extra test on a side neighbour: it has to lie
+     * inside the chunk. An in-chunk neighbour needs nothing further asked of
+     * it — the sweep takes whole columns, so a cell whose foot is open has an
+     * open head as well, and a bot standing in the slab carries its eye in the
+     * head layer, level with the face. Requiring that second cell open too was
+     * written first and reverted: above the head layer of the <em>topmost</em>
+     * slab stands rock the range does not cover, so every head-layer cell of a
+     * run started under a low ceiling would have been deferred for good, and
+     * {@link #slabHasWork} would have declared that layer finished. Deferred,
+     * this cell is mined from the south a few columns later, from inside the
+     * slab, at eye level.
+     */
+    private boolean hasOpenFace(Level level, BlockPos pos, List<BlockPos> batch) {
+        for (Direction face : AIMABLE_FACES) {
+            BlockPos neighbour = pos.relative(face);
+            // A side face is only a face if an eye of this run can get in front
+            // of it, and outside the chunk none ever can: those cells are never
+            // mined and never walked to, so an opening out there is a hole in
+            // the wall rather than a way in. The top face needs no such test —
+            // it is this column's own cell, and the bot looks down into it.
+            if (face != Direction.UP && !chunk.equals(new ChunkPos(neighbour))) {
+                continue;
+            }
+            // Open already, or open by the time the bot aims at it: this batch
+            // or the standing plan takes that neighbour out first.
+            if (isPassable(level.getBlockState(neighbour))
+                    || batch.contains(neighbour)
+                    || plannedBlocks.contains(neighbour)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -742,7 +824,8 @@ public class ChunkMinerBehavior implements BotBehavior {
     private boolean slabHasWork(Level level, int feetY) {
         for (BlockPos column : slabColumns(feetY)) {
             for (BlockPos pos : new BlockPos[] {column, column.above()}) {
-                if (isMinable(pos) && isDiggable(level.getBlockState(pos))) {
+                if (isMinable(pos) && isDiggable(level.getBlockState(pos))
+                        && hasOpenFace(level, pos, List.of())) {
                     return true;
                 }
             }
@@ -857,7 +940,8 @@ public class ChunkMinerBehavior implements BotBehavior {
     private boolean hasWork(Level level, BlockPos column) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
             if (isMinable(pos) && !plannedBlocks.contains(pos)
-                    && isDiggable(level.getBlockState(pos))) {
+                    && isDiggable(level.getBlockState(pos))
+                    && hasOpenFace(level, pos, List.of())) {
                 return true;
             }
         }
@@ -1542,6 +1626,12 @@ public class ChunkMinerBehavior implements BotBehavior {
      * the slab read as finished with the step still standing, and the bot never
      * end a slab on a column it is about to be told to mine; excluding it in
      * three would be three chances to disagree.
+     *
+     * <p>Those same three callers pair this with {@link #hasOpenFace}, and the
+     * pairing has to stay: this one answers "is the cell mine to mine", that one
+     * "can it be aimed at yet". Drop the second from any one of the three and
+     * the disagreement is back in a new shape — a column handed over that the
+     * plan then refuses, or a slab left over a cell nothing can reach.
      */
     private boolean isMinable(BlockPos pos) {
         return pos.getY() >= toY && pos.getY() <= fromY && chunk.equals(new ChunkPos(pos))

@@ -109,9 +109,9 @@ public record BotPolicy(
      * stands is otherwise the behavior's business — and a block inside
      * {@code reachDistance} with something in front of it therefore has no
      * move at all. LOOKING's re-approach is the closest thing and it does not
-     * cover this: it closes to {@code APPROACH_CLOSE_DISTANCE} (2.0), which a
-     * bot two columns short of a row's end already beats, so it walks nowhere
-     * and the second look timeout kills the task.
+     * cover this: it closes to {@code WORK_DISTANCE} (2.0), which a bot two
+     * columns short of a row's end already beats, so it walks nowhere and the
+     * second look timeout kills the task.
      *
      * <p>With the flag on, an obstructed line of sight is detected
      * geometrically — a clip from the eye to the target, independent of where

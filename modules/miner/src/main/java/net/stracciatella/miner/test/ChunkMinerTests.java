@@ -2016,6 +2016,140 @@ public class ChunkMinerTests {
         LOGGER.info("Chunk miner staircase test passed");
     }
 
+    // ================================================================
+    // Test 38: a cell the staircase walls in ends the slab, not the run
+    // ================================================================
+
+    /**
+     * Two consecutive steps cover two faces of the cell between them — the cell
+     * directly under one step, with the next step down standing beside it — and
+     * in a slab that is still solid the remaining three are rock. The bot used
+     * to climb onto the step and aim at the lid under its own feet until the look
+     * timed out three times, then declare the whole run dead: reported from a
+     * real world as {@code cannot break -30, 84, -64 (blocks mined: 1334)}.
+     *
+     * <p>The fixture walls the cell in for good, which is the case that cannot
+     * resolve itself as the sweep goes past: bedrock on the inward side (never
+     * diggable) and stone outside the chunk on the two outward sides (never this
+     * run's work). So the assertion is the whole of the new rule — the slab
+     * finishes, the run succeeds, and that one cell is still standing. That the
+     * <em>temporarily</em> hidden cell is still mined is what every other test
+     * here asserts by clearing its fixture completely.
+     */
+    @MinecraftTest(name = "Chunk miner finishes past a cell its staircase walls in",
+            timeoutTicks = 4000, order = 38)
+    public void finishesPastAWalledInCell(TestContext ctx) {
+        // Standing inside the chunk, not on its ring: the descent digs its own
+        // column, and on a ring column that column holds a step — which would
+        // hand the cell under test an open side for as long as the repair takes.
+        prepareWithFloor(ctx, 4, 1, 0, 7, 0, 1);
+        fill(ctx, 0, Y - 3, 0, 7, Y - 2, 1, "stone");
+        // A catch floor one layer under the range — never mined (isMinable caps
+        // at toY), never asserted on, and it is what keeps this fixture from
+        // being a cliff. The worked strip is two columns wide with nothing
+        // around it, so a single step off it used to be a twenty-block fall:
+        // "Player578 fell from a high place", the run stopped on damage 25
+        // blocks in, and it only happened under the load of a full run. The
+        // bedrock below invites a step-up jump, and a jump is airborne, where
+        // the crouch that normally holds the bot at a rim does not apply.
+        fill(ctx, -2, Y - 3, -2, 9, Y - 3, 3, "stone");
+        final BlockPos walledIn = new BlockPos(BASE_X, Y - 2, BASE_Z);
+        final BlockPos lid = new BlockPos(BASE_X, Y - 1, BASE_Z);
+        final BlockPos stepBeside = new BlockPos(BASE_X + 1, Y - 2, BASE_Z);
+        final BlockPos inward = new BlockPos(BASE_X, Y - 2, BASE_Z + 1);
+        setBlock(ctx, inward, "bedrock");
+        setBlock(ctx, new BlockPos(BASE_X - 1, Y - 2, BASE_Z), "stone");
+        setBlock(ctx, new BlockPos(BASE_X, Y - 2, BASE_Z - 1), "stone");
+        ctx.runCommand("give @s cobblestone 64");
+
+        runChunkMiner(ctx, Y + 1, Y - 2, true);
+
+        assertNotAir(ctx, lid, "the step over the walled-in cell");
+        assertNotAir(ctx, stepBeside, "the step beside the walled-in cell");
+        assertNotAir(ctx, walledIn, "the walled-in cell");
+        for (int dx = 0; dx <= 7; dx++) {
+            for (int dz = 0; dz <= 1; dz++) {
+                for (int y = Y - 2; y <= Y + 1; y++) {
+                    BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (cell.equals(lid) || cell.equals(stepBeside)
+                            || cell.equals(walledIn) || cell.equals(inward)) {
+                        continue;
+                    }
+                    assertAir(ctx, cell, "cell the sweep could reach");
+                }
+            }
+        }
+        LOGGER.info("Chunk miner walled-in cell test passed");
+    }
+
+    // ================================================================
+    // Test 39: an opening no body fits through is not a way in
+    // ================================================================
+
+    /**
+     * The same corner cell as the test above — lid overhead, the next step down
+     * beside it — but this time the two faces pointing out of the chunk are
+     * <em>open</em>: at a quarry's rim the ground outside stands at its own
+     * height, so the slab's level is air out there with rock over it. A ray goes
+     * straight through that; a body cannot, and the bot has no business outside
+     * the chunk anyway. Counting it as a face is what killed a real run at
+     * {@code cannot break -16, 106, -64 (blocks mined: 138)}: the cell was
+     * planned on the strength of a hole in the wall, the bot walked up the
+     * staircase to get as near as it could, and that put it on the lid, aiming
+     * {@code face=up} at the step under its own feet until the look timed out
+     * three times.
+     *
+     * <p>Inward the cell is plain slab stone, not the bedrock of the walled-in
+     * fixture, so this one asserts the other half of the rule: the cell is not
+     * given up on. It waits for the neighbour the sweep is going to take anyway
+     * and is then mined from inside the slab, at eye level — the run finishes
+     * with it gone and both steps still standing.
+     */
+    @MinecraftTest(name = "Chunk miner waits out a cell only a rim slot opens",
+            timeoutTicks = 4000, order = 39)
+    public void waitsOutACellOnlyARimSlotOpens(TestContext ctx) {
+        // Standing inside the chunk, not on its ring, for the same reason as the
+        // walled-in fixture: a descent through a ring column digs the step out
+        // and would hand the cell a face while the repair is pending.
+        prepareWithFloor(ctx, 4, 1, 0, 7, 0, 1);
+        fill(ctx, 0, Y - 3, 0, 7, Y - 2, 1, "stone");
+        fill(ctx, -2, Y - 3, -2, 9, Y - 3, 3, "stone");
+        final BlockPos underStep = new BlockPos(BASE_X, Y - 2, BASE_Z);
+        final BlockPos lid = new BlockPos(BASE_X, Y - 1, BASE_Z);
+        final BlockPos stepBeside = new BlockPos(BASE_X + 1, Y - 2, BASE_Z);
+        // The rim, on both outward sides: the cell's own level is already air
+        // out there (the prepare clears a margin round the chunk), and rock goes
+        // over it. Open to a ray, one cell high, outside the chunk. The rock is
+        // what makes the fixture falsify: a two-cell opening would let the bot
+        // stand out there and mine the cell, and the run would pass with the
+        // rule reverted.
+        for (BlockPos slot : new BlockPos[] {
+                new BlockPos(BASE_X - 1, Y - 2, BASE_Z),
+                new BlockPos(BASE_X, Y - 2, BASE_Z - 1)}) {
+            setBlock(ctx, slot.above(), "stone");
+            setBlock(ctx, slot.above().above(), "stone");
+        }
+        ctx.runCommand("give @s cobblestone 64");
+
+        runChunkMiner(ctx, Y + 1, Y - 2, true);
+
+        assertNotAir(ctx, lid, "the step over the cell");
+        assertNotAir(ctx, stepBeside, "the step beside the cell");
+        assertAir(ctx, underStep, "the cell under the step");
+        for (int dx = 0; dx <= 7; dx++) {
+            for (int dz = 0; dz <= 1; dz++) {
+                for (int y = Y - 2; y <= Y + 1; y++) {
+                    BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (cell.equals(lid) || cell.equals(stepBeside)) {
+                        continue;
+                    }
+                    assertAir(ctx, cell, "cell the sweep could reach");
+                }
+            }
+        }
+        LOGGER.info("Chunk miner rim slot test passed");
+    }
+
     private static String shortList(Set<BlockPos> cells) {
         return cells.isEmpty() ? "nowhere"
                 : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());

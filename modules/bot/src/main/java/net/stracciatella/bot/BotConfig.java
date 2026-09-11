@@ -121,15 +121,13 @@ public class BotConfig {
     public int restockClickDelayMin = 2;
     public int restockClickDelayMax = 5;
 
-    // Ticks the bot stands perfectly still before sending the commands that get
-    // it out of a hole, for servers that require a standstill before teleporting.
-    public int teleportStandStillTicks = 240;
-
     // Ticks to wait for the teleport to actually happen after the commands went
-    // out. Arrival is detected by the position jumping, not by this running out —
-    // the standstill requirement is a server setting and the next server's is a
-    // different number.
-    public int teleportWaitTicks = 200;
+    // out. Arrival is detected by the position jumping, not by this running out.
+    // It has to cover the server's own standstill count — that count starts when
+    // the command arrives, and the next server's is a different number — so this
+    // is generous on purpose: it is only ever spent in full when the teleport
+    // never comes.
+    public int teleportWaitTicks = 400;
 
     // Scanning: look toward distant target before walking
     public int scanTimeout = 30;
@@ -183,7 +181,6 @@ public class BotConfig {
         copyInto(this.storageBlocks, other.storageBlocks);
         this.restockClickDelayMin = other.restockClickDelayMin;
         this.restockClickDelayMax = other.restockClickDelayMax;
-        this.teleportStandStillTicks = other.teleportStandStillTicks;
         this.teleportWaitTicks = other.teleportWaitTicks;
         this.scanTimeout = other.scanTimeout;
         this.scanFacingTolerance = other.scanFacingTolerance;

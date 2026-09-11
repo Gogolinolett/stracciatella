@@ -6,6 +6,7 @@ import net.stracciatella.pathfinding.ChunkCoordinate;
 import net.stracciatella.pathfinding.logic.MeshManager;
 import net.stracciatella.pathfinding.logic.PathWalker;
 import net.stracciatella.pathfinding.logic.mesh.Mesh;
+import net.stracciatella.pathfinding.place.PathPlacement;
 import net.stracciatella.pathfinding.travel.Journey;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
@@ -204,6 +205,134 @@ public class JourneyTests {
         }
         LOGGER.info("Unloaded chunk {} left the cache untouched, {} still has {} nodes",
                 farChunk, home, homeNodesAfter);
+    }
+
+    /**
+     * A walk that cannot go on must be given up on <b>quickly</b>, and the
+     * failure has to say where it stopped.
+     *
+     * <p>The wall goes up <em>while the bot is walking</em>, which is the only way
+     * to reach the case that matters: {@link PathWalker} keeps the node list it was
+     * handed, so it walks into the new wall and presses against it. Planning
+     * against a wall that was already there never gets that far — A* hands back a
+     * path of one node, the leg ends on its own tick, and nothing is being timed.
+     *
+     * <p>Reported from a real return trip, and the reason the budget below is the
+     * assertion: the bot walked for sixteen seconds, stopped against something it
+     * could not pass, and then stood perfectly still for seventy-five more while
+     * three legs each spent the full {@code LEG_TIMEOUT_TICKS}. The leg timeout is
+     * a bound on how <em>long</em> a leg may be, and a walk that is going nowhere
+     * is not long — so a leg that stops moving now ends on {@code
+     * STILL_TICKS_LIMIT} instead, and two of those are the whole failure.
+     */
+    @MinecraftTest(name = "Journey gives up quickly when the way is walled off",
+            timeoutTicks = 2000, order = 52)
+    public void journeyGivesUpWhenWalledOff(TestContext ctx) {
+        final int z = ORIGIN_Z + 40;
+        final int length = 48;
+        final BlockPos start = new BlockPos(ORIGIN_X, ORIGIN_Y + 1, z);
+        final BlockPos target = new BlockPos(ORIGIN_X + length - 2, ORIGIN_Y + 1, z);
+        final boolean placementWasAllowed = PathPlacement.isAvailable();
+        try {
+            // Placement off for the duration: with it on, a stall tries to mend
+            // the way ahead first, which is correct behaviour and a different
+            // test. Set explicitly rather than trusted — a bot test that ran
+            // earlier may have left it on.
+            ctx.runOnClient(mc -> PathPlacement.setAllowed(false));
+            if (!buildWalkway(ctx, z, length, target)) {
+                return;
+            }
+            standAt(ctx, start);
+
+            ctx.runOnClient(mc -> Journey.start(target));
+            // Genuinely under way before the wall appears, so the leg being
+            // measured is one that was walking.
+            ctx.waitFor(mc -> mc.player.getX() > start.getX() + 6, 600);
+
+            final int wallX = ctx.computeOnClient(mc -> (int) Math.floor(mc.player.getX()) + 3);
+            ctx.runCommand("fill " + wallX + " " + (ORIGIN_Y + 1) + " " + (z - BRIDGE_HALF_WIDTH)
+                    + " " + wallX + " " + (ORIGIN_Y + 3) + " " + (z + BRIDGE_HALF_WIDTH)
+                    + " stone");
+            ctx.waitFor(mc -> !mc.level.getBlockState(
+                    new BlockPos(wallX, ORIGIN_Y + 2, z)).isAir());
+            final long walled = ctx.computeOnClient(mc -> mc.level.getGameTime());
+            LOGGER.info("Walled off at x={} while the bot was at {}", wallX,
+                    ctx.computeOnClient(mc -> mc.player.blockPosition()));
+
+            ctx.waitFor(mc -> Journey.status() != Journey.Status.RUNNING);
+            long spent = ctx.computeOnClient(mc -> mc.level.getGameTime()) - walled;
+
+            if (Journey.status() != Journey.Status.FAILED) {
+                ctx.fail("the way is walled off and the journey reported "
+                        + Journey.status() + " — there is no way through a three-block"
+                        + " wall on a walkway three wide");
+                return;
+            }
+            // Two stalled legs at STILL_TICKS_LIMIT plus the re-planning between
+            // them. The old behaviour spent LEG_TIMEOUT_TICKS on the first one
+            // alone and could not come in under this.
+            if (spent > 400) {
+                ctx.fail("the journey took " + spent + " ticks to give up on a wall it was"
+                        + " standing against; a leg that stops moving must not run out its"
+                        + " whole length first");
+                return;
+            }
+            // Either wording is right, and which one this fixture gets is worth
+            // knowing: once the wall is up there is nothing better than the cell
+            // the bot stands on, so A* hands back nothing at all and the verdict
+            // comes from the planner ("no way towards X from Y") rather than from
+            // the stall counter ("stopped at Y"). Both name the position, and
+            // that is the assertion — the reason is what reaches the player in
+            // chat, and a failure that does not say where it happened is the one
+            // this whole round started from.
+            if (!Journey.failReason().contains("from ")
+                    && !Journey.failReason().contains("stopped at ")) {
+                ctx.fail("the failure reads \"" + Journey.failReason() + "\" and does not say"
+                        + " where the bot stopped — which is the one thing the log needs");
+                return;
+            }
+            LOGGER.info("Journey gave up {} ticks after the wall went up: {}",
+                    spent, Journey.failReason());
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+                PathPlacement.setAllowed(placementWasAllowed);
+            });
+        }
+    }
+
+    /**
+     * A short flat walkway along +X at {@code z}, three wide with headroom. Short
+     * enough that one fill lays it with the player standing in the middle, which
+     * is what makes the span resident on the server — see {@link #buildBridge}.
+     *
+     * @return false when the fixture could not be built; the test has been failed
+     */
+    private boolean buildWalkway(TestContext ctx, int z, int length, BlockPos target) {
+        ctx.runOnClient(mc -> {
+            Journey.stop();
+            PathWalker.stop();
+        });
+        ctx.runCommand("gamemode creative");
+        ctx.runCommand("tp @s " + (ORIGIN_X + length / 2 + 0.5) + " " + (ORIGIN_Y + 8)
+                + " " + (z + 0.5));
+        ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level,
+                        new ChunkCoordinate(ORIGIN_X >> 4, z >> 4))
+                && MeshManager.isChunkLoaded(mc.level,
+                        new ChunkCoordinate((ORIGIN_X + length) >> 4, z >> 4)));
+        ctx.runCommand("fill " + ORIGIN_X + " " + ORIGIN_Y + " " + (z - BRIDGE_HALF_WIDTH)
+                + " " + (ORIGIN_X + length) + " " + ORIGIN_Y + " " + (z + BRIDGE_HALF_WIDTH)
+                + " stone");
+        ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y + 1) + " " + (z - BRIDGE_HALF_WIDTH)
+                + " " + (ORIGIN_X + length) + " " + (ORIGIN_Y + 4) + " "
+                + (z + BRIDGE_HALF_WIDTH) + " air");
+        ctx.waitTicks(4);
+        if (ctx.computeOnClient(mc -> mc.level.getBlockState(target.below()).isAir())) {
+            ctx.fail("fixture failed to build: no walkway under " + target);
+            return false;
+        }
+        return true;
     }
 
     /** Nodes in the cached mesh of {@code coord}, or 0 when there is none. */

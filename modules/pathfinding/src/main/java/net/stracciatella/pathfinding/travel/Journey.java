@@ -86,6 +86,18 @@ public final class Journey {
     private static final int KEEP_RADIUS = 8;
     /** A single leg may not take longer than this. */
     private static final int LEG_TIMEOUT_TICKS = 600;
+    /**
+     * Ticks a leg may go without the player moving anywhere before the leg is
+     * given up on. The leg timeout alone is a bound on <em>length</em>, and a
+     * walk that is going nowhere is not long, it is stuck: measured in a real
+     * return trip, the bot walked for sixteen seconds, came to a stop against
+     * something it could not pass, and then stood perfectly still for seventy-five
+     * seconds while three legs each spent the full six hundred ticks and the
+     * journey finally reported no progress. Five seconds is already a long time
+     * for a walk that covers four blocks a second, and it leaves room for the
+     * walker's own pauses — a jump being timed, a mesh being rebuilt under it.
+     */
+    private static final int STILL_TICKS_LIMIT = 100;
     /** Nor the whole journey. */
     private static final int TOTAL_TIMEOUT_TICKS = 12000;
     /**
@@ -114,6 +126,12 @@ public final class Journey {
     private static int legTicks;
     private static int stalledLegs;
     private static double bestDistance;
+    /** Where the player last actually was, and for how long it has been true. */
+    private static BlockPos stillAt;
+    private static int stillTicks;
+    /** What the current leg was asked to walk, for the diagnostics when it fails. */
+    private static BlockPos legTarget;
+    private static int legLength;
 
     private Journey() {
     }
@@ -136,6 +154,10 @@ public final class Journey {
         totalTicks = 0;
         legTicks = 0;
         stalledLegs = 0;
+        stillAt = player.blockPosition();
+        stillTicks = 0;
+        legTarget = null;
+        legLength = 0;
         bestDistance = Math.sqrt(player.blockPosition().distSqr(destination));
         phase = Phase.MESHING;
         queueCorridor(player);
@@ -191,7 +213,7 @@ public final class Journey {
         switch (phase) {
             case MESHING -> tickMeshing(player, level);
             case PLANNING -> tickPlanning(player, level);
-            case WALKING -> tickWalking(player);
+            case WALKING -> tickWalking(player, level);
             case PLACING -> tickPlacing(player);
             default -> { }
         }
@@ -254,19 +276,29 @@ public final class Journey {
         PathDisplay.setHighlightedPath(path);
         PathWalker.start(path);
         legTicks = 0;
+        legTarget = path.get(path.size() - 1).getBlockPos();
+        legLength = path.size();
+        stillAt = player.blockPosition();
+        stillTicks = 0;
         phase = Phase.WALKING;
     }
 
-    private static void tickWalking(LocalPlayer player) {
+    private static void tickWalking(LocalPlayer player, Level level) {
         if (PathWalker.isActive()) {
-            if (++legTicks > LEG_TIMEOUT_TICKS) {
-                LOGGER.info("Journey leg timed out after {} ticks, re-planning", legTicks);
-                PathWalker.stop();
-                endLeg(player);
+            legTicks++;
+            if (Math.sqrt(player.blockPosition().distSqr(stillAt)) > PROGRESS_EPSILON) {
+                stillAt = player.blockPosition();
+                stillTicks = 0;
+            } else if (++stillTicks > STILL_TICKS_LIMIT) {
+                endLeg(player, level, "stood still for " + stillTicks + " ticks");
+                return;
+            }
+            if (legTicks > LEG_TIMEOUT_TICKS) {
+                endLeg(player, level, "timed out after " + legTicks + " ticks");
             }
             return;
         }
-        endLeg(player);
+        endLeg(player, level, "walked out");
     }
 
     private static void tickPlacing(LocalPlayer player) {
@@ -283,8 +315,13 @@ public final class Journey {
 
     /**
      * A leg ended. Decide whether we are there, making progress, or stuck.
+     *
+     * @param why how the leg ended, for the log — the walker finishing, the leg
+     *            timing out and the bot standing still look identical from a
+     *            distance that did not change, and they want different fixes
      */
-    private static void endLeg(LocalPlayer player) {
+    private static void endLeg(LocalPlayer player, Level level, String why) {
+        PathWalker.stop();
         double distance = Math.sqrt(player.blockPosition().distSqr(target));
         if (player.blockPosition().distSqr(target) <= ARRIVAL_RADIUS_SQ) {
             LOGGER.info("Journey arrived at {} after {} ticks", shortPos(target), totalTicks);
@@ -299,10 +336,39 @@ public final class Journey {
         if (bestDistance - distance > PROGRESS_EPSILON) {
             bestDistance = distance;
             stalledLegs = 0;
-        } else if (++stalledLegs >= STALLED_LEGS_LIMIT) {
-            fail("no progress towards " + shortPos(target) + " over "
-                    + stalledLegs + " legs, still " + String.format("%.1f", distance) + " blocks away");
-            return;
+        } else {
+            // Failure-only diagnostics, and the reason this class had none is
+            // the reason a real failure could not be read at all: ninety seconds
+            // of a stuck return trip produced three identical lines saying a leg
+            // had timed out, and nothing about where the bot stood, what it had
+            // been told to walk, or whether a path had even been found. All of
+            // that is known right here.
+            LOGGER.warn("Journey leg {} stalled: {} — player={} legTarget={} legNodes={}"
+                    + " distance={} best={} walker={}", stalledLegs + 1, why,
+                    shortPos(player.blockPosition()),
+                    legTarget == null ? "none" : shortPos(legTarget), legLength,
+                    String.format("%.1f", distance), String.format("%.1f", bestDistance),
+                    PathWalker.isActive());
+            if (++stalledLegs >= STALLED_LEGS_LIMIT) {
+                fail("no progress towards " + shortPos(target) + " over " + stalledLegs
+                        + " legs, still " + String.format("%.1f", distance) + " blocks away"
+                        + " (stopped at " + shortPos(player.blockPosition())
+                        + ", last leg aimed at "
+                        + (legTarget == null ? "nothing" : shortPos(legTarget)) + ")");
+                return;
+            }
+            // The way ahead is what is wrong, so mend it if this server allows
+            // that — which is what STALLED_LEGS_LIMIT's second leg is for. It
+            // used to be reachable only when A* found nothing at all, and that
+            // is not what being stuck looks like: the search keeps handing back
+            // a perfectly good partial path to the best node it can see, the bot
+            // is already standing on it, and the leg that follows goes nowhere
+            // for the full timeout. So the attempt belongs to the stall, not to
+            // the empty path.
+            if (tryBridge(player, level)) {
+                phase = Phase.PLACING;
+                return;
+            }
         }
 
         // Keep the cache bounded as we move; the player's surroundings are what

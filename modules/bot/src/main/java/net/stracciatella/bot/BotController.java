@@ -95,8 +95,58 @@ public class BotController {
     private static boolean forceApproach = false;
     private static int wrongHitStreak = 0;
     private static BlockPos lastWrongHit = null;
-    private static final double APPROACH_CLOSE_DISTANCE = 2.0;
+    /**
+     * How close POSITIONING walks before it hands over to LOOKING — where the
+     * bot <em>works</em> from, as opposed to the farthest place it could still
+     * technically touch the block from.
+     *
+     * <p>That distinction was missing, and the reach distance stood in for it in
+     * both questions. Reach is a limit, not a position: arriving at 3.9 blocks
+     * puts the next block of a sweep at 4.9, out of reach, so every single block
+     * costs a fresh POSITIONING entry with its reaction beat instead of
+     * continuing the seam. Nothing pulled the bot in either — except, by
+     * accident, the walk to the drop it had just made. Put cobblestone and dirt
+     * on the ignored list and that accident stops happening: measured over 292
+     * breaks of a real chunk-miner run, a block broken from under 2.5 blocks was
+     * followed by the next break after 0.48 s, and one broken from over 3.0
+     * after 1.70 s — the same sweep, the same rows, 3.5 times the time, and only
+     * a third of the drops ever landing in the vanilla pickup box.
+     *
+     * <p>Two blocks also happens to be the right distance for the
+     * {@code approachOccluded} re-approach, which is why there is one constant
+     * here and not two: both are asking where a person stands to work.
+     */
+    private static final double WORK_DISTANCE = 2.0;
+    /**
+     * Where a walk toward a block runs out of anything to do: a 0.6-wide body
+     * flush against a block face stands 0.8 from its centre, so inside one
+     * block there is nothing left to close.
+     *
+     * <p>Not a standing distance — {@link #isStepSafe} decides where the bot
+     * comes to rest, by refusing to put the feet in a solid cell, and that is
+     * the whole point of it being the body rather than a number. This only
+     * keeps the degenerate case out: a target underfoot has a horizontal offset
+     * of centimetres, and {@code atan2} of centimetres is an arbitrary compass
+     * heading.
+     */
+    private static final double CONTACT_DISTANCE = 1.0;
+    /**
+     * Ticks the walk may fail to get any closer before the edge of reach is
+     * accepted as the best place on offer. Some targets cannot be approached at
+     * all — one across a gap the floor check refuses to step into, one behind a
+     * wall the body comes to rest against — and for those, reach really is as
+     * good as it gets. Without this the walk would hold them until
+     * {@code positionTimeout}, six times longer, for nothing. A target directly
+     * above or below needs no such patience: the working distance is measured
+     * horizontally, so that one has already arrived.
+     */
+    private static final int CLOSING_STALL_TICKS = 10;
+    /** How much closer counts as progress. Same bar as the collect walk's. */
+    private static final double CLOSING_EPSILON = 0.05;
     private static final int WRONG_HIT_STREAK_TICKS = 8;
+    /** Closest the current POSITIONING has got, and how long ago that was. */
+    private static double closeBest = Double.MAX_VALUE;
+    private static int closeStalledTicks = 0;
 
     // Bridging: the crouch that lets the bot place a block into the gap it is
     // standing at the edge of. See updateBridging for when it goes down and,
@@ -566,7 +616,7 @@ public class BotController {
                         String.format(java.util.Locale.US, "%.2f", player.getX()),
                         String.format(java.util.Locale.US, "%.2f", player.getY()),
                         String.format(java.util.Locale.US, "%.2f", player.getZ()),
-                        hasLineOfSight(client, player, currentTask.targetPos()),
+                        hasLineOfSight(client, player, currentTask),
                         pin, past, bridging, player.onGround(), blocked);
                 scheduleAction(() -> transitionTo(Phase.LOOKING));
             } else {
@@ -596,9 +646,14 @@ public class BotController {
             return;
         }
 
-        // Close enough? Reaction beat before LOOKING starts. After a failed
-        // look (forceApproach) "close enough" means close range, not reach —
-        // the whole point of the re-approach is to change the viewpoint.
+        // Close enough? Reaction beat before LOOKING starts. "Close enough" is
+        // WORK_DISTANCE, not reach: reach says the block can be touched from
+        // here, which is a different question from where to stand to work, and
+        // letting the first answer the second is what made the bot mine from the
+        // rim of its own reach and pay a walk for every block (see the constant).
+        // A re-approach after a failed look insists on it with no fallback — the
+        // whole point of that walk is to change the viewpoint, and settling for
+        // reach is how it used to arrive without moving.
         //
         // A behavior that asked for approachOccluded gets the viewpoint stated
         // outright instead of approximated by a distance: walk until the sight
@@ -611,14 +666,28 @@ public class BotController {
             // Still owed the step out to the rim: the edge of the block
             // underfoot is not in sight yet, and nothing else about the
             // position matters until it is. Asked first because the other two
-            // rules both say "arrived" here — the support is in reach, and the
-            // sight line to its centre was never blocked; only its face is.
+            // rules both say "arrived" here — the support is in reach, and a
+            // clip that ends on the support itself reads as clear however the
+            // bot happens to be standing on it.
             arrived = false;
         } else if (forceApproach && policy.approachOccluded()) {
-            arrived = hasLineOfSight(client, player, approaching);
+            arrived = hasLineOfSight(client, player, currentTask);
+        } else if (forceApproach) {
+            // Close range, measured the whole way, with no settling for reach:
+            // this walk exists to change the viewpoint, and a re-approach that
+            // arrives without moving is the bug it replaces.
+            arrived = distanceToTarget(player, approaching) <= WORK_DISTANCE;
         } else {
-            arrived = distanceToTarget(player, approaching)
-                    <= (forceApproach ? APPROACH_CLOSE_DISTANCE : CONFIG.reachDistance);
+            // Horizontally, because that is the only distance a walk can change.
+            // Measured the whole way, a target directly underfoot reads as 3.1
+            // blocks off and the phase sets out to close a gap no heading
+            // shortens — sixty ticks of shuffling on top of the column it was
+            // trying to mine, its own footing between eye and target. Horizontal
+            // makes that target arrive at once, which is what it did before the
+            // working distance existed and what it should do.
+            double horizontal = horizontalDistanceTo(player, approaching);
+            arrived = horizontal <= WORK_DISTANCE
+                    || (isWithinReach(player, approaching) && !closingIn(horizontal));
         }
         if (arrived) {
             forceApproach = false;
@@ -770,7 +839,7 @@ public class BotController {
                     String.format(java.util.Locale.US, "%.2f", player.getX()),
                     String.format(java.util.Locale.US, "%.2f", player.getY()),
                     String.format(java.util.Locale.US, "%.2f", player.getZ()), hit,
-                    lookRetryUsed, hasLineOfSight(client, player, t));
+                    lookRetryUsed, hasLineOfSight(client, player, currentTask));
             failCurrentTask("Look timeout — could not aim at target");
             return;
         }
@@ -851,7 +920,7 @@ public class BotController {
             // behavior that has asked for the approach gets it on tick one
             // rather than eight ticks of staring later.
             if (policy.approachOccluded() && !lookRetryUsed
-                    && !hasLineOfSight(client, player, target)) {
+                    && !hasLineOfSight(client, player, currentTask)) {
                 lookRetryUsed = true;
                 forceApproach = true;
                 if (CONFIG.debugEnabled) {
@@ -934,18 +1003,43 @@ public class BotController {
     }
 
     /**
-     * Whether anything stands between the bot's eye and the target block.
+     * Whether anything stands between the bot's eye and the point on the target
+     * LOOKING is going to aim at.
      *
-     * <p>Geometry, not aim: this is a clip from the eye to the block's centre
-     * and says nothing about where the camera currently points, which is what
-     * makes it usable the moment LOOKING starts instead of after the camera has
-     * settled on the wrong block for {@link #WRONG_HIT_STREAK_TICKS} ticks. A
-     * ray that ends on the target itself counts as clear — clip stops at the
-     * target's own outline on the way to its centre.
+     * <p>Geometry, not aim: this is a clip, so it says nothing about where the
+     * camera currently points, which is what makes it usable the moment LOOKING
+     * starts instead of after the camera has settled on the wrong block for
+     * {@link #WRONG_HIT_STREAK_TICKS} ticks. A ray that ends on the target
+     * itself counts as clear — clip stops at the target's own outline.
+     *
+     * <p><b>To the face, not to the centre.</b> It used to clip to
+     * {@code Vec3.atCenterOf(target)} while LOOKING aimed at a face, and the two
+     * rays do not answer the same question: the face centre sits half a block
+     * off the middle, so one of them clears an obstacle the other clips. That
+     * difference decided a run. The chunk miner handed over a block three
+     * columns along with a staircase step in between; the ray to the centre
+     * passed over the step, so POSITIONING reported "arrived" without a step
+     * taken, and LOOKING then spent its whole budget on a face ray the step
+     * stopped dead — three times over, from a position identical to two
+     * decimals, and the run died on {@code cannot break -29, 82, -64} with
+     * {@code los=true} in its own diagnostics. Asking about the aim point is
+     * what makes {@link BotPolicy#approachOccluded} able to do its job at all:
+     * it walks until the sight line is clear, and that can only work if "clear"
+     * means the line it is going to use.
+     *
+     * <p>The humanized aim jitter is deliberately left out — the point here is
+     * the face the camera will settle on, and a clip that wandered with the
+     * per-task offsets would answer a slightly different question on every call.
      */
-    private static boolean hasLineOfSight(Minecraft client, LocalPlayer player, BlockPos target) {
+    private static boolean hasLineOfSight(Minecraft client, LocalPlayer player, BotTask task) {
+        BlockPos target = task.targetPos();
+        net.minecraft.core.Direction face = aimFace(client, task);
+        Vec3 aim = new Vec3(
+                target.getX() + 0.5 + face.getStepX() * 0.5,
+                target.getY() + 0.5 + face.getStepY() * 0.5,
+                target.getZ() + 0.5 + face.getStepZ() * 0.5);
         BlockHitResult clip = client.level.clip(new ClipContext(player.getEyePosition(),
-                Vec3.atCenterOf(target), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+                aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
         return clip.getType() != HitResult.Type.BLOCK || clip.getBlockPos().equals(target);
     }
 
@@ -1069,12 +1163,22 @@ public class BotController {
             return;
         }
 
-        // Step toward drops without interrupting the break — the camera above
-        // has already been committed to the target this tick, so this can only
-        // move the body. Placement is excluded: there is nothing to collect and
-        // a placement's aim is pinned to one face, which a step would spoil.
-        if (policy.opportunisticCollection() && !placing) {
-            tickOpportunisticCollection(client, player, target);
+        // Walk while breaking — the camera above has already been committed to
+        // the target this tick, so this can only move the body. A drop comes
+        // first where the policy asked for that, because it is the one errand
+        // that will not wait; otherwise the body closes on the face it is
+        // mining, which is what makes a row need POSITIONING once instead of
+        // once per block. Nothing moves unless one of the two wants it to, and
+        // then the keys go down for that tick only.
+        //
+        // Placement is excluded from both: there is nothing to collect, and a
+        // placement's aim is pinned to one face with the body parked on a rim,
+        // which a step would spoil — see needsEdgeStep.
+        if (!placing
+                && !(policy.opportunisticCollection()
+                        && tickOpportunisticCollection(client, player, target))
+                && !stepTowardWork(client, player, target)) {
+            releaseMovementKeys();
         }
 
         // Start interacting if not already. Pass the explicit target so the
@@ -1301,9 +1405,12 @@ public class BotController {
      *       vanilla pickup radius, which collects it without moving at all.
      * </ol>
      * COLLECTING still runs afterwards and picks up whatever this declined.
+     *
+     * <p>Returns whether it took the step, so the caller can offer the body
+     * somewhere else to go when it did not.
      */
-    private static void tickOpportunisticCollection(Minecraft client, LocalPlayer player,
-                                                    BlockPos target) {
+    private static boolean tickOpportunisticCollection(Minecraft client, LocalPlayer player,
+                                                      BlockPos target) {
         net.minecraft.world.entity.item.ItemEntity nearest = null;
         double nearestDistSq = Double.MAX_VALUE;
         var box = player.getBoundingBox().inflate(OPPORTUNISTIC_ITEM_RANGE);
@@ -1330,14 +1437,74 @@ public class BotController {
             }
         }
         if (nearest == null) {
-            releaseMovementKeys();
-            return;
+            return false;
         }
+        return stepToward(client, player, target, nearest.getX(), nearest.getZ());
+    }
 
-        // Quantize the direction to the drop into the 8 key directions,
-        // relative to the view the camera is holding on the mined block.
+    /**
+     * Close the last of the distance to the block being mined, while mining it.
+     *
+     * <p>The walk a person does without thinking about it: you hold the button
+     * and keep walking into the face. Everything it needs is already here — the
+     * camera is committed, the direction quantizes the same way, and
+     * {@link #isStepSafe} asks the same three questions — so the only new thing
+     * is the destination.
+     *
+     * <p>What it buys is not the walk itself but the <em>phase</em>: without it
+     * the bot leaves a block at about 3.0 (having broken the one before from
+     * 2.0), the next cell of the row is then at 4.0, and closing again costs a
+     * POSITIONING entry with its reaction beat. With it, the break the bot is
+     * already paying for carries the body back to the face, so a row never needs
+     * POSITIONING twice — the seam sustains itself. Reported from a real run as a
+     * bot that does not mine and walk at the same time, which is exactly right:
+     * every tick spent walking was a tick not breaking, and the two fit inside
+     * one another.
+     *
+     * <p>Self-limiting, and not by a standing distance of its own: the
+     * target block is solid, so {@code isStepSafe} refuses the step that would
+     * put the feet in its cell, and the bot comes to rest against the face the
+     * way a body does. It used to stop early at {@link #WORK_DISTANCE} on the
+     * argument that closer bought nothing — and that is exactly what looked
+     * mechanical from outside: the bot walked up, stopped dead at a distance no
+     * person would have picked, and swung at arm's length. Someone mining who
+     * has nothing to pick up simply keeps walking into the block. The only
+     * threshold left is {@link #CONTACT_DISTANCE}, and it is not a standing
+     * distance but the point where there is no walk left to make.
+     *
+     * <p>The distance it measures is <b>horizontal</b>, and that is not a detail.
+     * A walk cannot shorten a vertical gap, so measuring the 3-D distance made
+     * the step fire on a target directly underfoot — where the horizontal offset
+     * is a few centimetres and {@code atan2} of a few centimetres is a yaw in an
+     * arbitrary compass direction, the same trap {@link #aimPoint} documents. The
+     * bot then shuffled about on top of the very column it was trying to mine,
+     * its own footing between the eye and the target: {@code hitResult} on the
+     * block under its feet, {@code los=false}, three look timeouts and
+     * {@code cannot break 3008, 38, 3008}. With the horizontal measure such a
+     * target produces no step at all, which is correct — there is nowhere closer
+     * to stand — and the miner's own "standing in the way" retry handles it.
+     */
+    private static boolean stepTowardWork(Minecraft client, LocalPlayer player, BlockPos target) {
+        if (horizontalDistanceTo(player, target) <= CONTACT_DISTANCE) {
+            return false;
+        }
+        return stepToward(client, player, target, target.getX() + 0.5, target.getZ() + 0.5);
+    }
+
+    /**
+     * Hold the movement keys that carry the body toward {@code destX/destZ}
+     * without turning the camera off {@code target}.
+     *
+     * <p>The half of the step that is the same whatever it is walking at, so it
+     * is written once: quantize, work out where that key combination actually
+     * pushes, refuse it unless {@link #isStepSafe}, press.
+     */
+    private static boolean stepToward(Minecraft client, LocalPlayer player, BlockPos target,
+                                      double destX, double destZ) {
+        // Quantize the direction into the 8 key directions, relative to the
+        // view the camera is holding on the mined block.
         float moveYaw = (float) Math.toDegrees(
-                Math.atan2(-(nearest.getX() - player.getX()), nearest.getZ() - player.getZ()));
+                Math.atan2(-(destX - player.getX()), destZ - player.getZ()));
         float rel = AngleUtil.wrapDegrees(moveYaw - player.getYRot());
         float a = Math.abs(rel);
         boolean forward = a <= 67.5f;
@@ -1355,15 +1522,13 @@ public class BotController {
         double pushZ = (forward ? fz : backward ? -fz : 0.0) + strafeDir * fx;
         double pushLen = Math.sqrt(pushX * pushX + pushZ * pushZ);
         if (pushLen < 1.0e-6) {
-            releaseMovementKeys();
-            return;
+            return false;
         }
         double stepX = player.getX() + pushX / pushLen * STEP_LOOKAHEAD;
         double stepZ = player.getZ() + pushZ / pushLen * STEP_LOOKAHEAD;
 
         if (!isStepSafe(client, player, target, stepX, stepZ)) {
-            releaseMovementKeys();
-            return;
+            return false;
         }
 
         client.options.keyUp.setDown(forward);
@@ -1371,6 +1536,7 @@ public class BotController {
         client.options.keyLeft.setDown(strafeDir < 0);
         client.options.keyRight.setDown(strafeDir > 0);
         client.options.keySprint.setDown(false);
+        return true;
     }
 
     /**
@@ -1893,30 +2059,25 @@ public class BotController {
                 client.options.keyUp.setDown(false);
                 client.options.keySprint.setDown(false);
                 aimCollectGaze(player, nearest.getX(), nearest.getY() + 0.2, nearest.getZ());
-            } else if (!itemsSeenThisCollect && lastMinedPos != null) {
-                // No items visible yet, but we expect a drop at lastMinedPos.
-                // Walk there so the entity enters the AABB as soon as the server
-                // syncs its spawn.
-                double tx = lastMinedPos.getX() + 0.5;
-                double ty = lastMinedPos.getY() + 0.5;
-                double tz = lastMinedPos.getZ() + 0.5;
-                double dx = tx - player.getX();
-                double dz = tz - player.getZ();
-                double horizDistSq = dx * dx + dz * dz;
-                if (horizDistSq > 1.0) {
-                    walkToward(client, player, tx, ty, tz, horizDistSq);
-                } else {
-                    client.options.keyUp.setDown(false);
-                    client.options.keySprint.setDown(false);
-                    // Keep watching the spot where the drop will appear.
-                    aimCollectGaze(player, tx, ty, tz);
-                }
             } else {
                 client.options.keyUp.setDown(false);
                 client.options.keySprint.setDown(false);
-                // Everything picked up, waiting out the absence window —
-                // let the camera finish its swing and keep saccading
-                // rather than freezing in place.
+                // Nothing to walk to: either everything is picked up and the
+                // absence window is draining, or the drop has not synced yet.
+                // A third branch used to walk at lastMinedPos before the first
+                // sighting, to be inside the pickup box the moment the spawn
+                // arrived (STR-026). Its premise was a bot that finished its
+                // break several blocks from the drop; the working distance
+                // removed that premise — the break now ends about two blocks
+                // out, and the sighted-drop walk above closes that in three
+                // ticks. What it still did was walk blind: no entity to
+                // measure, no progress watchdog, no step safety, and, measured
+                // at a block of travel while one spawn synced, straight into
+                // the pickup box of a drop on the ignore list — collecting the
+                // one thing the list exists to leave alone.
+                //
+                // Let the camera finish its swing and keep saccading rather
+                // than freezing in place.
                 if (hasLastAim) {
                     aimCameraAt(player, lastAimX, lastAimY, lastAimZ);
                 }
@@ -2178,6 +2339,16 @@ public class BotController {
         phase = newPhase;
         phaseTicks = 0;
         preAttackHesitationRemaining = -1;
+        // The closing-in watchdog belongs to one POSITIONING phase and has to be
+        // armed here rather than lazily on its first call: that call only happens
+        // once the bot is already in reach, which is never the phase's first tick,
+        // so a reset keyed on phaseTicks never ran at all. The counter then
+        // arrived carrying whatever the previous task had left in it and answered
+        // "stop trying" before the walk had taken a step — measured as a bot that
+        // started breaking from 3.67 blocks, the reach distance it was supposed to
+        // have stopped using.
+        closeBest = Double.MAX_VALUE;
+        closeStalledTicks = 0;
     }
 
     /**
@@ -2367,6 +2538,46 @@ public class BotController {
 
     private static boolean isWithinReach(LocalPlayer player, BlockPos target) {
         return distanceToTarget(player, target) <= CONFIG.reachDistance;
+    }
+
+    /**
+     * Distance from the player to {@code target}'s column, ignoring height.
+     *
+     * <p>The distance a walk can do something about, which is why the working
+     * distance is expressed in it. Reach is the other kind and stays
+     * three-dimensional: whether a block can be touched is a question about the
+     * whole line, not about the floor plan.
+     */
+    private static double horizontalDistanceTo(LocalPlayer player, BlockPos target) {
+        double dx = (target.getX() + 0.5) - player.getX();
+        double dz = (target.getZ() + 0.5) - player.getZ();
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    /**
+     * Whether the walk is still getting closer to the target.
+     *
+     * <p>Asked only of a bot that is already in reach but horizontally short of
+     * {@link #WORK_DISTANCE}, i.e. one that could start mining but would rather
+     * step up to the face first. Usually it can, and then this keeps saying yes
+     * until it has. When it cannot — the floor check refusing a gap, a body come
+     * to rest against a wall — the distance stops falling, and after
+     * {@link #CLOSING_STALL_TICKS} the edge of reach is accepted instead. That
+     * fallback is the whole reason this predicate exists rather than a plain
+     * distance test: without it those cases would no longer be mined at all, only
+     * timed out.
+     *
+     * <p>The caller passes the <em>horizontal</em> distance, which is the one the
+     * walk can change — fed the full distance, this watchdog would be asked to
+     * judge a walk by a number the walk does not control.
+     */
+    private static boolean closingIn(double distance) {
+        if (distance < closeBest - CLOSING_EPSILON) {
+            closeBest = distance;
+            closeStalledTicks = 0;
+            return true;
+        }
+        return ++closeStalledTicks < CLOSING_STALL_TICKS;
     }
 
     /**

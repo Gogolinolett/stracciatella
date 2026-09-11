@@ -1,5 +1,7 @@
 package net.stracciatella.bot.behavior;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 import net.minecraft.client.Minecraft;
@@ -24,7 +26,9 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Walks to a storage block, empties the loot into it, takes back what the
- * interrupted behavior is short of, and walks home.
+ * interrupted behavior is short of, and walks home — on to the next storage
+ * whenever one will not take any more or has nothing to give, because a camp is
+ * a row of barrels and one of them is always full.
  *
  * <p>It is a {@link BotBehavior} like any other rather than a mode inside one,
  * and that is what makes it reusable: the chunk miner needed it first, but
@@ -42,8 +46,8 @@ import org.slf4j.LoggerFactory;
  * <p>A bot that has been mining is usually standing at the bottom of something,
  * and a mesh edge climbs at most one block. Two ways out, chosen per server
  * because which one exists is a fact about the server:
- * {@link ServerSettings.ExitStrategy#COMMAND} stands perfectly still and then
- * sends the server's own teleport command, and
+ * {@link ServerSettings.ExitStrategy#COMMAND} comes to a stop and sends the
+ * server's own teleport command from there, and
  * {@link ServerSettings.ExitStrategy#STAIRCASE} simply walks — which works
  * because whoever dug the hole left a way up it (the chunk miner's spiral) and
  * because the pathfinder may mend a gap when the server allows it. Nothing is
@@ -76,6 +80,14 @@ public class RestockBehavior implements BotBehavior {
      */
     private static final int TRANSFER_STALL_TICKS = 60;
 
+    /**
+     * Ticks the bot holds one block before the exit command goes out. Not the
+     * server's standstill count — that one starts when the command arrives — but
+     * the time a walk that has just been told to stop needs to have stopped, so
+     * the command is not refused for movement the bot is no longer making.
+     */
+    private static final int SETTLE_TICKS = 10;
+
     private enum Phase {
         /** Getting out of whatever the bot has dug itself into. */
         LEAVE_SITE,
@@ -96,7 +108,10 @@ public class RestockBehavior implements BotBehavior {
     private Phase phase = Phase.LEAVE_SITE;
     private RestockNeeds needs = RestockNeeds.none();
     private BlockPos anchor;
-    private StorageSite storage;
+    /** Every storage in this dimension, nearest first — see {@link #sortedStorages}. */
+    private List<StorageSite> route = List.of();
+    /** Which one of {@link #route} the bot is at or heading for. */
+    private int stop;
     private String failure;
 
     private int phaseTicks;
@@ -106,6 +121,13 @@ public class RestockBehavior implements BotBehavior {
     private int stalledTicks;
     private int deposited;
     private int withdrawn;
+    /**
+     * Whether this trip still has something to do when the current container is
+     * let go of. Decided in {@link #tickTransfer} while the menu is still open,
+     * because that is where the answer is cheap and certain, and read by
+     * {@link #tickClose} to choose between the next storage and going home.
+     */
+    private boolean workLeft;
 
     /** Where the bot stood when the exit command went out, to spot the jump. */
     private BlockPos standstillFrom;
@@ -139,6 +161,8 @@ public class RestockBehavior implements BotBehavior {
         stalledTicks = 0;
         deposited = 0;
         withdrawn = 0;
+        stop = 0;
+        workLeft = false;
         standstillFrom = null;
         standstillTicks = 0;
         commandsSent = false;
@@ -157,14 +181,14 @@ public class RestockBehavior implements BotBehavior {
 
         ServerSettings settings = ServerSettingsStore.current();
         String dimension = ServerSettingsStore.dimensionOf(client);
-        storage = nearestStorage(settings.storagesIn(dimension), anchor);
-        if (storage == null) {
+        route = sortedStorages(settings.storagesIn(dimension), anchor);
+        if (route.isEmpty()) {
             failure = "no storage configured for " + ServerSettingsStore.keyFor(client)
                     + " in " + dimension + " — point the bot at one with /bot storage add";
             return;
         }
-        LOGGER.info("Restock from {}: storage {}, needs {}", shortPos(anchor), storage,
-                needs.needs().size() + " entries");
+        LOGGER.info("Restock from {}: {} storages, nearest {}, needs {} entries",
+                shortPos(anchor), route.size(), storage(), needs.needs().size());
     }
 
     @Override
@@ -181,7 +205,7 @@ public class RestockBehavior implements BotBehavior {
 
         return switch (phase) {
             case LEAVE_SITE -> tickLeaveSite(client, player);
-            case TO_STORAGE -> tickTravel(storage.pos(), Phase.OPEN, "to the storage");
+            case TO_STORAGE -> tickTravel(storage().pos(), Phase.OPEN, "to the storage");
             case OPEN -> tickOpen(player, level);
             case TRANSFER -> tickTransfer(player);
             case CLOSE -> tickClose(player);
@@ -207,27 +231,29 @@ public class RestockBehavior implements BotBehavior {
             return fail("exit strategy is COMMAND but no exit commands are configured");
         }
 
-        // Standing still means standing still: whatever was walking stops, and
-        // the bot holds the spot. These servers cancel the teleport on movement,
-        // and the margin is the server's setting, not ours.
-        if (standstillFrom == null) {
-            PathWalker.stop();
-            BotController.stop();
-            standstillFrom = player.blockPosition();
-            standstillTicks = 0;
-        }
-        if (!player.blockPosition().equals(standstillFrom)) {
-            // Pushed, or still sliding off a rim. Start the count again rather
-            // than send a command the server is about to refuse.
-            standstillFrom = player.blockPosition();
-            standstillTicks = 0;
-            commandsSent = false;
-            return BehaviorStatus.RUNNING;
-        }
-
-        standstillTicks++;
         if (!commandsSent) {
-            if (standstillTicks < config.teleportStandStillTicks) {
+            // Standing still means standing still: whatever was walking stops,
+            // and the bot holds the spot. But it holds it only long enough to
+            // have actually stopped — the server's own count starts when the
+            // command arrives, so waiting that count out before sending spends
+            // it twice and the first spending buys nothing. Measured in a real
+            // run: twelve seconds between "Restocking" and the command going on
+            // the wire, and the teleport landing in the same second it finally
+            // did.
+            if (standstillFrom == null) {
+                PathWalker.stop();
+                BotController.stop();
+                standstillFrom = player.blockPosition();
+                standstillTicks = 0;
+            }
+            if (!player.blockPosition().equals(standstillFrom)) {
+                // Pushed, or still sliding off a rim. Let the slide finish
+                // rather than send a command the server is about to refuse.
+                standstillFrom = player.blockPosition();
+                standstillTicks = 0;
+                return BehaviorStatus.RUNNING;
+            }
+            if (++standstillTicks < SETTLE_TICKS) {
                 return BehaviorStatus.RUNNING;
             }
             for (String command : commands) {
@@ -235,12 +261,25 @@ public class RestockBehavior implements BotBehavior {
             }
             commandsSent = true;
             standstillTicks = 0;
-            LOGGER.info("Exit commands sent, waiting for the teleport");
+            LOGGER.info("Exit commands sent from {}, waiting for the teleport",
+                    shortPos(standstillFrom));
             return BehaviorStatus.RUNNING;
         }
 
         // Arrival is the position jumping, not a timer running out — the wait is
         // only a bound on how long to believe in it.
+        //
+        // Nothing past the send reacts to ordinary movement, and that is the
+        // repair rather than an omission. A branch that restarted the count
+        // whenever the position changed sat in front of this one and swallowed
+        // the single event it was waiting for: the jump IS movement. The bot
+        // then held its new spot for another count, sent the command again —
+        // which teleported it to where it already stood, so not even a position
+        // change was left to see — and failed with "did not teleport" after a
+        // log that shows the teleport twice. A nudge from a mob survives the
+        // same way: standstillFrom stays where the command went out, so the jump
+        // is still measured from the place it has to be measured from.
+        standstillTicks++;
         if (Math.sqrt(player.blockPosition().distSqr(standstillFrom)) > TELEPORT_JUMP_DISTANCE) {
             LOGGER.info("Teleported to {}", shortPos(player.blockPosition()));
             return enter(Phase.TO_STORAGE);
@@ -280,19 +319,27 @@ public class RestockBehavior implements BotBehavior {
 
     private BehaviorStatus tickOpen(LocalPlayer player, Level level) {
         if (OpenContainerTask.isContainerOpen()) {
+            // Each container starts its own stall count. Carrying the previous
+            // one's over would have the next storage closed on its first
+            // unsatisfied click — the count is a statement about one container,
+            // not about the trip.
+            stalledTicks = 0;
             return enter(Phase.TRANSFER);
         }
-        if (!isStorageBlock(level, storage.pos())) {
-            return fail("no " + String.join(" or ", config.storageBlocks) + " at "
-                    + storage + " any more — remove it with /bot storage remove");
+        if (!isStorageBlock(level, storage().pos())) {
+            // Reported and walked past, never struck off the list: an unloaded
+            // chunk looks exactly like a chest somebody mined, and a list that
+            // edits itself on that evidence quietly forgets a whole camp.
+            return moveOn("no " + String.join(" or ", config.storageBlocks) + " at "
+                    + storage() + " any more — remove it with /bot storage remove");
         }
         if (!BotController.isActive()) {
             if (phaseTicks > 1) {
                 // The task ran and the screen never opened. Saying so beats
                 // clicking the same block until the behavior times out.
-                return fail("could not open the storage at " + storage);
+                return moveOn("could not open the storage at " + storage());
             }
-            BotController.enqueueTask(new OpenContainerTask(storage.pos()));
+            BotController.enqueueTask(new OpenContainerTask(storage().pos()));
         }
         return BehaviorStatus.RUNNING;
     }
@@ -320,7 +367,14 @@ public class RestockBehavior implements BotBehavior {
         if (withdrawSlot >= 0) {
             return move(player, withdrawSlot, false);
         }
-        LOGGER.info("Transfer done: {} stacks in, {} stacks out", deposited, withdrawn);
+        // Nothing more to put in (no loot is left anywhere in the inventory) and
+        // nothing here the manifest wants. Whether the trip is finished is
+        // therefore exactly whether the manifest is still short of something —
+        // another storage may hold it.
+        workLeft = needs.shortfall(player) != null;
+        LOGGER.info("Transfer done at {}: {} stacks in, {} stacks out, manifest {}",
+                storage(), deposited, withdrawn,
+                workLeft ? "still short" : "satisfied");
         return enter(Phase.CLOSE);
     }
 
@@ -337,8 +391,14 @@ public class RestockBehavior implements BotBehavior {
         if (unchanged(before, after)) {
             stalledTicks++;
             if (stalledTicks > TRANSFER_STALL_TICKS) {
-                LOGGER.info("Transfer stalled after {} in, {} out — closing up",
-                        deposited, withdrawn);
+                // A click the planner wanted and the container would not take:
+                // this one is full, or holds a stack there is no room for. There
+                // is work left by construction — the planner had just named
+                // it — so the next storage gets the trip, and the one after
+                // that, until the list runs out.
+                workLeft = true;
+                LOGGER.info("Transfer stalled at {} after {} in, {} out —"
+                        + " nothing more fits here", storage(), deposited, withdrawn);
                 return enter(Phase.CLOSE);
             }
             // Not a hard failure: the other direction may still have work, and
@@ -373,7 +433,48 @@ public class RestockBehavior implements BotBehavior {
             player.closeContainer();
             return BehaviorStatus.RUNNING;
         }
+        if (workLeft && stop + 1 < route.size()) {
+            return nextStop();
+        }
         return enter(Phase.RETURN);
+    }
+
+    /**
+     * Walk on to the next storage on the route.
+     *
+     * <p>A camp is a row of barrels, not one chest, and any single one of them is
+     * full sooner or later — a trip that commits to the nearest and gives up when
+     * it will not take another stack is a trip that deposits nothing. Reported
+     * from a real run: one barrel of thirty-three on record, {@code Transfer
+     * stalled after 0 in, 0 out}, and the bot walked home with everything it
+     * arrived with.
+     *
+     * <p>No roles, deliberately: a barrel that holds a pickaxe <em>is</em> the
+     * tool barrel, and the bot finds that out by opening it. The list is only
+     * ever ordered, never labelled, so nothing here needs the player to keep
+     * bookkeeping up to date.
+     */
+    private BehaviorStatus nextStop() {
+        stop++;
+        LOGGER.info("On to storage {} of {}: {}", stop + 1, route.size(), storage());
+        return enter(Phase.TO_STORAGE);
+    }
+
+    /**
+     * Say what is wrong with this storage and try the next one, or fail when it
+     * was the last.
+     */
+    private BehaviorStatus moveOn(String reason) {
+        if (stop + 1 >= route.size()) {
+            return fail(reason);
+        }
+        LOGGER.warn("Restock: {}", reason);
+        return nextStop();
+    }
+
+    /** The storage the bot is at or heading for. */
+    private StorageSite storage() {
+        return route.get(stop);
     }
 
     @Override
@@ -394,8 +495,9 @@ public class RestockBehavior implements BotBehavior {
     public String statusLine() {
         return switch (phase) {
             case LEAVE_SITE -> "leaving the work site";
-            case TO_STORAGE -> "walking to " + storage;
-            case OPEN -> "opening " + storage;
+            case TO_STORAGE -> "walking to " + storage()
+                    + " (" + (stop + 1) + " of " + route.size() + ")";
+            case OPEN -> "opening " + storage();
             case TRANSFER -> "sorting (" + deposited + " in, " + withdrawn + " out)";
             case CLOSE -> "closing up";
             case RETURN -> "walking back to " + shortPos(anchor);
@@ -417,18 +519,19 @@ public class RestockBehavior implements BotBehavior {
                 .storagesIn(ServerSettingsStore.dimensionOf(client)).isEmpty();
     }
 
-    /** Nearest of {@code candidates} to {@code from}, or null when there are none. */
-    private static StorageSite nearestStorage(List<StorageSite> candidates, BlockPos from) {
-        StorageSite best = null;
-        double bestDistance = Double.MAX_VALUE;
-        for (StorageSite site : candidates) {
-            double distance = site.pos().distSqr(from);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                best = site;
-            }
-        }
-        return best;
+    /**
+     * {@code candidates} ordered by distance from {@code from}, nearest first.
+     *
+     * <p>Sorted once, at the start, rather than re-picking the nearest unvisited
+     * one at every stop. The two orders barely differ for a row of barrels a
+     * block apart, and this one is a plan the bot can be asked about: stop three
+     * of thirty-three is a sentence, "the nearest one I have not tried yet" is
+     * not.
+     */
+    private static List<StorageSite> sortedStorages(List<StorageSite> candidates, BlockPos from) {
+        List<StorageSite> sorted = new ArrayList<>(candidates);
+        sorted.sort(Comparator.comparingDouble(site -> site.pos().distSqr(from)));
+        return sorted;
     }
 
     /** Whether the block there is still one of the configured storage kinds. */

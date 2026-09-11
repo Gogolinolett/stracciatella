@@ -37,7 +37,7 @@ net.stracciatella.pathfinding
 │   └── LevelChunkMixin.java          # Triggers mesh generation on chunk load
 └── test/
     ├── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
-    ├── JourneyTests.java             # In-game tests: a 400-block bridge, and an unloaded target
+    ├── JourneyTests.java             # In-game tests: a 400-block bridge, an unloaded target, and a way walled off mid-journey
     └── EnderPearlTests.java          # In-game tests: ender pearl throwing at various distances/elevations
 ```
 
@@ -240,6 +240,27 @@ is unchanged — `KEEP_RADIUS` (8) evicts meshes outside a window around the pla
 (2): a leg that ends no closer than it started is a stall, and the **second** one
 ends the journey — the first is what triggers an attempt to mend the way ahead,
 and that attempt deserves a leg to prove itself.
+
+**Standing still is not walking, and the leg timeout is the wrong bound for it.**
+`PathWalker.isActive()` stays true with the body pressed against a wall, so a leg
+whose path runs into one spends its full 600 ticks holding the forward key — and
+with three such legs in a row, a journey that had already failed took 90 seconds
+to say so. `STILL_TICKS_LIMIT` (100, five seconds — longer than any legitimate
+pause a walk has: a pre-jump hesitation is 12 ticks, a retreat a handful) is
+measured against `PROGRESS_EPSILON` from the last position the bot actually moved
+from, and ends the leg as a stall. Which is what makes the mend reachable at all:
+`STALLED_LEGS_LIMIT` promises the first stall triggers `tryBridge`, but the only
+path into it used to be A* returning an *empty* path — a bot wedged against a
+one-block step got the promise and never the attempt. The diagnostics go out on
+the failure path only (player position, the leg's own target and node count,
+distance left, best distance reached, whether the walker was still active): a WARN
+per leg would be noise on a route that works, and the ninety seconds of silence
+produced exactly three identical lines with nothing in them to tell a wall from a
+timeout. The fail message now names where the bot actually stopped and what the
+last leg was aiming at, because "no way towards X" on its own does not say whether
+the bot ever left. Pinned by *Journey gives up quickly when the way is walled off*,
+which walls off a 48-block walkway in front of a journey already under way and
+asserts it gives up within 400 ticks — 520 with the watchdog disabled, 70 with it.
 
 ### Placement: the pathfinder may build, if it is allowed to
 

@@ -87,10 +87,10 @@ IDLE → SCANNING → NAVIGATING → POSITIONING → LOOKING → INTERACTING →
 | **IDLE** | No active task, poll queue when new task enqueued | — |
 | **SCANNING** | `CameraController.aimAt` toward distant target, exit when `isAimedAt(scanFacingTolerance)` | `scanTimeout` |
 | **NAVIGATING** | PathWalker controls movement, bot monitors `isActive()` | `navigateTimeout` |
-| **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block. After a failed look (`forceApproach`) it walks to close range (2.0) instead of reach distance — the re-approach exists to change the viewpoint | `positionTimeout` |
+| **POSITIONING** | Fine-tune position if not within reach after navigation; walks while the camera (re-initialized from current rotation — PathWalker may have rotated the player) smoothly eases onto the target block. Arrives at `WORK_DISTANCE` (2.0), not at reach — see *The working distance* below — unless the walk stops closing, and after a failed look (`forceApproach`) with no such fallback, because that re-approach exists to change the viewpoint | `positionTimeout` |
 | **LOOKING** | `CameraController.aimAt` toward target block face + offset; on tick 1 also `selectBestTool` (carried-item packet runs in parallel with the camera turn) and roll a per-target look-speed. Exit the moment the client's `hitResult` is a `BlockHitResult` whose `getBlockPos()` equals the target — the crosshair touching the block is when a human clicks; no angular convergence required (the camera keeps easing toward its aim point during INTERACTING). A short `preAttackHesitation` (1–3 ticks) is held between the gate firing and the transition; during it the camera keeps aiming and micro-saccades are enabled. Continuing a seam skips the hesitation and keeps the previous camera. | `lookTimeout` |
 | **INTERACTING** | Calls `gameMode.startDestroyBlock`/`continueDestroyBlock` on the explicit target and swings the arm each tick like vanilla, polls `isAir()`, maintains camera via `aimAt` — switching the aim to the next queued block once the client already sees this one gone, so the wait for the server ack is spent turning; a fall due into the cell (gravel or sand on the target, or already on its way down its column) holds the phase after the confirmed break until it has landed, and the landed block is the task's next sub-target (see *Falling blocks*) | `maxBreakTicks`, the fall wait bounded on its own (`FALL_WAIT_TICKS`) |
-| **COLLECTING** | Walk toward visible drops or `lastMinedPos`, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); drops more than a block above or below the feet are not chased (`COLLECT_REACH_VERTICAL`), a step down to one is walked at the middle of its cell and a one-block rise on the way back is jumped (`stepUpIfBlocked`); exit once items have been observed and are all picked up | `collectWaitMax` |
+| **COLLECTING** | Walk toward visible drops, gaze following the drop at a capped ground-scan pitch (~38–52°, rolled per phase via `aimCollectGaze`; saccades on; look skipped when the item is nearly underfoot — unstable yaw target); drops more than a block above or below the feet are not chased (`COLLECT_REACH_VERTICAL`), a step down to one is walked at the middle of its cell and a one-block rise on the way back is jumped (`stepUpIfBlocked`); exit once items have been observed and are all picked up | `collectWaitMax` |
 | **EATING** | Only under `BotPolicy.autoEat`, and only at a task boundary (`startNextTask`, `continueSeam`): the biggest edible stack in hand, `keyUse` held until the food bar goes up, camera easing on toward its last aim point; then the interrupted transition runs | 60 ticks (`EAT_TIMEOUT_TICKS`) |
 
 **COLLECTING and POSITIONING walk on raw key presses** — no PathWalker under them, unlike NAVIGATING, and no reach/line-of-sight gate, unlike the opportunistic step during INTERACTING. COLLECTING's `walkToward` points the gaze at the drop, holds `keyUp`, and adds `keySprint` past two blocks; direction comes from the gaze and nothing else. A drop lies wherever it rolled, including over the lip of the shaft the bot just dug, so it needs its own floor check: `hasFloorWithinOneBlock` looks `STEP_LOOKAHEAD` (1.0) ahead along the gaze and releases the keys when there is no sturdy face under that cell or one below it. Without it the bot sprinted off its own platform and died of the fall. It is deliberately weaker than `isStandable`, which the opportunistic step uses: requiring head room and a collision-free cell made the bot refuse a drop lying against the face it had just mined, and it then stood still for the whole collect window. Walking into a wall costs nothing — only falling does.
@@ -101,9 +101,94 @@ POSITIONING needs the same refusal, and for a while did not have it. It walks wh
 
 **One block up is a jump.** Vanilla's auto-step is 0.6 blocks, so a raw-key walk that met a one-block rise stood against it until the position timeout — after collecting a drop from a block lower down, the bot never came back up. `stepUpIfBlocked` is asked by every raw-key walk except the crouched bridging step (a crouch-jump off a rim is the fall the crouch is there to prevent) and the opportunistic step during a break (which has to keep the target in reach): when the cell at foot height `STEP_UP_LOOKAHEAD` (0.6) ahead is solid, the two above it are free and there is head room over the bot, `keyJump` goes down for exactly one tick — released at the top of the next tick whatever that tick does, so it can never be left down — and the walk, still pressed, carries the body onto the ledge the way vanilla's auto-jump does. From further out the jump lands short of the top, and by the time the body is against the wall the cell ahead at foot height is the wall itself; `STEP_UP_COOLDOWN_TICKS` (10) keeps the decision from re-firing while the jump it just made is still in the air. POSITIONING's walk now goes through the same eight-direction key quantisation as every other walk (`walkToward`), which is also what stops a backwards edge-step key still held from cancelling it into standing still. Measured by `Bot steps up out of a dip` and `Bot collects from a dip and climbs back`.
 
+### The working distance: reach is a limit, not a place to stand
+
+`reachDistance` (4.0) used to answer two different questions — *can the bot touch
+this block* and *where should the bot stand to mine it* — and it is only an honest
+answer to the first. Arriving at 3.9 means the next cell of a sweep is at 4.9, out
+of reach, so every single block costs a fresh POSITIONING entry with its reaction
+beat instead of continuing the seam. `WORK_DISTANCE` (2.0) is the second answer,
+and POSITIONING walks to it; from there the next two cells are still in reach and
+the seam runs.
+
+**Nothing pulled the bot in before except an accident**, which is why this went
+unnoticed for so long: the COLLECTING walk to the drop it had just made ended up
+at the working face, so the bot was dragged to where it should have been standing
+anyway. Put cobblestone and dirt on `ignoredItems` and that accident stops
+happening — the list quite correctly stops the bot chasing drops, and with it the
+only thing that was ever closing the distance. Measured over 292 breaks of a real
+chunk-miner run (`BREAKWIRE` lines carry the distance): a block broken from under
+2.5 blocks was followed by the next break after **0.48 s**, one broken from over
+3.0 after **1.70 s** — the same sweep, the same rows, 3.5× the time, with every
+long gap showing `dist=3,5…3,8` and `invDelta=0`, and only a third of all drops
+ever landing in the vanilla pickup box.
+
+`closingIn` is the other half, and without it the change would be a regression
+rather than a fix. Some targets cannot be approached at all — one across a gap the
+floor check refuses to step into (correctly: the alternative is a fall), one
+straight overhead, where no heading shortens the distance — and for those the edge
+of reach really is the best place on offer. When the distance stops falling for
+`CLOSING_STALL_TICKS` (10), reach is accepted. Told only to close to 2.0, the phase
+would hold such a target for the whole `positionTimeout` (60) and then mine it
+anyway, so getting this wrong costs ticks on every such block rather than a
+failure — the kind of bug that hides.
+
+The state behind it is armed in `transitionTo`, not lazily on first use, and that
+distinction cost a run: `closingIn` is only *called* once the bot is in reach,
+which is never the phase's first tick, so a reset keyed on `phaseTicks` never ran.
+The counter then arrived carrying whatever the previous task had left in it and
+answered "stop trying" before the walk had taken a step — the bot started breaking
+from 3.67 blocks, the exact distance it was supposed to have stopped using, and the
+new test caught it.
+
+**The suite cannot show the gain, and that is worth knowing before trying to
+measure it there.** Every fixture collects its drops, so the bot was already being
+dragged to the face in all of them; the chunk miner's pace numbers are unchanged by
+this (16.5 / 13.8 / 13.8 per block, the same as before). The gain only exists where
+drops are *not* collected, and the suite had no such case — which is also why the
+two tests for this assert the **distance at the break** rather than a pace.
+
+**The same walk, while the break runs.** POSITIONING happens *before* a break, so
+a target that was already in reach when the task started never goes through it at
+all — that is every continuation of a seam and every `isWithinReach` hand-off
+straight to LOOKING — and the bot mined those from wherever it happened to be
+standing. `stepTowardWork` closes that: during INTERACTING the bot walks at the
+target column until `CONTACT_DISTANCE` (1.0), using the same 8-direction
+view-relative quantization the opportunistic strafe uses, so the body moves
+without the camera leaving the block. It is the last of three claimants on the
+movement keys in a tick — never while placing, then opportunistic collection (a
+drop beside the bot is worth more than half a block of approach), then this;
+whichever declines hands the tick on, and if all three decline the keys are
+released. The next block of a sweep is then already closer than reach when its
+task starts, which is the whole point: the time the bot is *not* mining is the
+time it spends arriving.
+
+**Walking up and stopping dead is not what a person does.** This walk ended at
+`WORK_DISTANCE` for a while, on the argument that closer bought nothing — and
+that is exactly what looked mechanical from outside: the bot arrived, stopped at
+a distance nobody would have picked, and swung at arm's length. Someone mining
+who has nothing to pick up simply keeps walking into the block. `CONTACT_DISTANCE`
+is not a standing distance and is not tuned to be one: a 0.6-wide body flush
+against a face stands 0.8 from its centre, so the walk is still pressed at 1.0,
+and what actually ends the approach is `isStepSafe` refusing the step that would
+put the feet in the target's own cell. It only keeps out the degenerate case of a
+block underfoot, where the `atan2` of a few centimetres is an arbitrary heading —
+the same geometry `aimPoint` has to special-case. `WORK_DISTANCE` (2.0) is
+untouched and still POSITIONING's arrival: that phase walks *before* the break
+and has no face to stand against yet.
+
+**Measured horizontally, in both places.** The 3-D eye→centre distance is the
+right answer to *can I reach this* and the wrong one to *should I walk*: mining
+the block under its own feet, the bot read 3.12 — nearly all of it the 1.1-block
+eye offset — stepped off on an `atan2` of a few centimetres of horizontal offset
+and wandered 3008.71 → 3008.57 → 3008.48 with its raycast on the block beneath
+it, which is how the chunk miner's staircase test started failing with `cannot
+break`. `horizontalDistanceTo` measures the only distance a walk can change. The
+3-D measure stays for `forceApproach`, where the question really is reach.
+
 ### Bridging: the placement that can only be made from the edge
 
-A block is placed on the side of an existing block, and one case of that cannot be aimed at from anywhere the bot would normally stand: a **vertical support face below the eye**. Every ray from an eye still horizontally over the block meets the block's own *top* face first, so the crosshair lands on the right block with the wrong `getDirection()` and the placement gate holds until `lookTimeout` — `face=east … hitResult=… (up)` in the log. It is the block the bot is standing on hiding its own side, and no re-approach fixes it: `approachOccluded` tests a sight line to the block's *centre*, which is clear the whole time.
+A block is placed on the side of an existing block, and one case of that cannot be aimed at from anywhere the bot would normally stand: a **vertical support face below the eye**. Every ray from an eye still horizontally over the block meets the block's own *top* face first, so the crosshair lands on the right block with the wrong `getDirection()` and the placement gate holds until `lookTimeout` — `face=east … hitResult=… (up)` in the log. It is the block the bot is standing on hiding its own side, and no re-approach fixes it: `approachOccluded` clips to the support block itself, and a ray that ends on the target counts as clear however the bot is standing on it. Which is why `needsEdgeStep` is asked *before* the occlusion rule in POSITIONING, not after.
 
 The move that works is the one a player bridges with, and the bot now makes it: **turn your back on the gap, crouch, walk backwards until the edge of the block underfoot comes into view, place**. The crouch is both halves of it. Vanilla's `maybeBackOffFromEdge` clips a crouched walk to positions where the bounding box still has support under it, so the bot cannot step off — and the same clip lets its centre, hence its eye, travel about 0.3 blocks *past* the rim, which is exactly where the side face stops being hidden. `EDGE_STEP_CLEARANCE` (0.1) is how far past the plane counts as arrived, well inside what the clip allows.
 
@@ -152,9 +237,11 @@ There is no fourth exit that leaves before conditions 1 and 2 with drops still o
 
 `itemsNearby` is measured on the same filtered set the walk uses, not on the raw 8-block query: an item more than 4 blocks above or below, or one the bot has walked at for `itemAbsenceTicks` without getting closer, is one it has decided never to approach. Counting those as "nearby" pins the flag true forever and the phase burns the full `collectWaitMax` — 1200 ticks of the bot standing still, which reads as it having quit. The give-up takes no opt-in: it applies to plain `/bot` tasks as much as to behaviors, because sixty ticks of walking without getting closer means the same thing whoever queued the task.
 
-While no items are visible yet, the bot walks toward `lastMinedPos` so the drop enters the AABB query as soon as the server syncs it. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
+Nothing is walked at before it has been seen. A blind walk toward `lastMinedPos` used to run while no drop had synced yet, so the bot would be inside the pickup box the moment the spawn arrived (STR-026). The working distance removed its premise — the break now ends about two blocks from the block, and the walk above closes that in roughly three ticks — and what was left was the one walk in this phase with no entity to measure, no progress watchdog and no step safety, which under load covered a full block of ground and carried the bot into the pickup box of a drop on the ignore list. `collectWaitMax` (400 accel ticks) is the hard timeout for drops that never become reachable.
 
-**Ignored drops** (`ignoredItems` in the config, edited by `/bot ignore` or the gui page) are drops the bot neither walks to nor waits for. The candidate loop skips them, so they are never `nearest` and never count as nearby — but a sighting still sets `itemsSeenThisCollect`, because the break did produce its drop and that is all the exit gate's first condition asks. The phase therefore ends the way a clean pickup would: at once with a task queued or `fastCollectExit`, after the absence window otherwise. The list is global, not per behavior: which drops are junk is a property of the world the player is in, not of the strategy. It decides only where the bot goes, never what it keeps — a drop that lands inside the vanilla pickup box is taken in passing, and the opportunistic strafe skips the same list. The break confirmation keeps counting every drop: an ignored drop is still proof that the block broke. A drop is ignored from the tick it exists on the client: until its spawn arrives, the walk toward `lastMinedPos` above applies to it like to any other drop, and under load that has been a whole block of walking — which is why the ignored-drop test measures against the pickup box, not against the standing spot.
+**Ignored drops** (`ignoredItems` in the config, edited by `/bot ignore` or the gui page) are drops the bot neither walks to nor waits for. The candidate loop skips them, so they are never `nearest` and never count as nearby — but a sighting still sets `itemsSeenThisCollect`, because the break did produce its drop and that is all the exit gate's first condition asks. The phase therefore ends the way a clean pickup would: at once with a task queued or `fastCollectExit`, after the absence window otherwise. The list is global, not per behavior: which drops are junk is a property of the world the player is in, not of the strategy. It decides only where the bot goes, never what it keeps — a drop that lands inside the vanilla pickup box is taken in passing, and the opportunistic strafe skips the same list. The break confirmation keeps counting every drop: an ignored drop is still proof that the block broke.
+
+**Standing still is not out of range**, and the working distance is what makes the difference visible. The bot now finishes its break about 1.7 blocks from the block it broke, and a drop is not a point on that block: it spawns up to a quarter block off centre and then pops and slides. Measured on one fixture over ten runs — a stone block mined from three blocks out, cobblestone ignored, the bot never walking at it — the final bot-to-drop distance ranged from **1.62 to 4.41 blocks**, so the drift alone spans more than the 1.425-block pickup box. Whether vanilla inhales an ignored drop is therefore not something the client decides; only *where the bot goes* is. The test follows: it summons a `NoGravity` cobblestone four blocks off on the bot's other side — inside the collect query, inside the vertical walk filter, and collectable, so the list is the only reason it is still lying there at the end — and asserts on *that*. The mined stone's own cobblestone still carries the other half, that an ignored drop in plain sight must not pin `itemsNearby` and hold the phase to `collectWaitMax`; whether vanilla inhaled that one in passing is deliberately not asserted.
 
 **The walk stops at 1.0 blocks, not 1.5.** Vanilla pickup is a box, not a radius: `Player.touch` queries `getBoundingBox().inflate(1.0, 0.5, 1.0)` and takes every item whose own box intersects it — 1.425 centre-to-centre on each horizontal axis for a 0.6-wide player and a 0.25-wide item. Stopping at 1.5 parked the bot *outside* that on a straight-ahead approach, so whether a drop was collected came down to how far the walk's momentum carried past the threshold. When it didn't, the bot stood over an item it could not reach for the whole `collectWaitMax`: that is the `Bot mine ore vein` timeout, which leaves all three drops on the ground and predates the behaviour layer (same fingerprint in archived runs from June).
 
@@ -285,7 +372,9 @@ It also restores head-before-feet within a column, which the chunk miner plans f
 
 The controller walks to a target only when it is **out of reach** — where the bot stands is otherwise the behavior's business. A block inside `reachDistance` with something in front of it therefore had no move at all: the raycast lands on the obstacle, the hit-result gate holds, and LOOKING burns its timeout. The one thing that looked like a fix does not cover it — the post-timeout re-approach closes to `APPROACH_CLOSE_DISTANCE` (2.0), and a bot two columns short of a corner is already at 1.4, so it "arrives" without moving and the second timeout kills the task.
 
-With the flag on, two things change. LOOKING detects the obstruction **geometrically** — `hasLineOfSight`, a clip from the eye to the target's centre — which does not care where the camera points and therefore fires on tick one instead of after `WRONG_HIT_STREAK_TICKS` of the crosshair resting on the wrong block. And POSITIONING then walks until *that line is clear* rather than until a distance is met: the sight line is the actual requirement, and the distance was only ever standing in for it.
+With the flag on, two things change. LOOKING detects the obstruction **geometrically** — `hasLineOfSight`, a clip from the eye to the target — which does not care where the camera points and therefore fires on tick one instead of after `WRONG_HIT_STREAK_TICKS` of the crosshair resting on the wrong block. And POSITIONING then walks until *that line is clear* rather than until a distance is met: the sight line is the actual requirement, and the distance was only ever standing in for it.
+
+**The clip goes to the face, and that is load-bearing.** It used to go to the block's centre while LOOKING aimed at a face — `aimPoint` on the face `faceTowardPlayer` picked — and the two rays do not answer the same question: the face centre is half a block nearer, so the ray to it is half a block steeper and clips obstacles the centre ray passes over. The flag was then worse than useless on exactly the geometry it was written for. POSITIONING's arrival test said "clear", so the re-approach arrived without a step, LOOKING spent its whole budget on a ray the obstacle stopped, and the task died — reported from a real chunk-miner run as three attempts from a position identical to two decimals, with `los=true` printed in the diagnostics of every one of them and the run ending on `cannot break -29, 82, -64`. Whatever the approach measures has to be the line the aim will use, or walking cannot clear it. The humanized aim offset (±0.3) is deliberately left out of the clip: it would make the same question get a slightly different answer on every call, and the face centre is the point the camera settles on. *Bot walks until the face it aims at is in sight* pins it by asserting the **step** rather than the break — with the bug the bot broke nothing from 0.00 blocks along, and a lucky offset occasionally lifts the ray over the corner on its own, which would make an outcome-only assertion report the weather.
 
 Still bounded exactly as before — `lookRetryUsed` allows one approach per task, and a target that stays hidden runs out the position timeout, returns to LOOKING and fails there.
 
@@ -419,12 +508,60 @@ that looks busy and never mines a block.
 
 | Phase | Behavior |
 |-------|----------|
-| **LEAVE_SITE** | Nothing at all under `STAIRCASE`. Under `COMMAND`: stop everything, hold the spot for `teleportStandStillTicks`, send `exitCommands`, then wait for the position to **jump** (`TELEPORT_JUMP_DISTANCE`, 32 blocks). Any movement restarts the count rather than sending a command the server is about to refuse. |
-| **TO_STORAGE** | `Journey.start(nearest chest in this dimension)` — the pathfinding module's layer for a target that may not even be loaded yet. |
-| **OPEN** | One `OpenContainerTask`. A block that is no longer a storage block, or a task that ran without a screen appearing, fails with a named reason instead of clicking forever. |
-| **TRANSFER** | One shift-click per `restockClickDelay`: deposit first, then withdraw. Deposit before withdraw because a withdrawal needs somewhere to land, and the loot is what is filling the slots. |
-| **CLOSE** | `closeContainer()`. `abort()` does it too — a chest screen left open holds the bot's hands for the rest of the session, and the next behavior's clicks go into the container instead of into the world. |
+| **LEAVE_SITE** | Nothing at all under `STAIRCASE`. Under `COMMAND`: stop everything, hold the spot until it has actually stopped moving (`SETTLE_TICKS`, 10), send `exitCommands` at once, then wait for the position to **jump** (`TELEPORT_JUMP_DISTANCE`, 32 blocks), bounded by `teleportWaitTicks`. Movement matters only *before* the send, where it means the bot is still sliding; after it, movement is the very thing being waited for — see the two halves below. |
+| **TO_STORAGE** | `Journey.start(...)` on the current stop of the route — the pathfinding module's layer for a target that may not even be loaded yet. |
+| **OPEN** | One `OpenContainerTask`. A block that is no longer a storage block, or a task that ran without a screen appearing, is walked past rather than failed (below). |
+| **TRANSFER** | One shift-click per `restockClickDelay`: deposit first, then withdraw. Deposit before withdraw because a withdrawal needs somewhere to land, and the loot is what is filling the slots. Decides, while the menu is still open, whether the trip has work left. |
+| **CLOSE** | `closeContainer()`. `abort()` does it too — a chest screen left open holds the bot's hands for the rest of the session, and the next behavior's clicks go into the container instead of into the world. Then either the next stop or home. |
 | **RETURN** | `Journey` back to the anchor, which is simply where the bot stood when the shortfall was noticed: the runner suspends on that tick, so nothing has moved yet and nobody has to remember to record it earlier. |
+
+**A camp is a row of barrels, and one of them is full.** The trip therefore walks
+a **route**, not a chest: `sortedStorages` puts every storage of this dimension in
+distance order from the work site at `start()`, and `stop` indexes it. Three things
+move the trip on to the next one, and all three used to end it instead — measured
+on a real server with 33 barrels, where the first one was full and the bot came
+home with every block it had set out with, `Transfer stalled` in the log and
+nothing in any barrel:
+
+- the container **would not take** another stack (`TRANSFER_STALL_TICKS`, below) —
+  there is work left by construction, since the planner had just named the click;
+- the manifest is **still short** when the menu holds nothing it wants
+  (`shortfall` re-asked at the end of `TRANSFER`) — another barrel may have the
+  pickaxe;
+- the site is **not a container any more**, or its screen never opened — someone
+  broke the barrel, which is a fact about that stop and not about the trip.
+
+All three go through `moveOn`, which walks past with a warning while a stop is
+left and fails with the original reason only at the end of the list. A site is
+never struck off `servers.json`: the bot is not the authority on what the player's
+camp looks like, and a barrel that is full today is the right barrel tomorrow.
+Whether work is left is decided in `TRANSFER` while the menu is still open, where
+the answer is cheap and certain, and read by `CLOSE` — which is also why a trip
+that fills up the first barrel and needs nothing back goes straight home rather
+than touring the camp. Sorting by distance is `RestockBehavior`'s own business
+rather than the store's, because "nearest" is nearest *to the work site*, and only
+the trip knows where that is. Pinned by *Bot moves on when the nearest storage is
+full*, which puts a deliberately-full barrel nearest and registers the route
+far-first so the ordering is under test too.
+
+**The send is early and the jump is the arrival** — two halves of `LEAVE_SITE`
+that both went wrong in a real run, and both for the same reason: the server's
+standstill rule was modelled in the wrong place. The server starts its count when
+the command *arrives*, so holding still for 240 ticks first spent those seconds
+twice — measured as twelve seconds between "Restocking" and the command reaching
+the wire, with the teleport landing in the same second it finally did. And the
+branch that restarted the count on any movement sat in front of the jump check,
+so it swallowed the one event the phase exists to notice: the jump **is**
+movement. The bot held its new spot for another count, sent the command again —
+teleporting it to where it already stood, leaving not even a position change to
+see — and gave up with "exit commands did not teleport the bot" after a log that
+shows the server teleporting it twice. So: before the send, movement means the
+bot is still sliding and the settle restarts; after the send, nothing reacts to
+movement at all and `standstillFrom` never moves, which is also what lets a nudge
+from a mob be survivable — the jump is still measured from where the command went
+out. Both halves are pinned by *Bot sends its exit command at once and reads the
+teleport*, which fails with a tick budget for the first and a status line for the
+second.
 
 **The way out is per server; the way back is always on foot.** Which exit exists
 is a fact about the server, not a preference — `/t spawn` and its standstill rule
@@ -450,7 +587,8 @@ the precision buys nothing: a restock that comes back with 64 cobblestone instea
 of 37 is not a worse restock. `move` then checks that the slot actually changed —
 a chest with no room answers a shift-click by doing nothing at all, and the same
 slot would come back from the planner forever; `TRANSFER_STALL_TICKS` (60) closes
-up instead. The check reads the slot straight after the click, i.e. it reads the
+up and takes the trip to the next storage instead. The check reads the slot
+straight after the click, i.e. it reads the
 client's own prediction, which is exactly what is wanted: a click the client
 could not satisfy is one the server will not satisfy either.
 
@@ -627,8 +765,7 @@ Restocking (see *Restocking*; where a chest **is** is per server in `servers.jso
 - `storageBlocks` — block ids a restock may open (default chest, trapped chest, barrel). Ids rather than "any block entity that is a `Container`": that would also catch hoppers, droppers and furnaces, and a bot tipping its diamonds into a hopper is a bug report
 - `routeBlocks` — what `RoutePlacer` bridges a route with, first one carried wins. Deliberately its own list and not the miner's `fillerBlocks`: same contents by default, different owner, different question, and only this one is governed by a per-server permission
 - `restockClickDelayMin` / `restockClickDelayMax` — uniform gap between two stack moves in an open container (default 2–5). Shift-clicking thirty stacks in one tick is not a person
-- `teleportStandStillTicks` — ticks held perfectly still before the exit commands go out (default 240), for servers that cancel a teleport on movement
-- `teleportWaitTicks` — bound on believing in the teleport afterwards (default 200). Arrival is the position jumping, not this running out — the standstill requirement is a server's setting and the next server's is a different number
+- `teleportWaitTicks` — bound on believing in the teleport after the commands went out (default 400). Arrival is the position jumping, not this running out. It has to cover the server's **own** standstill count, because that count starts when the command arrives: there used to be a second setting for holding still *before* sending, which spent the same seconds a second time and bought nothing
 
 ## Dependencies
 
@@ -643,14 +780,29 @@ Restocking (see *Restocking*; where a chest **is** is per server in `servers.jso
 Tests in `test/BotTests.java`, registered via `TestRunner.instance().registerSuite(BotTests.class)`.
 Run via `./gradlew runMinecraftTests`. Each test builds its environment with `/fill` + `/setblock`.
 
-Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, and the `/bot server exit command` argument against servers.json.
+Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, a restock whose nearest barrel is full, the `/bot server exit command` argument against servers.json, an exit command driven against a real teleport, an occluded approach that has to walk before it may break, a block walked up to instead of reached for, one closed in on while the break is already running, and one across a trench that has to be mined from where the bot stands.
+
+**The suite reads the player's live `stracciatella/bot.json`**, and that is a trap worth naming: with `ignoredItems` set to cobblestone and dirt — a perfectly reasonable thing for a player to want — thirteen tests fail, because they assert that the bot collects the cobblestone it mines and the config forbids exactly that. Measured both ways in one sitting: 16 failures with that list, 4 with it empty, nothing else changed. A suite whose result depends on what was last typed in-game cannot tell a regression from a setting, so set the file aside before reading a run as a verdict. The same file is why a test that edits `ignoredItems` in memory must restore it *conditionally*: adding an entry the player already had is a no-op, removing it afterwards is not, and `Bot ignore commands edit the list` saves the config later in the same run.
+
+**A fixture that places a drop has to place the bot too**, and the contact walk is
+what made that explicit. `Bot collects from a dip and climbs back` put its drop
+0.7 blocks off the bot's centre, which is just inside the half-block radius that
+holds the gaze — the code the test exists for — on the unstated assumption that
+the bot would still be standing where it started when the collect began. With
+the walk during the break it is not: mining a block two out, it ends the break a
+block nearer, the drop is 1.1 away and behind it, the hold never engages and
+turning round for it costs 187 degrees of perfectly reasonable yaw against a bar
+of 120. The block under test moved inside `CONTACT_DISTANCE` so the bot mines it
+from where it stands; the drop, the bar and the assertion are untouched. Worth
+knowing before reading such a failure as a regression — and before placing a drop
+relative to a start position in a new one.
 
 The policy tests drive a `PolicyProbeBehavior` defined inside `BotTests` — the policy layer is only reachable through a behavior, so the guards need one to be testable at all. The three eating tests run the food bar down with the hunger effect at amplifier 255 (a food point every three ticks or so) and clear it again before the run, so the bar is low and stays put — on Easy, switched for the test and back to Peaceful in a `finally`, because the test world is Peaceful and Peaceful never takes a food point (`FoodData.tick` drains saturation only there).
 
 - **fast collect exit** summons a `NoGravity` item 6 blocks up (inside the 8-block collect query, outside the 4-block walk filter) and asserts the run finishes in fewer than `collectWaitMax` ticks with the decoy still present, the block actually mined, and the cobblestone in the inventory. Without the flag the decoy's mere presence pins the phase until the timeout; the last two assertions exist so "exits sooner" can't quietly become "exits without collecting".
 - **opportunistic collection** puts a drop 2.5 blocks to the bot's *side* — perpendicular to the block being mined, so reaching it is a pure strafe — and asserts the bot closes at least 0.5 blocks **while still in INTERACTING**. This is what pins down the view-relative sign convention, which has no other coverage. It mines **obsidian with a diamond pickaxe**: ~187 ticks of INTERACTING, long enough to observe the walk, and it still drops. Mining bare-handed for a slow break does not work — stone without a pickaxe drops nothing, so the break never produces an artifact, never confirms, and ends in a `maxBreakTicks` timeout instead of the phase the test needs to watch.
 
-The three restock tests drive a `RestockProbeBehavior`, also defined inside
+The restock tests drive a `RestockProbeBehavior`, also defined inside
 `BotTests`: a manifest of one diamond pickaxe, `BotPolicy.none()`, and a `tick`
 that counts its own starts and succeeds on the second. Counting starts is how
 "suspended and resumed" is observable at all, given that resume *is* `start()`.
@@ -676,6 +828,15 @@ that counts its own starts and succeeds on the second. Counting starts is how
   by it: this is the test that makes a manifest safe to have on by default, and
   it is the one that would have caught `chunkMinerRestock = true` turning a fresh
   install's first run into an instant failure.
+- **moves on when the nearest storage is full** — two barrels, the near one
+  packed with 27 stacks of dirt and the far one holding the pickaxe the manifest
+  wants, registered **far-first** so the distance ordering is under test rather
+  than assumed from the file order. Asserts the probe started twice, that the
+  pickaxe came back, that no cobblestone did, and — the two that separate "moved
+  on" from "gave up" — that the full barrel holds **no** cobblestone and the
+  spare holds all 64. Both counts are read from the singleplayer server for the
+  reason above. Falsified by making the stall end the trip: the bot then comes
+  home with the cobblestone and the barrels are as they started.
 
 **exit command reaches servers.json** covers the one thing about
 `/bot server exit command` that is invisible until a restock actually tries to
@@ -686,5 +847,24 @@ verified by making it one), that a leading slash is stripped (verified by
 removing the strip: `[/t spawn]`), that a second command replaces the first, and
 that switching to `staircase` and back keeps it. The reload from disk is the
 assertion for all of them.
+
+**sends its exit command at once and reads the teleport** is the same feature
+driven against a real teleport rather than against the file: `exitCommands` is a
+`tp` to a landing pad 48 blocks off, past the 32 that separate a teleport from a
+nudge. Two assertions, one per half of the bug (both measured in a real run): the
+command has to have worked inside `SEND_BUDGET_TICKS` (60 — it takes 20, and used
+to take 250), and 20 ticks after the jump the runner's status line has to read
+"walking to", because the jump is the arrival. Nothing walks the way back here;
+the round trip is the previous test's job.
+
+**walks until the face it aims at is in sight** is the `approachOccluded` clip,
+with one stone beside the bot and the target three along: the ray to the target's
+middle passes over that stone, the ray to the face the bot will aim at clips its
+corner. It asserts **where the bot stands when the pick goes in** — at least
+`MIN_APPROACH_STEP` (0.2) off the start, where the bug managed 0.00 — and not
+merely that the block fell, because the ±0.3 aim offset lifts the ray over the
+corner often enough to make an outcome-only assertion flaky. The position is read
+in INTERACTING, since the collect walk afterwards moves the bot whatever the
+approach did.
 
 **The player-attack path has no in-game test** — it needs a second player swinging at the bot. Its two real failure modes (never firing, firing on the bot's own swing) are covered by plain JUnit in `src/test/.../safety/BotAlarmTest.java`, which is why `BotAlarm.isAttackerInRange` takes bare doubles instead of Minecraft types. Run with `./gradlew :modules:bot:test`.

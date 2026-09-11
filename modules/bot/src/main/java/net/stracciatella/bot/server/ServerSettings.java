@@ -31,10 +31,11 @@ public class ServerSettings {
          */
         STAIRCASE,
         /**
-         * Stand perfectly still for {@code teleportStandStillTicks} and then
-         * send {@link ServerSettings#exitCommands} — the {@code /t spawn}
-         * arrangement many servers use, where movement cancels the teleport.
-         * Arrival is detected by the position jumping, not by a timer.
+         * Come to a stop and send {@link ServerSettings#exitCommands} from
+         * there — the {@code /t spawn} arrangement many servers use, where the
+         * server counts its own seconds from the command and movement cancels
+         * the teleport. Arrival is detected by the position jumping, not by a
+         * timer; {@code teleportWaitTicks} only bounds the believing.
          */
         COMMAND
     }
@@ -42,8 +43,8 @@ public class ServerSettings {
     public ExitStrategy exitStrategy = ExitStrategy.STAIRCASE;
 
     /**
-     * Commands sent (without the leading slash) once the bot has stood still
-     * long enough, when {@link #exitStrategy} is {@link ExitStrategy#COMMAND}.
+     * Commands sent (without the leading slash) as soon as the bot has come to
+     * a stop, when {@link #exitStrategy} is {@link ExitStrategy#COMMAND}.
      * Empty by default: a bot that types into the chat of a server nobody
      * configured is a bot that gets its owner in trouble.
      *

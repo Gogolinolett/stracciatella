@@ -14,6 +14,7 @@ import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.bot.behavior.BehaviorStatus;
 import net.stracciatella.bot.behavior.BotBehavior;
+import net.stracciatella.bot.behavior.RestockBehavior;
 import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
@@ -936,11 +937,22 @@ public class BotTests {
      * steps down; the next task is then out of reach from the dip, so it has
      * to jump the rim to get on with it. Asserts both pickups, the second
      * block mined from platform level, and a collect well short of a spin.
+     *
+     * <p>The first block sits inside the controller's {@code CONTACT_DISTANCE} on
+     * purpose, and that is a property of the fixture rather than of the feature:
+     * the bot mines it from where it stands, so "0.7 blocks off its centre"
+     * still describes the drop when the collect begins, and the drop is inside
+     * the radius that holds the gaze — the code this test exists for. Two
+     * blocks out the bot walks into the block while breaking, ends the break a
+     * block nearer it, and the drop is then 1.1 away and behind: the hold never
+     * engages, nothing under test runs, and turning round for it costs a
+     * perfectly reasonable 187 degrees. A fixture that pins where the drop is
+     * has to pin where the bot is standing too.
      */
     @MinecraftTest(name = "Bot collects from a dip and climbs back", timeoutTicks = 400, order = -179)
     public void collectsFromADipAndClimbsBack(TestContext ctx) {
         final BlockPos origin = new BlockPos(2000, 30, 1000);
-        final BlockPos first = origin.offset(0, 0, -2);
+        final BlockPos first = origin.offset(0, 0, -1);
         final BlockPos second = origin.offset(-4, 0, 0);
         final BlockPos dip = origin.offset(1, -1, 0);
 
@@ -1043,23 +1055,43 @@ public class BotTests {
     }
 
     // ================================================================
-    // Test 22: an ignored drop is left where it fell, without a wait
+    // Test 22: an ignored drop is neither walked to nor waited for
     // ================================================================
     /**
      * A drop on the ignore list is one the bot neither walks to nor waits
-     * for. The block is mined from three blocks out — in reach, and far
-     * enough that its cobblestone lands outside the vanilla pickup box, so
-     * only a walk could collect it. With cobblestone ignored the run has to
-     * end with the drop still on the ground, the bot still where it stood,
-     * and COLLECTING over inside the absence window rather than at
-     * {@code collectWaitMax}, which is what an uncollected drop in sight used
-     * to cost. The list is edited in place and restored, never saved: the
-     * test must not leave a real config behind with cobblestone on it.
+     * for, and both halves are asserted here on a drop it could perfectly
+     * well have fetched: a cobblestone item standing four blocks off on the
+     * bot's other side, inside the 8-block collect query and inside the
+     * vertical walk filter, so the list is the only reason it is still there
+     * at the end. It is summoned {@code NoGravity} and collectable — an
+     * infinite {@code PickupDelay} like the fast-collect decoy's would make
+     * the assertion hold with or without the list, and prove nothing.
+     *
+     * <p>The bot's own drop cannot carry this test any more, which is worth
+     * knowing before someone writes it that way again. Since the working
+     * distance the break ends about 1.7 blocks from the block; a drop spawns
+     * up to a quarter block off centre and then pops and slides, and across
+     * eleven runs of the fixture that asserted on the mined block's own
+     * cobblestone the final bot-to-drop distance came out anywhere between
+     * 1.62 and 4.41 blocks. The vanilla pickup box is 1.425 and vanilla
+     * pickup is server-side, so "the drop is still on the ground" was a coin
+     * toss about the drift, not a statement about the bot.
+     *
+     * <p>The mined stone still carries the waiting half: its cobblestone is
+     * on the same list, so an ignored drop lying in plain sight must not pin
+     * {@code itemsNearby} — the phase has to end inside the absence window
+     * instead of at {@code collectWaitMax}, which is what an uncollected
+     * drop in sight used to cost. Whether vanilla inhaled that one in
+     * passing is deliberately not asserted.
+     *
+     * <p>The list is edited in place and restored, never saved: the test
+     * must not leave a real config behind with cobblestone on it.
      */
     @MinecraftTest(name = "Bot ignores a listed drop", timeoutTicks = 400, order = -177)
     public void ignoresListedDrop(TestContext ctx) {
         final BlockPos origin = new BlockPos(2100, 30, 1000);
         final BlockPos target = origin.offset(3, 0, 0);
+        final BlockPos bait = origin.offset(-4, 0, 0);
         final String cobblestone = "minecraft:cobblestone";
 
         setupTest(ctx, origin);
@@ -1068,8 +1100,19 @@ public class BotTests {
         ctx.runCommand("give @s diamond_pickaxe");
         switchToSurvivalAt(ctx, origin, origin.getY());
 
+        // Whether it was already on the player's own list decides whether the
+        // finally may take it off again: an add that was a no-op must not be
+        // undone by a removal that is not, or the test quietly edits a real
+        // config — and a later test in the same run saves that file.
+        final boolean alreadyIgnored = ctx.computeOnClient(mc ->
+                BotController.CONFIG.ignoredItems.contains(cobblestone));
         ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.add(cobblestone));
         try {
+            ctx.runCommand("summon item " + (bait.getX() + 0.5) + " " + bait.getY()
+                    + " " + (bait.getZ() + 0.5)
+                    + " {Item:{id:\"minecraft:cobblestone\",count:1},NoGravity:1b}");
+            ctx.waitFor(mc -> countBaitAt(ctx, bait) == 1);
+
             long startTick = ctx.computeOnClient(mc -> mc.level.getGameTime());
             ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(target)));
             waitForBotIdle(ctx);
@@ -1078,39 +1121,30 @@ public class BotTests {
             if (ctx.computeOnClient(mc -> !mc.level.getBlockState(target).isAir())) {
                 throw new AssertionError("Block was never mined");
             }
-            if (countItem(ctx, Items.COBBLESTONE) > 0) {
+            if (countBaitAt(ctx, bait) != 1) {
                 throw new AssertionError("The ignored cobblestone was collected");
             }
-            int onGround = ctx.computeOnClient(mc -> mc.level.getEntities(
-                    net.minecraft.world.entity.EntityType.ITEM,
-                    new net.minecraft.world.phys.AABB(target).inflate(4.0), item -> true).size());
-            if (onGround != 1) {
-                throw new AssertionError("Expected the cobblestone lying at the block, found "
-                        + onGround + " drops there");
-            }
-            // The bot stood its ground: a collect walk ends inside the pickup
-            // box, one block from the drop. Only the box counts as having
-            // walked there: until the spawn of the drop reaches the client
-            // the phase walks at the mined block whatever is going to lie
-            // there, and under load that sync has taken long enough for a
-            // whole block of it (1.97 blocks left of 3, once, in a full run).
-            double toDrop = ctx.computeOnClient(mc -> {
-                var drop = mc.level.getEntities(net.minecraft.world.entity.EntityType.ITEM,
-                        new net.minecraft.world.phys.AABB(target).inflate(4.0), item -> true).get(0);
-                return horizDistTo(mc, drop.getX(), drop.getZ());
-            });
-            if (toDrop < 1.5) {
+            // The bait starts at exactly four blocks and the work is in the
+            // other direction, so the distance can only grow. Any approach at
+            // all is the regression; 3.5 leaves room for the collect walk to
+            // the mined block's own drop and nothing more.
+            double toBait = ctx.computeOnClient(mc ->
+                    horizDistTo(mc, bait.getX() + 0.5, bait.getZ() + 0.5));
+            if (toBait < 3.5) {
                 throw new AssertionError(String.format(
-                        "Bot walked to the ignored drop (%.2f blocks from it)", toDrop));
+                        "Bot walked at the ignored drop (%.2f blocks from it, started at 4.00)",
+                        toBait));
             }
             if (elapsed >= BotController.CONFIG.collectWaitMax) {
-                throw new AssertionError("COLLECTING waited for the ignored drop: " + elapsed
+                throw new AssertionError("COLLECTING waited for the ignored drops: " + elapsed
                         + " ticks, collectWaitMax is " + BotController.CONFIG.collectWaitMax);
             }
-            LOGGER.info("Ignored drop test passed ({} ticks, {} blocks from the drop)",
-                    elapsed, String.format("%.2f", toDrop));
+            LOGGER.info("Ignored drop test passed ({} ticks, {} blocks from the bait)",
+                    elapsed, String.format("%.2f", toBait));
         } finally {
-            ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.remove(cobblestone));
+            if (!alreadyIgnored) {
+                ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.remove(cobblestone));
+            }
         }
     }
 
@@ -1465,25 +1499,7 @@ public class BotTests {
                 throw new AssertionError("The bot kept " + countItem(ctx, Items.COBBLESTONE)
                         + " cobblestone — loot the manifest does not mention belongs in the chest");
             }
-            // Asked of the server, not of mc.level: a client-side
-            // ChestBlockEntity never holds its contents — getUpdateTag sends
-            // none — so the client's copy reads empty however the deposit went.
-            // Submitted to the server thread and joined on the test thread, so
-            // the read is both authoritative and not a torn off-thread peek.
-            final MinecraftServer server = ctx.computeOnClient(mc -> mc.getSingleplayerServer());
-            int inChest = server.submit(() -> {
-                if (!(server.overworld().getBlockEntity(chest)
-                        instanceof net.minecraft.world.level.block.entity.ChestBlockEntity box)) {
-                    return -1;
-                }
-                int found = 0;
-                for (int slot = 0; slot < box.getContainerSize(); slot++) {
-                    if (box.getItem(slot).is(Items.COBBLESTONE)) {
-                        found += box.getItem(slot).getCount();
-                    }
-                }
-                return found;
-            }).join();
+            int inChest = countInContainer(ctx, chest, Items.COBBLESTONE);
             if (inChest < 64) {
                 throw new AssertionError("The chest holds " + inChest
                         + " cobblestone, expected the whole deposited stack of 64");
@@ -1566,6 +1582,137 @@ public class BotTests {
     }
 
     // ================================================================
+    // Test 29: a full barrel is not the end of the trip
+    // ================================================================
+
+    /**
+     * A camp is a row of barrels, and the nearest one is full.
+     *
+     * <p>Reported from a real run: thirty-three barrels on record, the bot opened
+     * the nearest, found no room, logged {@code Transfer stalled after 0 in, 0
+     * out} and walked home with everything it had arrived with — and the run then
+     * stopped on the same full inventory that had sent it. One container is
+     * therefore never the trip: a stall means <em>this</em> one cannot help, and
+     * the answer is the next one.
+     *
+     * <p>Barrels rather than chests on purpose. It is what the report came from,
+     * and it pins the block id list doing its job — {@code storageBlocks} has to
+     * accept a barrel both when the site is chosen and when {@code tickOpen}
+     * checks that the block is still a container.
+     */
+    @MinecraftTest(name = "Bot moves on when the nearest storage is full",
+            timeoutTicks = 1200, order = -168)
+    public void restockWalksPastAFullStorage(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1500, 30, 1500);
+        final BlockPos full = origin.offset(2, 0, 0);
+        final BlockPos spare = origin.offset(6, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + full.getX() + " " + full.getY() + " " + full.getZ()
+                + " barrel");
+        ctx.runCommand("setblock " + spare.getX() + " " + spare.getY() + " " + spare.getZ()
+                + " barrel");
+        ctx.waitFor(mc -> mc.level.getBlockState(full).is(Blocks.BARREL)
+                && mc.level.getBlockState(spare).is(Blocks.BARREL));
+        // Every one of the twenty-seven slots, because a shift-click only has to
+        // find one gap. Dirt, which no manifest here mentions and no stack of
+        // cobblestone can merge into.
+        for (int slot = 0; slot < 27; slot++) {
+            ctx.runCommand("item replace block " + full.getX() + " " + full.getY() + " "
+                    + full.getZ() + " container." + slot + " with minecraft:dirt 64");
+        }
+        ctx.runCommand("item replace block " + spare.getX() + " " + spare.getY() + " "
+                + spare.getZ() + " container.0 with minecraft:diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        ctx.runCommand("give @s cobblestone 64");
+        ctx.waitFor(mc -> countItems(mc.player.getInventory(), Items.COBBLESTONE) >= 64);
+        generateMesh(ctx, origin);
+
+        final List<StorageSite> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().storages));
+        final RestockProbeBehavior probe = new RestockProbeBehavior();
+        try {
+            ctx.runOnClient(mc -> {
+                ServerSettings settings = ServerSettingsStore.current();
+                settings.storages.clear();
+                settings.exitStrategy = ServerSettings.ExitStrategy.STAIRCASE;
+                String dimension = ServerSettingsStore.dimensionOf(mc);
+                // Added nearest last, so the ordering under test is the one the
+                // behavior computes and not the one the list happens to carry.
+                settings.storages.add(StorageSite.of(dimension, spare));
+                settings.storages.add(StorageSite.of(dimension, full));
+                BehaviorRunner.register(probe);
+                BehaviorRunner.start(RestockProbeBehavior.ID);
+            });
+
+            ctx.waitFor(mc -> !BehaviorRunner.isActive());
+            ctx.runOnClient(mc -> BotController.stop());
+
+            if (probe.starts != 2) {
+                throw new AssertionError("The probe was started " + probe.starts
+                        + " times, expected 2 (start, then resume after the restock)");
+            }
+            if (countItem(ctx, Items.DIAMOND_PICKAXE) < 1) {
+                throw new AssertionError("The bot came home without the pickaxe; it lay in the"
+                        + " second barrel, which is the one the trip never reached");
+            }
+            int leftBehind = countItem(ctx, Items.COBBLESTONE);
+            if (leftBehind > 0) {
+                throw new AssertionError("The bot kept " + leftBehind + " cobblestone — a full"
+                        + " barrel is a reason to walk to the next one, not to take the loot"
+                        + " home");
+            }
+            int inFull = countInContainer(ctx, full, Items.COBBLESTONE);
+            if (inFull > 0) {
+                throw new AssertionError("The full barrel gained " + inFull + " cobblestone,"
+                        + " so the fixture was not full and nothing was tested");
+            }
+            int inSpare = countInContainer(ctx, spare, Items.COBBLESTONE);
+            if (inSpare < 64) {
+                throw new AssertionError("The second barrel holds " + inSpare + " cobblestone,"
+                        + " expected the whole stack of 64");
+            }
+            LOGGER.info("Full-storage test passed: 64 cobblestone went into the second barrel");
+        } finally {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+                ServerSettingsStore.current().storages.clear();
+                ServerSettingsStore.current().storages.addAll(before);
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    /**
+     * How many of {@code item} the container at {@code pos} holds, asked of the
+     * server.
+     *
+     * <p>Not of {@code mc.level}: a client-side container block entity never holds
+     * its contents — {@code getUpdateTag} sends none — so the client's copy reads
+     * empty however the deposit went. Submitted to the server thread and joined on
+     * the test thread, so the read is both authoritative and not a torn
+     * off-thread peek. Returns -1 when there is no container there at all, which
+     * no assertion should ever accept quietly.
+     */
+    private int countInContainer(TestContext ctx, BlockPos pos, net.minecraft.world.item.Item item) {
+        final MinecraftServer server = ctx.computeOnClient(mc -> mc.getSingleplayerServer());
+        return server.submit(() -> {
+            if (!(server.overworld().getBlockEntity(pos)
+                    instanceof net.minecraft.world.Container box)) {
+                return -1;
+            }
+            int found = 0;
+            for (int slot = 0; slot < box.getContainerSize(); slot++) {
+                if (box.getItem(slot).is(item)) {
+                    found += box.getItem(slot).getCount();
+                }
+            }
+            return found;
+        }).join();
+    }
+
+    // ================================================================
     // Test 28: /bot server exit command writes the command it was given
     // ================================================================
 
@@ -1622,6 +1769,453 @@ public class BotTests {
             });
         }
     }
+
+    // ================================================================
+    // Test 29: the exit command goes out at once, and the jump is the arrival
+    // ================================================================
+
+    /**
+     * The {@code COMMAND} way out of a pit, driven end to end against a real
+     * teleport: the command has to go on the wire as soon as the bot has stopped
+     * walking, and the position jumping afterwards has to be read as the arrival
+     * it is.
+     *
+     * <p>Both halves failed in a real run and the log shows them one after the
+     * other. The command went out twelve seconds after the restock began,
+     * because the bot first stood still for {@code teleportStandStillTicks} —
+     * a count the server starts when the command ARRIVES, so spending it first
+     * bought nothing. Then the teleport landed, was swallowed by a branch that
+     * restarted the whole wait on any movement, and the restock finally gave up
+     * with "exit commands did not teleport the bot" after a log that shows the
+     * server teleporting the bot twice.
+     *
+     * <p>So the two assertions are a tick budget and the phase after
+     * LEAVE_SITE. The camp is 48 blocks off, comfortably past the 32 that
+     * separate a teleport from a nudge, and nothing here walks the way back:
+     * the round trip is the previous test's job.
+     */
+    @MinecraftTest(name = "Bot sends its exit command at once and reads the teleport",
+            timeoutTicks = 600, order = -168)
+    public void exitCommandTeleportsAndIsNoticed(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1500, 30, 1500);
+        final BlockPos chest = origin.offset(6, 0, 0);
+        final BlockPos camp = origin.offset(0, 0, -48);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        buildPlatform(ctx, camp, 3);
+        ctx.runCommand("setblock " + chest.getX() + " " + chest.getY() + " " + chest.getZ()
+                + " chest");
+        ctx.waitFor(mc -> mc.level.getBlockState(chest).is(Blocks.CHEST));
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        final ServerSettings.ExitStrategy beforeStrategy = ctx.computeOnClient(
+                mc -> ServerSettingsStore.current().exitStrategy);
+        final List<String> beforeCommands = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().exitCommands));
+        final List<StorageSite> beforeStorages = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().storages));
+        final RestockProbeBehavior probe = new RestockProbeBehavior();
+        try {
+            ctx.runOnClient(mc -> {
+                ServerSettings settings = ServerSettingsStore.current();
+                settings.storages.clear();
+                settings.storages.add(
+                        StorageSite.of(ServerSettingsStore.dimensionOf(mc), chest));
+                settings.exitStrategy = ServerSettings.ExitStrategy.COMMAND;
+                settings.exitCommands.clear();
+                settings.exitCommands.add("tp " + (camp.getX() + 0.5) + " " + camp.getY()
+                        + " " + (camp.getZ() + 0.5));
+                BehaviorRunner.register(probe);
+                BehaviorRunner.start(RestockProbeBehavior.ID);
+            });
+
+            ctx.waitFor(mc -> RestockBehavior.ID.equals(BehaviorRunner.activeId()));
+            int ticks = ctx.waitFor(mc -> horizDistTo(mc, camp.getX() + 0.5,
+                    camp.getZ() + 0.5) < 2.0, 400);
+            if (ticks > SEND_BUDGET_TICKS) {
+                throw new AssertionError("The exit command only teleported the bot after "
+                        + ticks + " ticks; a command the server itself counts from has to go"
+                        + " out as soon as the bot has stopped (budget " + SEND_BUDGET_TICKS
+                        + ")");
+            }
+
+            // The jump is the arrival, so the phase has to have moved on. Given
+            // a breath to do it in: the walk that follows takes far longer than
+            // this to get anywhere, so a status line still reading "leaving" is
+            // the old bug and nothing else.
+            ctx.waitTicks(20);
+            String status = ctx.computeOnClient(mc -> BehaviorRunner.statusLine());
+            if (!status.contains("walking to")) {
+                throw new AssertionError("After the teleport the restock reports \"" + status
+                        + "\"; the position jumping is what it was waiting for");
+            }
+            LOGGER.info("Exit teleport test passed: command landed after {} ticks, {}",
+                    ticks, status);
+        } finally {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+                ServerSettings settings = ServerSettingsStore.current();
+                settings.exitCommands.clear();
+                settings.exitCommands.addAll(beforeCommands);
+                settings.exitStrategy = beforeStrategy;
+                settings.storages.clear();
+                settings.storages.addAll(beforeStorages);
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    // ================================================================
+    // Test 30: the approach has to measure the ray the aim will use
+    // ================================================================
+
+    /**
+     * A target whose <em>centre</em> is in plain sight while the face the bot is
+     * going to aim at is not. One block of stone beside the bot does it: the eye
+     * looks down the row, the ray to the block's middle passes over that stone,
+     * and the ray to the near face — half a block closer, so half a block
+     * steeper — clips its top corner.
+     *
+     * <p>Which is the difference between an approach that works and one that
+     * cannot. {@code approachOccluded} walks until the sight line is clear, and
+     * the clip that judged "clear" used to go to the centre while LOOKING aimed
+     * at the face: POSITIONING reported arrival without a step taken, LOOKING
+     * spent its budget on a ray the stone stopped, and the task died. Out of a
+     * real chunk-miner run, with a staircase step in the role of the stone:
+     * three attempts from a position identical to two decimals, {@code los=true}
+     * in the diagnostics of every one of them, and the run dead on
+     * {@code cannot break -29, 82, -64}.
+     *
+     * <p>So the assertion is the step: where the bot stands when it starts
+     * breaking has to be somewhere else than where it was told to mine from.
+     * Asserting only that the block falls would not catch it — the aim carries a
+     * humanized offset of up to 0.3, which now and then lifts the ray over the
+     * corner on its own, and a test that passes on that is a test that reports
+     * the weather.
+     */
+    @MinecraftTest(name = "Bot walks until the face it aims at is in sight",
+            timeoutTicks = 400, order = -167)
+    public void approachesUntilTheAimedFaceIsVisible(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1560, 30, 1560);
+        final BlockPos occluder = origin.offset(1, 0, 0);
+        final BlockPos target = origin.offset(3, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + occluder.getX() + " " + occluder.getY() + " "
+                + occluder.getZ() + " stone");
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " "
+                + target.getZ() + " stone");
+        ctx.waitFor(mc -> !mc.level.getBlockState(occluder).isAir()
+                && !mc.level.getBlockState(target).isAir());
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        final double startX = ctx.computeOnClient(mc -> mc.player.getX());
+        try {
+            ctx.runOnClient(mc -> {
+                BotController.setPolicy(BotPolicy.none().withApproachOccluded());
+                BotController.enqueueTask(new MineBlockTask(target));
+            });
+
+            // Where it stands when the pick goes in, not where it ends up: the
+            // collect walk afterwards moves the bot whatever the approach did.
+            ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.INTERACTING, 300);
+            double movedBy = ctx.computeOnClient(mc -> mc.player.getX()) - startX;
+            if (movedBy < MIN_APPROACH_STEP) {
+                throw new AssertionError("The bot started breaking from "
+                        + String.format(java.util.Locale.US, "%.2f", movedBy)
+                        + " blocks off its starting spot; with the face it aims at behind a"
+                        + " block, the approach has to walk until that face is in sight");
+            }
+
+            waitForBotIdle(ctx);
+            boolean mined = ctx.computeOnClient(mc -> mc.level.getBlockState(target).isAir());
+            if (!mined) {
+                throw new AssertionError("The bot walked but never broke " + target);
+            }
+            LOGGER.info("Occluded approach test passed: broke it from {} blocks along",
+                    String.format(java.util.Locale.US, "%.2f", movedBy));
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.stop();
+                BotController.setPolicy(null);
+            });
+        }
+    }
+
+    /**
+     * The bot must walk up to the block, not stop at the far edge of its reach.
+     *
+     * <p>Nothing about one block is slow either way — what this pins down is the
+     * block <em>after</em> it. Mining from 3.9 blocks puts the next cell of a
+     * sweep at 4.9, out of reach, so it costs a whole POSITIONING entry with its
+     * reaction beat instead of continuing the seam; mining from 2.0 leaves the
+     * next two in reach. Measured over 292 breaks of a real run: 0.48 s to the
+     * next break from under 2.5 blocks, 1.70 s from over 3.0.
+     *
+     * <p>Asserted as a distance rather than as a pace, because the distance is
+     * the mechanism and a pace assertion on a single block would be measuring the
+     * reaction-delay roll.
+     */
+    @MinecraftTest(name = "Bot walks up to the block instead of reaching for it",
+            timeoutTicks = 400, order = -166)
+    public void walksUpToTheBlock(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1620, 30, 1620);
+        // Out of reach (about 5.1 blocks) but inside reach + 2.5, which is the
+        // band POSITIONING walks without a pathfinding ceremony — the same band
+        // every block of a sweep falls into.
+        final BlockPos target = origin.offset(5, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " "
+                + target.getZ() + " stone");
+        ctx.waitFor(mc -> !mc.level.getBlockState(target).isAir());
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        try {
+            ctx.runOnClient(mc -> {
+                BotController.setPolicy(BotPolicy.none());
+                BotController.enqueueTask(new MineBlockTask(target));
+            });
+
+            // Where it stands when the pick goes in: the collect walk afterwards
+            // closes the distance whatever the approach did, so reading it later
+            // would report the pickup instead of the approach.
+            ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.INTERACTING, 300);
+            double distance = ctx.computeOnClient(mc -> distanceToBlock(mc.player, target));
+            if (distance > MAX_WORK_DISTANCE) {
+                throw new AssertionError("The bot started breaking from "
+                        + String.format(java.util.Locale.US, "%.2f", distance)
+                        + " blocks away; it has to walk up to the block, because the"
+                        + " next one of a sweep is only in reach from close range");
+            }
+
+            waitForBotIdle(ctx);
+            if (!ctx.computeOnClient(mc -> mc.level.getBlockState(target).isAir())) {
+                throw new AssertionError("The bot walked up to " + target + " but never broke it");
+            }
+            LOGGER.info("Working-distance test passed: broke it from {} blocks",
+                    String.format(java.util.Locale.US, "%.2f", distance));
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.stop();
+                BotController.setPolicy(null);
+            });
+        }
+    }
+
+    /**
+     * And it must walk while it mines, not instead of mining.
+     *
+     * <p>A target already inside reach is handed straight to LOOKING with no walk
+     * at all, which is right — but it leaves the bot working from wherever it
+     * happened to be. Breaking is the one thing the bot is going to spend ticks
+     * on regardless, so the approach belongs inside it: by the time the block
+     * falls the body is at the face and the next cell of the row is a seam rather
+     * than another POSITIONING entry. Reported from a real run as a bot that does
+     * not mine and walk at the same time.
+     *
+     * <p>Obsidian with a diamond pickaxe for the same reason the opportunistic
+     * collection test uses it: ~187 ticks of INTERACTING is long enough to watch
+     * the body move, and a fast block would measure the momentum of the last
+     * phase instead.
+     *
+     * <p>Measured horizontally, against {@link #MAX_CONTACT_DISTANCE}. The step
+     * has no standing distance of its own: {@code isStepSafe} ends it by refusing
+     * to put the feet in the target's cell, so the bot comes to rest against the
+     * face the way a body does, and the bar sits where a fixed early stop could
+     * not reach however the ticks fell. It used to stop at 2.0 and swing from
+     * there, which is what the run looked mechanical for. Falsified by putting that
+     * stop back: the wait runs out at 250 ticks, the bot never having got under
+     * 1.5 — a 2.0 stop plus the bounded coast cannot.
+     */
+    @MinecraftTest(name = "Bot closes in while it is breaking",
+            timeoutTicks = 300, order = -164)
+    public void closesInWhileBreaking(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1700, 30, 1700);
+        // Three along: inside reach (about 3.2 blocks), so the task goes straight
+        // to LOOKING and the break starts from there. That is the geometry the
+        // in-break step exists for — nothing else will ever close this gap.
+        final BlockPos target = origin.offset(3, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " "
+                + target.getZ() + " obsidian");
+        ctx.waitFor(mc -> !mc.level.getBlockState(target).isAir());
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        final double[] closest = {Double.MAX_VALUE};
+        final double[] atStart = {-1.0};
+        try {
+            ctx.runOnClient(mc -> {
+                // Deliberately without opportunisticCollection: the drop branch
+                // would be a second explanation for any movement seen here.
+                BotController.setPolicy(BotPolicy.none());
+                BotController.enqueueTask(new MineBlockTask(target));
+            });
+
+            ctx.waitFor(mc -> {
+                if (BotController.getPhase() != BotController.Phase.INTERACTING) {
+                    return false;
+                }
+                double distance = horizDistTo(mc, target.getX() + 0.5, target.getZ() + 0.5);
+                if (atStart[0] < 0) {
+                    atStart[0] = distance;
+                }
+                closest[0] = Math.min(closest[0], distance);
+                return closest[0] <= MAX_CONTACT_DISTANCE;
+            }, 250);
+
+            if (atStart[0] <= MAX_CONTACT_DISTANCE) {
+                throw new AssertionError("The bot already started breaking from "
+                        + String.format(java.util.Locale.US, "%.2f", atStart[0])
+                        + " blocks, so this fixture had no gap to close — the test would"
+                        + " pass whatever the bot did during the break");
+            }
+            LOGGER.info("In-break step test passed: started at {} blocks, closed to {}",
+                    String.format(java.util.Locale.US, "%.2f", atStart[0]),
+                    String.format(java.util.Locale.US, "%.2f", closest[0]));
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.stop();
+                BotController.setPolicy(null);
+            });
+        }
+    }
+
+    /**
+     * And it must give up walking when walking cannot help.
+     *
+     * <p>The other half of the working distance, and the half that keeps it from
+     * being a regression: a target across a trench is in reach and will never be
+     * any nearer, because the floor check refuses the step — correctly, the
+     * alternative is a fall. Told only to close to 2.0 the phase would hold that
+     * target for the full {@code positionTimeout} and mine it afterwards anyway,
+     * so the cost of getting this wrong is paid in ticks on every such block
+     * rather than in a failure, which is exactly the kind of bug that hides.
+     */
+    @MinecraftTest(name = "Bot stops closing in when the way is a trench",
+            timeoutTicks = 400, order = -165)
+    public void settlesForReachWhenItCannotCloseIn(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1660, 30, 1660);
+        final BlockPos target = origin.offset(4, 0, 0);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        // Two cells of floor gone between the bot and the block. It can stand at
+        // x+1 and reach the target from 3.2 blocks, and it can never stand nearer.
+        ctx.runCommand("fill " + (origin.getX() + 2) + " " + (origin.getY() - 2) + " "
+                + (origin.getZ() - 1) + " " + (origin.getX() + 3) + " " + (origin.getY() - 1)
+                + " " + (origin.getZ() + 1) + " air");
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " "
+                + target.getZ() + " stone");
+        ctx.waitFor(mc -> !mc.level.getBlockState(target).isAir()
+                && mc.level.getBlockState(origin.offset(2, -1, 0)).isAir());
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        final int[] positioningTicks = {0};
+        try {
+            ctx.runOnClient(mc -> {
+                BotController.setPolicy(BotPolicy.none());
+                BotController.enqueueTask(new MineBlockTask(target));
+            });
+
+            ctx.waitFor(mc -> {
+                if (BotController.getPhase() == BotController.Phase.POSITIONING) {
+                    positioningTicks[0]++;
+                }
+                return BotController.getPhase() == BotController.Phase.INTERACTING;
+            }, 300);
+            if (positioningTicks[0] > MAX_BLOCKED_POSITION_TICKS) {
+                throw new AssertionError("The bot spent " + positioningTicks[0]
+                        + " ticks trying to get closer to a block across a trench;"
+                        + " a walk that is not closing the distance has to be given up on");
+            }
+
+            waitForBotIdle(ctx);
+            if (!ctx.computeOnClient(mc -> mc.level.getBlockState(target).isAir())) {
+                throw new AssertionError("The bot never broke " + target
+                        + " across the trench");
+            }
+            LOGGER.info("Blocked-approach test passed: {} ticks in POSITIONING, then it mined"
+                    + " from where it stood", positioningTicks[0]);
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.stop();
+                BotController.setPolicy(null);
+            });
+        }
+    }
+
+    /** Eye to block centre, the distance {@code BotController} positions by. */
+    private static double distanceToBlock(net.minecraft.client.player.LocalPlayer player,
+                                          BlockPos target) {
+        double dx = (target.getX() + 0.5) - player.getX();
+        double dy = (target.getY() + 0.5) - player.getEyeY();
+        double dz = (target.getZ() + 0.5) - player.getZ();
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /**
+     * How far the occluded approach has to carry the bot before it may start
+     * breaking. Deliberately small: walking closer lifts the ray over the
+     * corner, and measured here that takes 0.46 blocks, not a whole one. The
+     * line to beat is zero — the bug stood perfectly still, three attempts at a
+     * position identical to two decimals — so anything that cannot be drift is
+     * the right threshold, and a larger one would only assert that this
+     * particular geometry needs a particular number of blocks.
+     */
+    private static final double MIN_APPROACH_STEP = 0.2;
+
+    /**
+     * How far from the block the bot may still be when it starts breaking it.
+     *
+     * <p>{@code WORK_DISTANCE} (2.0) is horizontal and this is measured to the
+     * block centre, so a block at foot level sits a further 1.1 blocks below the
+     * eye: 2.3 is what a correct arrival actually reads, and 2.5 leaves room for
+     * the reaction beat and the walk's own momentum. The line to beat is the
+     * reach distance — arriving there puts the bot at about 3.9, which is what
+     * this test measured before POSITIONING had a working distance of its own, so
+     * the bar separates the two by a wide margin despite looking tight against
+     * 2.3.
+     */
+    private static final double MAX_WORK_DISTANCE = 2.5;
+
+    /**
+     * How close the in-break step has to bring the body, measured <b>horizontally</b>
+     * — the only distance a walk can change, and the one the production step uses.
+     *
+     * <p>Provably out of reach of the behaviour this replaced, which is what makes
+     * the bar worth having: that step stopped pressing at {@code WORK_DISTANCE}
+     * (2.0) and the body then coasted, and a coast is bounded — walking speed is
+     * about 0.13 blocks a tick against ground friction of 0.6, so it carries at
+     * most 0.13 / (1 − 0.6) ≈ 0.33 blocks. An early stop therefore cannot end
+     * nearer than about 1.67 however the ticks fall. Letting {@code isStepSafe}
+     * decide instead — it refuses the step that would put the feet in the target's
+     * own cell — stops the press around 1.5 and the same coast lands near 1.2.
+     */
+    private static final double MAX_CONTACT_DISTANCE = 1.5;
+
+    /**
+     * Ticks POSITIONING may spend on a target it cannot get any closer to.
+     *
+     * <p>Between {@code CLOSING_STALL_TICKS} (10, plus the walk that got the bot
+     * into reach) and {@code positionTimeout} (60), which is what the phase costs
+     * when nothing tells it to stop trying. Not scaled by the tick multiplier —
+     * this counts client ticks the phase was observed in, not wall time.
+     */
+    private static final int MAX_BLOCKED_POSITION_TICKS = 35;
+
+    /**
+     * Ticks the exit command may take to reach the server and work. It covers
+     * {@code RestockBehavior.SETTLE_TICKS} plus the round trip, and is far
+     * enough under the 240-tick standstill that used to come first that the
+     * difference cannot be read as jitter.
+     */
+    private static final int SEND_BUDGET_TICKS = 60;
 
     private void assertExitCommands(TestContext ctx, List<String> expected, String when) {
         List<String> actual = ctx.computeOnClient(
@@ -1802,6 +2396,18 @@ public class BotTests {
                 net.minecraft.world.entity.EntityType.ITEM,
                 new net.minecraft.world.phys.AABB(origin).inflate(12.0),
                 item -> item.getY() > origin.getY() + 4).size());
+    }
+
+    /**
+     * Item entities lying where the bait was summoned. Tight enough that the
+     * mined block's own drop, seven blocks the other way, can never be
+     * mistaken for it.
+     */
+    private int countBaitAt(TestContext ctx, BlockPos at) {
+        return ctx.computeOnClient(mc -> mc.level.getEntities(
+                net.minecraft.world.entity.EntityType.ITEM,
+                new net.minecraft.world.phys.AABB(at).inflate(1.5),
+                item -> true).size());
     }
 
     /**
