@@ -5,6 +5,7 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundDamageEventPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.sounds.SoundEvents;
 import net.stracciatella.bot.interaction.BlockWireTrace;
@@ -16,10 +17,11 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Feeds {@link BotAlarm} from the two packets that tell the client something
- * hostile happened, so behaviors with a stop policy need no per-tick polling.
+ * Feeds {@link BotAlarm} from the packets that tell the client something
+ * happened to the player it did not do itself, so a run needs no per-tick
+ * polling to notice.
  *
- * <p>Both injections sit at TAIL rather than HEAD on purpose. These handlers
+ * <p>All injections sit at TAIL rather than HEAD on purpose. These handlers
  * start with {@code PacketUtils.ensureRunningOnSameThread}, which runs once on
  * the netty thread (throwing to reschedule) and once on the client thread — a
  * HEAD injection would therefore fire on the netty thread as well and read
@@ -53,6 +55,32 @@ public class ClientPacketListenerMixin {
         if (BotAlarm.isAttackerInRange(packet.getX(), packet.getY(), packet.getZ(),
                 player.getX(), player.getY(), player.getZ())) {
             BotAlarm.raiseAttack();
+        }
+    }
+
+    /**
+     * Someone moved the bot. Every server-forced position arrives here and
+     * nowhere else — on the server side {@code ServerGamePacketListenerImpl}
+     * has exactly one method that sends this packet, and {@code /tp}, a plugin
+     * warp, a portal and a rubber-band correction all go through it — so this
+     * one injection covers the lot without the client having to guess from a
+     * position that jumped.
+     *
+     * <p>Where the player ends up is read off the player rather than out of the
+     * packet, which is the other thing TAIL buys: the packet's coordinates can
+     * be relative to the player's own and its rotation-only variants leave the
+     * position alone, and after the handler has run none of that has to be
+     * worked out again — the player is standing at the answer. Verified over a
+     * full test run: every position packet left the player exactly on the
+     * coordinates it carried, so nothing here is interpolating.
+     */
+    @Inject(at = @At("TAIL"), method = "handleMovePlayer")
+    private void stracciatella$onMovePlayer(ClientboundPlayerPositionPacket packet,
+                                            CallbackInfo ci) {
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player != null
+                && BotAlarm.isNewPlace(player.getX(), player.getY(), player.getZ())) {
+            BotAlarm.raiseTeleport();
         }
     }
 

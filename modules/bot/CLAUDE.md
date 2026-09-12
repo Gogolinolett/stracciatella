@@ -46,7 +46,7 @@ net.stracciatella.bot
 │   ├── StoragePage.java            # Which block kinds count as storage, on the same IdListScreen
 │   └── ServerPage.java             # This server's exit strategy and placement permission, on SettingsScreen
 ├── safety/
-│   └── BotAlarm.java               # Latches damage / player-attack events for the runner
+│   └── BotAlarm.java               # Latches damage / player-attack / teleport events for the runner
 ├── mixin/
 │   ├── ClientPacketListenerMixin.java  # Damage + attack-sound + block-ack packets
 │   ├── ClientCommonPacketListenerImplMixin.java  # Outgoing packets, for the wire trace
@@ -382,12 +382,29 @@ Written for the chunk miner's row turns, where it let the sweep hand over a hidd
 
 ### Detection: packets, not polling
 
-Two `ClientPacketListener` injections feed `BotAlarm`; the runner consumes both latches every tick and applies only the ones its policy asked for (a trigger nobody wanted must not stay set and fire at the start of the next run).
+Three `ClientPacketListener` injections feed `BotAlarm`; the runner consumes every latch each tick and applies only the ones that apply (a trigger nobody wanted must not stay set and fire at the start of the next run).
 
 - `handleDamageEvent` where `entityId == mc.player.getId()` — the bot took damage.
 - `handleSoundEvent` where the sound is `PLAYER_ATTACK_NODAMAGE`. **A zero-damage hit produces no damage event at all** — this sound is the only signal that reaches the bot's client. It is broadcast at the *attacker's* position, so proximity stands in for "aimed at me": within 5 blocks counts, within 0.5 does not, because `Player.attack` broadcasts with a `null` source player and the bot would otherwise stop itself the first time it swung at anything. A neighbouring whiff at an unrelated target is an accepted false positive — stopping too often is cheap, missing a hit is not.
+- `handleMovePlayer` — **someone moved the bot**, see below.
 
-Both inject at **TAIL, not HEAD**: these handlers open with `PacketUtils.ensureRunningOnSameThread`, which runs once on the netty thread (throwing to reschedule) and once on the client thread, so a HEAD injection would read `Minecraft.player` off-thread.
+All three inject at **TAIL, not HEAD**: these handlers open with `PacketUtils.ensureRunningOnSameThread`, which runs once on the netty thread (throwing to reschedule) and once on the client thread, so a HEAD injection would read `Minecraft.player` off-thread.
+
+### The teleport guard: not a policy flag
+
+A teleport ends whatever is running, and it does so for **every** behavior and for hand-queued `/bot` work alike — it is the one stop that is not opt-in. Every other flag in the table above is a trade-off whose owner has to choose; this one has no other side. Wherever the bot has been put is not the place it planned its work for — not the queued blocks, not the route, not the site a restock means to come back to — and carrying on regardless is also the most conspicuous thing a bot can do while the staff member who just teleported it stands there watching. A `stopOnTeleport` flag would only have offered new behaviors a way to inherit that by omission.
+
+`ClientboundPlayerPositionPacket` is the detection. On the server side `ServerGamePacketListenerImpl` has exactly one method that sends it, so `/tp`, a plugin warp, a portal and a correction all arrive through this one handler — no guessing from a position that jumped.
+
+**The packet alone is not the signal.** The same handler carries vanilla's own re-placements, and a stack trace taken on the integrated server named them: `ServerGamePacketListenerImpl.handleMovePlayer` re-sends a position it is still waiting to have acknowledged — three times per `/tp` under the test suite's accelerated ticks — and it puts a player whose move it refused back on the last position it did accept, which a bot digging the floor out from under itself provokes constantly. Taken at face value that tripped the whole suite: `Bot digs down without turning` failed on the fall, `Bot out-of-reach failure` stopped on the echo of its own setup teleport, and the chunk miner stopped mid-descent.
+
+**A distance band cannot separate the two**, and the attempt is recorded because it looked obvious and passed the first suite it was tried on. Measured on real runs those corrections come in at 0.078 blocks (the grid nudge), 0.768 (a fall wound back) and **1.41** (a whole diagonal block) — while the event the guard exists for, staff teleporting the bot *to themselves* in order to watch it, moves it about 0.6, because two players cannot stand closer than their own width. The ranges overlap, so no threshold sits between them. A 0.25-block band survived `-Psuites=bot` and only died on the full run.
+
+**The trail decides instead** (`BotAlarm.recordPosition` / `isNewPlace`, `TRAIL_TICKS` 40, `SAME_SPOT` 0.05). What tells the two apart is not how far the position moved the bot but where it points: a correction always names somewhere the client itself reported a moment ago, a teleport names somewhere it has never been. `BehaviorRunner.tick` therefore notes the player's position every tick — the one hook in the module that runs unconditionally whether or not anything is going, which is why the errand lives there rather than in the safety layer — and the handler raises the latch only for a position matching none of the last two seconds' worth. Two seconds outlasts the widest correction seen (1.41 blocks, about seven ticks of walking) and stays short of the point where the bot's own route would start hiding real teleports. `Bot stops when it is teleported` asserts a **one-block hop**, backwards off the row so the destination is not somewhere the bot has just walked, under `BotPolicy.none()` to pin the other half.
+
+All three injections therefore sit at **TAIL**, and this one wants it for a second reason: once the handler has run the player is standing on the answer, so nothing has to work out whether the packet's coordinates were relative or whether it was one of the rotation-only variants. Verified over a full test run — every position packet left the player exactly on the coordinates it carried, so nothing interpolates in between. A HEAD version that read the packet through `PositionMoveRotation.calculateAbsolute` and turned the netty-thread pass away itself was written first, and went out with the distance band.
+
+The one exception is the behavior that teleports itself. `BotBehavior.expectsTeleport()` defaults to false and `RestockBehavior` overrides it with `phase == LEAVE_SITE && commandsSent` — the exact stretch between its exit command going out and the jump arriving. Narrow on purpose: outside that window a restock wants the guard as much as anything else does, and the arrival test itself is unchanged (still the 32-block jump).
 
 ### Stopping and the alert
 
@@ -464,6 +481,8 @@ it stays in the inventory, and the bot is full again two slabs later.
 
 The order inside `BehaviorRunner.tick` is load-bearing and was wrong once:
 
+0. **Teleport** — ahead of everything, including the question of whether a
+   behavior is running at all, because it also stops hand-queued `/bot` work.
 1. **Safety** — damage and player-attack. A bot that is being hit stops; it does
    not go shopping.
 2. **Restock** — `restockReason`, skipped entirely while a trip is in flight
@@ -508,7 +527,7 @@ that looks busy and never mines a block.
 
 | Phase | Behavior |
 |-------|----------|
-| **LEAVE_SITE** | Nothing at all under `STAIRCASE`. Under `COMMAND`: stop everything, hold the spot until it has actually stopped moving (`SETTLE_TICKS`, 10), send `exitCommands` at once, then wait for the position to **jump** (`TELEPORT_JUMP_DISTANCE`, 32 blocks), bounded by `teleportWaitTicks`. Movement matters only *before* the send, where it means the bot is still sliding; after it, movement is the very thing being waited for — see the two halves below. |
+| **LEAVE_SITE** | Nothing at all under `STAIRCASE`. Under `COMMAND`: stop everything, hold the spot until it has actually stopped moving (`SETTLE_TICKS`, 10), send `exitCommands` at once, then wait for the position to **jump** (`TELEPORT_JUMP_DISTANCE`, 32 blocks), bounded by `teleportWaitTicks`. Movement matters only *before* the send, where it means the bot is still sliding; after it, movement is the very thing being waited for — see the two halves below. This is also the one window in which `expectsTeleport()` is true, so the teleport guard does not read the bot's own exit command as somebody moving it. |
 | **TO_STORAGE** | `Journey.start(...)` on the current stop of the route — the pathfinding module's layer for a target that may not even be loaded yet. |
 | **OPEN** | One `OpenContainerTask`. A block that is no longer a storage block, or a task that ran without a screen appearing, is walked past rather than failed (below). |
 | **TRANSFER** | One shift-click per `restockClickDelay`: deposit first, then withdraw. Deposit before withdraw because a withdrawal needs somewhere to land, and the loot is what is filling the slots. Decides, while the menu is still open, whether the trip has work left. |
@@ -780,7 +799,7 @@ Restocking (see *Restocking*; where a chest **is** is per server in `servers.jso
 Tests in `test/BotTests.java`, registered via `TestRunner.instance().registerSuite(BotTests.class)`.
 Run via `./gradlew runMinecraftTests`. Each test builds its environment with `/fill` + `/setblock`.
 
-Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, a restock whose nearest barrel is full, the `/bot server exit command` argument against servers.json, an exit command driven against a real teleport, an occluded approach that has to walk before it may break, a block walked up to instead of reached for, one closed in on while the break is already running, and one across a trench that has to be mined from where the bot stands.
+Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, a restock whose nearest barrel is full, the `/bot server exit command` argument against servers.json, an exit command driven against a real teleport, an occluded approach that has to walk before it may break, a block walked up to instead of reached for, one closed in on while the break is already running, one across a trench that has to be mined from where the bot stands, and a one-block teleport that has to end the run.
 
 **The suite reads the player's live `stracciatella/bot.json`**, and that is a trap worth naming: with `ignoredItems` set to cobblestone and dirt — a perfectly reasonable thing for a player to want — thirteen tests fail, because they assert that the bot collects the cobblestone it mines and the config forbids exactly that. Measured both ways in one sitting: 16 failures with that list, 4 with it empty, nothing else changed. A suite whose result depends on what was last typed in-game cannot tell a regression from a setting, so set the file aside before reading a run as a verdict. The same file is why a test that edits `ignoredItems` in memory must restore it *conditionally*: adding an entry the player already had is a no-op, removing it afterwards is not, and `Bot ignore commands edit the list` saves the config later in the same run.
 
@@ -867,4 +886,4 @@ corner often enough to make an outcome-only assertion flaky. The position is rea
 in INTERACTING, since the collect walk afterwards moves the bot whatever the
 approach did.
 
-**The player-attack path has no in-game test** — it needs a second player swinging at the bot. Its two real failure modes (never firing, firing on the bot's own swing) are covered by plain JUnit in `src/test/.../safety/BotAlarmTest.java`, which is why `BotAlarm.isAttackerInRange` takes bare doubles instead of Minecraft types. Run with `./gradlew :modules:bot:test`.
+**The player-attack path has no in-game test** — it needs a second player swinging at the bot. Its two real failure modes (never firing, firing on the bot's own swing) are covered by plain JUnit in `src/test/.../safety/BotAlarmTest.java`, which is why `BotAlarm.isAttackerInRange` takes bare doubles instead of Minecraft types. The teleport trail (`recordPosition` / `isNewPlace`) is pinned there for a sharper version of the same reason: its hard case is the server correcting a move, which the in-game test can only produce by accident and never on demand, so the walk-then-get-put-back sequence is played out in doubles instead. Run with `./gradlew :modules:bot:test`.

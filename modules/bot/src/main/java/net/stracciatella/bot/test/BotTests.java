@@ -2150,6 +2150,64 @@ public class BotTests {
         }
     }
 
+    /**
+     * Being moved ends the run, whoever was running it and however short the hop.
+     *
+     * <p>Two claims in one, and both are the ones that were wrong before. The
+     * probe asks for {@link BotPolicy#none()}, so a guard that had been hung off
+     * a policy flag would sit this out — a teleport is not a preference. And the
+     * bot is teleported <b>one block</b>, because the case that matters is a
+     * staff member putting the bot where they are standing, and they are
+     * standing next to it when they do; anything that waited for a jump would
+     * pass a test written with a long throw and still miss the real thing.
+     */
+    @MinecraftTest(name = "Bot stops when it is teleported", timeoutTicks = 300, order = -164)
+    public void teleportStopsTheRun(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1740, 30, 1740);
+        final BlockPos standPos = origin.offset(0, 0, 2);
+        // Four blocks, so the run still has work left when the teleport lands.
+        final List<BlockPos> blocks = List.of(
+                origin, origin.offset(1, 0, 0), origin.offset(2, 0, 0), origin.offset(3, 0, 0));
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        for (BlockPos block : blocks) {
+            ctx.runCommand("setblock " + block.getX() + " " + block.getY() + " "
+                    + block.getZ() + " stone");
+        }
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, standPos, origin.getY());
+
+        startProbe(ctx, BotPolicy.none(), blocks);
+        // Only meaningful once the bot is actually working.
+        ctx.waitFor(mc -> BotController.getPhase() == BotController.Phase.INTERACTING);
+
+        // One block back, away from the row. Sideways would be along the line
+        // the bot walks to reach the next block, and a spot it has just stood on
+        // is one the alarm is meant to forgive.
+        ctx.runCommand("tp @s " + (standPos.getX() + 0.5) + " " + origin.getY() + " "
+                + (standPos.getZ() + 1.5));
+        ctx.waitFor(mc -> !BehaviorRunner.isActive());
+
+        int remaining = ctx.computeOnClient(mc -> {
+            int count = 0;
+            for (BlockPos block : blocks) {
+                if (!mc.level.getBlockState(block).isAir()) {
+                    count++;
+                }
+            }
+            return count;
+        });
+        if (remaining == 0) {
+            throw new AssertionError("The run mined every block — the teleport stop never fired");
+        }
+        if (ctx.computeOnClient(mc -> BotController.isActive())) {
+            throw new AssertionError("The behavior ended but the task layer carried on mining");
+        }
+        ctx.runOnClient(mc -> BotController.stop());
+        LOGGER.info("Teleport stop test passed ({} of {} blocks left)", remaining, blocks.size());
+    }
+
     /** Eye to block centre, the distance {@code BotController} positions by. */
     private static double distanceToBlock(net.minecraft.client.player.LocalPlayer player,
                                           BlockPos target) {

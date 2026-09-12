@@ -161,10 +161,29 @@ public class BehaviorRunner {
     }
 
     public static void tick(Minecraft client) {
+        // Where the bot is standing, every tick and whether or not anything is
+        // running: the alarm needs the path behind it to tell a teleport from
+        // the server putting the bot back where it just was. This hook is the
+        // only thing in the module that runs unconditionally every tick, which
+        // is why the errand lands here rather than in the safety layer.
+        if (client.player != null) {
+            BotAlarm.recordPosition(
+                    client.player.getX(), client.player.getY(), client.player.getZ());
+        }
+
         // Consumed unconditionally, like the alarm latches below and for the
         // same reason: a block the bot could not mine during a run nobody asked
         // to restock must not still be sitting here when the next run starts.
         var missingTool = BotController.consumeMissingTool();
+
+        // Ahead of the "is a behavior running" question, because this one guard
+        // covers hand-queued work as well — `/bot gather ores` is a sweep that
+        // runs for minutes with no behavior above it, and being carried off in
+        // the middle of one is no less a reason to put the pickaxe down.
+        if (BotAlarm.consumeTeleport() && (active == null || !active.expectsTeleport())) {
+            stopOnTeleport(client);
+            return;
+        }
 
         if (active == null) {
             return;
@@ -361,6 +380,37 @@ public class BehaviorRunner {
     }
 
     /**
+     * Someone moved the bot, so everything in flight ends here. It was all
+     * planned for a place the bot is no longer standing in — the queued blocks,
+     * the route, the site a restock means to come back to — and carrying on with
+     * it is both useless and the most conspicuous thing a bot can do while the
+     * staff member who just teleported it is watching.
+     *
+     * <p>Kept out of {@link #stopReason} because it does not answer the same
+     * question: that one asks what the active policy wants, and this applies
+     * whether or not a behavior is running at all.
+     */
+    private static void stopOnTeleport(Minecraft client) {
+        String reason = client.player != null
+                ? "the bot was teleported to " + client.player.blockPosition().toShortString()
+                : "the bot was teleported";
+        if (active != null) {
+            active.abort();
+            abandonSuspended();
+            finish(client, BehaviorStatus.FAILED, reason);
+            return;
+        }
+        // The queue counts as work too, not just the task in hand: a paused bot
+        // holds its blocks in there with no current task, and resuming it after
+        // a teleport would carry on somewhere else entirely.
+        if (!BotController.isActive() && BotController.getTaskQueue().isEmpty()) {
+            return;
+        }
+        BotController.stop();
+        announce(client, "Bot STOPPED — " + reason, true);
+    }
+
+    /**
      * Why a full inventory should end this run, or {@code null}. Separate from
      * {@link #stopReason} because it is not a safety question and must not be
      * asked in the same breath: see the call site.
@@ -384,22 +434,27 @@ public class BehaviorRunner {
      */
     private static void finish(Minecraft client, BehaviorStatus status, String stopReason) {
         boolean abnormal = status != BehaviorStatus.SUCCEEDED;
-        String summary = active.statusLine();
-        String message = "Behavior " + active.id()
+        announce(client, "Behavior " + active.id()
                 + (abnormal ? " STOPPED" : " finished")
                 + (stopReason != null ? " — " + stopReason : "")
-                + " (" + summary + ")";
+                + " (" + active.statusLine() + ")", abnormal);
+        clearActive();
+    }
+
+    /**
+     * Tell the supervising player how something ended, in the log, in chat and
+     * out loud. Red on any abnormal stop: they may be several chunks away and
+     * need to tell "it's done" from "it gave up".
+     */
+    private static void announce(Minecraft client, String message, boolean abnormal) {
         LOGGER.info(message);
         if (client.player != null) {
-            // Red on any abnormal stop: the supervising player may be several
-            // chunks away and needs to tell "it's done" from "it gave up".
             client.player.displayClientMessage(
                     Component.literal(message)
                             .withStyle(abnormal ? ChatFormatting.RED : ChatFormatting.GRAY),
                     false);
         }
         playAlert(client, abnormal);
-        clearActive();
     }
 
     /**

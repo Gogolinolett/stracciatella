@@ -153,6 +153,14 @@ public class RestockBehavior implements BotBehavior {
     }
 
     @Override
+    public boolean expectsTeleport() {
+        // Exactly the stretch between the exit command going out and the jump
+        // being seen. Before it there is nothing to expect, and after it a
+        // second move is somebody else's doing and ends the trip like any other.
+        return phase == Phase.LEAVE_SITE && commandsSent;
+    }
+
+    @Override
     public void start(Minecraft client) {
         phase = Phase.LEAVE_SITE;
         phaseTicks = 0;

@@ -63,6 +63,25 @@ public interface BotBehavior {
     }
 
     /**
+     * Whether this strategy is <em>right now</em> waiting for a teleport it
+     * asked for itself.
+     *
+     * <p>A teleport otherwise ends the run on the spot, and that guard is not a
+     * {@link BotPolicy} flag: unlike damage, being moved is never a thing to
+     * weigh up. Wherever the bot has been put is not where it planned its work,
+     * so no strategy has a reason to carry on, and none should be able to
+     * inherit blindness to it by omission.
+     *
+     * <p>Which leaves only the one behavior that teleports itself — see
+     * {@link RestockBehavior}'s exit command. It answers with the narrowest
+     * window it can, the phase that sent the command, rather than for the whole
+     * run: outside that window it wants the guard as much as anyone else.
+     */
+    default boolean expectsTeleport() {
+        return false;
+    }
+
+    /**
      * Called once when the behavior is started. Reset all internal state here.
      */
     void start(Minecraft client);
