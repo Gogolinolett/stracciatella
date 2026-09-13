@@ -1218,7 +1218,17 @@ public class PathWalker {
                 break decide;
             }
 
-            boolean needsJump = feetToTargetDy > 0.5 || blockInFront || forwardAir || gap > 1;
+            // Whether a jump is owed is a question about the ground and about the
+            // step the mesh planned, never about how far the target still is.
+            // `gap` is measured from the block the player stands in, while a node
+            // counts as reached anywhere within 0.65 of its centre
+            // (ARRIVAL_MARGIN) — wider than the node's own block. Ticked off from
+            // the near edge of that box the player is still a block short of the
+            // node it has just left behind, so the next one reads as gap=2 over
+            // dead-flat, solid ground and the bot hops across nothing. Most
+            // visible at a corner: braking into the turn is what leaves the bot
+            // furthest from a centre when arrival fires.
+            boolean needsJump = feetToTargetDy > 0.5 || blockInFront || forwardAir || nodeGap > 1;
             if (!needsJump) {
                 reason = "no-jump-needed";
                 break decide;

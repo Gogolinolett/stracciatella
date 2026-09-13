@@ -15,8 +15,8 @@ import net.minecraft.world.level.ChunkPos;
  * and those blocks form a ramp.
  *
  * <p><b>A pure function, not a plan.</b> Nothing is stored, nothing is built up
- * front, and no cursor records how far the staircase has got: given a top height
- * and a position, {@link #isStairCell} simply answers whether that position is a
+ * front, and no cursor records how far the staircase has got: given a position,
+ * {@link #isStairCell} simply answers whether that position is a
  * step. That is the same principle the rest of the chunk miner is built on —
  * progress is read back out of the world rather than remembered — and it is what
  * makes the answer the same for the sweep deciding what to skip, for the finish
@@ -36,9 +36,22 @@ import net.minecraft.world.level.ChunkPos;
  * <p>One step per layer, walking the chunk's outer ring: 16 along the north edge,
  * down the east edge, back along the south, up the west — {@value #RING_LENGTH}
  * cells, each horizontally adjacent to the next, the last adjacent to the first.
- * Step {@code i} sits one block lower than step {@code i - 1}, so the ramp falls
+ * The step one layer down sits one ring position further along, so the ramp falls
  * at exactly the 1:1 slope the mesh can climb, and after a full circuit it is
  * {@value #RING_LENGTH} blocks deeper and directly under where it started.
+ *
+ * <p><b>The layer alone decides which column, and that is the whole of the
+ * bug this used to have.</b> The ring position is {@code -y mod} {@value
+ * #RING_LENGTH} — pinned to the world's own height grid, nothing else. It used
+ * to be measured down from a {@code topY} the miner set from wherever the bot
+ * happened to be standing when the run began, which made the answer a property
+ * of the run rather than of the chunk. Any second start — the player restarting
+ * a stopped run, or a restock resuming one — arrived at a different height and
+ * rotated every step in the shaft by that difference, so the sweep mined the
+ * staircase it had left on the way down and left a fresh one beside it. Observed
+ * as {@code staircase from y=103} and then {@code y=101} in the same shaft. A
+ * chunk miner that finds its place again by reading the world cannot have
+ * geometry that depends on when it started reading.
  *
  * <p>The outer ring rather than a tighter spiral in the middle: its outward side
  * is the chunk wall, which is never mined, so every step has rock on one side and
@@ -60,32 +73,14 @@ public final class SpiralStairs {
     /**
      * Whether the chunk-local column {@code (localX, localZ)} carries a step at
      * height {@code y}.
-     *
-     * @param topY height of the first step — the top of the mined range, so the
-     *             ramp starts at the surface the bot arrived on
      */
-    public static boolean isStairCell(int topY, int localX, int localZ, int y) {
-        if (y > topY) {
-            return false;
-        }
+    public static boolean isStairCell(int localX, int localZ, int y) {
         int index = ringIndex(localX, localZ);
-        if (index < 0) {
-            return false;
-        }
-        // How far this cell is below its column's first step. A whole number of
-        // circuits means this is that column's step on a later loop.
-        int below = topY - y - index;
-        return below >= 0 && below % RING_LENGTH == 0;
-    }
-
-    /** Height of step {@code index}, counting down from {@code topY}. */
-    public static int stepY(int topY, int index) {
-        return topY - index;
+        return index >= 0 && index == ringIndexAt(y);
     }
 
     /**
-     * The ring position carrying the step at height {@code y}, or -1 when
-     * {@code y} is above the ramp's top.
+     * The ring position carrying the step at height {@code y}.
      *
      * <p>The same fact {@link #isStairCell} states, asked the other way round,
      * and the repair needs it that way: it has a layer and wants the one column
@@ -93,12 +88,15 @@ public final class SpiralStairs {
      * single hit would be the same answer computed 256 times. The two agree by
      * construction — {@code isStairCell} holds exactly when the column's ring
      * index equals this one — and {@code theTwoDirectionsAgree} pins that.
+     *
+     * <p>Every layer has one, including layers no run will ever reach. Capping
+     * the ramp is the caller's business and the miner already does it, by only
+     * ever asking about layers inside the range it is clearing; a cap in here
+     * would have to be told where the range ends, and being told that is what
+     * made the staircase move between runs.
      */
-    public static int ringIndexAt(int topY, int y) {
-        if (y > topY) {
-            return -1;
-        }
-        return Math.floorMod(topY - y, RING_LENGTH);
+    public static int ringIndexAt(int y) {
+        return Math.floorMod(-y, RING_LENGTH);
     }
 
     /**
@@ -145,37 +143,19 @@ public final class SpiralStairs {
 
     // --- World-coordinate conveniences ---
 
-    /** @see #isStairCell(int, int, int, int) */
-    public static boolean isStairCell(ChunkPos chunk, int topY, BlockPos pos) {
-        return isStairCell(topY, pos.getX() - chunk.getMinBlockX(),
+    /** @see #isStairCell(int, int, int) */
+    public static boolean isStairCell(ChunkPos chunk, BlockPos pos) {
+        return isStairCell(pos.getX() - chunk.getMinBlockX(),
                 pos.getZ() - chunk.getMinBlockZ(), pos.getY());
     }
 
     /**
-     * The step at ring position {@code index} on its first circuit, or
-     * {@code null} when {@code index} is not a ring position.
-     */
-    public static BlockPos step(ChunkPos chunk, int topY, int index) {
-        if (index < 0 || index >= RING_LENGTH) {
-            return null;
-        }
-        int[] offset = ringOffset(index);
-        return new BlockPos(chunk.getMinBlockX() + offset[0], stepY(topY, index),
-                chunk.getMinBlockZ() + offset[1]);
-    }
-
-    /**
-     * The one cell of layer {@code y} that carries a step, or {@code null} above
-     * the ramp's top.
+     * The one cell of layer {@code y} that carries a step.
      *
      * @see #ringIndexAt
      */
-    public static BlockPos stepAt(ChunkPos chunk, int topY, int y) {
-        int index = ringIndexAt(topY, y);
-        if (index < 0) {
-            return null;
-        }
-        int[] offset = ringOffset(index);
+    public static BlockPos stepAt(ChunkPos chunk, int y) {
+        int[] offset = ringOffset(ringIndexAt(y));
         return new BlockPos(chunk.getMinBlockX() + offset[0], y,
                 chunk.getMinBlockZ() + offset[1]);
     }

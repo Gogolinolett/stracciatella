@@ -133,22 +133,6 @@ public class ChunkMinerBehavior implements BotBehavior {
     private int fromY;
     private int toY;
     private int slabFeetY;
-    /**
-     * Height of the staircase's first step — see {@link SpiralStairs}. Two below
-     * the top of the range, which is the layer the bot was standing on when the
-     * run started: {@code fromY} is the bot's <em>head</em> layer, so the floor
-     * under its feet is {@code fromY - 2}, and a ramp whose top step is that
-     * floor can be walked onto from the surface without a climb. One layer
-     * higher would put a block in the foot layer of the topmost slab, whose
-     * headroom is the untouched terrain above the range — a step nobody can
-     * stand on.
-     *
-     * <p>It also means a run pinned to a single slab has no steps at all: the top
-     * step is then below {@code toY} and outside the range, so the chunk comes
-     * out empty. That is the right answer rather than a coincidence — a two-deep
-     * pit needs no ramp to climb out of.
-     */
-    private int stairTopY;
     private int requestedFromY;
     private int requestedToY;
     private boolean rangeRequested;
@@ -332,9 +316,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         if (toY < worldFloor) {
             toY = worldFloor;
         }
-        stairTopY = fromY - 2;
-        LOGGER.info("Chunk miner: chunk {} layers {}..{}, staircase from y={}",
-                chunk, toY, fromY, stairTopY);
+        LOGGER.info("Chunk miner: chunk {} layers {}..{}", chunk, toY, fromY);
     }
 
     @Override
@@ -453,7 +435,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
 
         return switch (phase) {
-            case SELECT_SLAB -> tickSelectSlab(level);
+            case SELECT_SLAB -> tickSelectSlab(player, level);
             case DESCEND -> tickDescend(player, level);
             case CLEAR -> tickClear(player, level);
         };
@@ -464,10 +446,14 @@ public class ChunkMinerBehavior implements BotBehavior {
     /**
      * Pick the topmost layer pair that still holds something to dig. This is
      * the resume mechanism: it reads the world, not a saved cursor.
+     *
+     * <p>Asked from where the bot stands, not from each slab's floor: a slab
+     * below the bot is one it looks down on, and that is the only way into a
+     * slab nobody has opened yet — see {@link #hasOpenFace}.
      */
-    private BehaviorStatus tickSelectSlab(Level level) {
+    private BehaviorStatus tickSelectSlab(LocalPlayer player, Level level) {
         for (int feetY = fromY - 1; feetY >= toY - 1; feetY -= SLAB_HEIGHT) {
-            if (slabHasWork(level, feetY)) {
+            if (slabHasWork(level, feetY, player.blockPosition().getY())) {
                 slabFeetY = feetY;
                 sweepColumn = null;
                 phase = Phase.DESCEND;
@@ -670,15 +656,23 @@ public class ChunkMinerBehavior implements BotBehavior {
         // would run it out of order. The column just planned counts too — with
         // its own floor still owed, a chain would carry the sweep on over a
         // hole that is not filled until the batch has drained.
+        BlockPos scannedFrom = scanStart(player);
         sweepColumn = column;
         if (groundworkAfterOpening == null) {
             List<BlockPos> columns = slabColumns(slabFeetY);
-            for (int i = columns.indexOf(column) + 1; i > 0 && i < columns.size(); i++) {
+            int index = columns.indexOf(column);
+            // Only a scan that ran forward went past the column before this one;
+            // on a back pass that column is the next one the pass has to take.
+            if (index > columnIndex(columns, scannedFrom)) {
+                addColumnBefore(level, columns, index, blocks);
+            }
+            for (int i = index + 1; i > 0 && i < columns.size(); i++) {
                 BlockPos next = columns.get(i);
                 if (!withinChainDistance(player, next) || !needsNoGroundwork(level, next)) {
                     break;
                 }
                 addColumn(level, next, blocks);
+                addColumnBefore(level, columns, i, blocks);
                 // Everything the chain walks over is planned or already empty,
                 // so the sweep is past it whether it added anything or not.
                 sweepColumn = next;
@@ -711,28 +705,85 @@ public class ChunkMinerBehavior implements BotBehavior {
      * while the head block stands, the foot block's upward face is covered and
      * its side faces are hidden by the corridor wall, so aiming at it first
      * only burns a look timeout. Which is why the head being in this very batch
-     * is what makes the foot plannable — see {@link #hasOpenFace}.
+     * is what makes the foot plannable — see {@link #hasOpenFace}. A column
+     * offered a second time, as {@link #addColumnBefore} does, adds only what
+     * it did not add the first time.
      */
     private void addColumn(Level level, BlockPos column, List<BlockPos> into) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-            if (isMinable(pos) && !plannedBlocks.contains(pos)
+            if (isMinable(level, pos) && !plannedBlocks.contains(pos) && !into.contains(pos)
                     && isDiggable(level.getBlockState(pos))
-                    && hasOpenFace(level, pos, into)) {
+                    && hasOpenFace(level, pos, into, column.getY())) {
                 into.add(pos);
             }
         }
     }
 
-    /** The faces a bot inside a two-layer slab can ever put a ray on. */
+    /**
+     * Offer the column the snake runs through just before {@code
+     * columns[index]} again, once the plan takes that column whole. A cell with
+     * no face open when the sweep reached it is not work yet, so the sweep went
+     * past it, and the column after it is what opens it. Where the ramp turns
+     * into the next row, the cell over the lower step has the upper step on one
+     * side and the chunk wall and unmined rock on the others; the cell under the
+     * upper step is the same the other way round. Left to {@link #nextColumn},
+     * such a cell came back only on the back pass at the end of the slab, and a
+     * real run showed what that looks like: {@code -1, 103, -61} still standing
+     * beside the ramp while the sweep worked its way west along the row that
+     * cell starts. Taken along here, it falls straight after the column that
+     * opens it, from the same spot. Its drop lands beside that column's, so it
+     * needs no distance bound.
+     *
+     * <p>Three conditions keep it to that cell. First, the sweep must actually
+     * have gone past the column before. The chain always has, and the planned
+     * column has only when {@link #nextColumn} reached it scanning forward —
+     * the caller asks that. On a back pass the column before is the next one
+     * the pass has to take, not one it left behind, and offering it there
+     * batches it past {@link #CHAIN_DISTANCE}: the batching that bound exists
+     * to prevent. Both earlier forms of this condition missed that. Offered
+     * unconditionally, the corridor test's corridor — cleared on a back pass,
+     * because it lies behind the bot in snake order — took its next column into
+     * the plan from two blocks out. Offered only when that column had nothing
+     * the sweep could take on its own, the staircase fixtures, whose bot enters
+     * at the snake's end, took whole columns of sealed rock along their back
+     * pass, because rock no neighbour has opened has no face of its own either.
+     * Second, the column that opens it must fall whole. Only then is the
+     * opening one a body stands in, with the eye level with the face; a feet
+     * cell beside a head still standing, the gap under a step, leaves a
+     * one-high slot a ray has to thread from above. Third, the column must need
+     * no groundwork, which is the chain's own condition.
+     *
+     * <p>What this does not reach is a cell whose way in is not the next column
+     * of the snake: the rest of a first row the ramp runs along, or a cell walled
+     * in along its row by bedrock or the blacklist. Those still come on the back
+     * pass.
+     */
+    private void addColumnBefore(Level level, List<BlockPos> columns, int index,
+            List<BlockPos> into) {
+        if (index <= 0) {
+            return;
+        }
+        BlockPos opener = columns.get(index);
+        BlockPos before = columns.get(index - 1);
+        if (isOpen(level, opener.above(), into) && isOpen(level, opener, into)
+                && needsNoGroundwork(level, before)) {
+            addColumn(level, before, into);
+        }
+    }
+
+    /**
+     * The faces an eye on or above a two-layer slab can ever put a ray on;
+     * whether it is above the top one is {@link #hasOpenFace}'s question.
+     */
     private static final Direction[] AIMABLE_FACES = {
         Direction.UP, Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
 
     /**
-     * Whether {@code pos} has a face a ray can reach: one of its top or four
-     * sides already open, or open by the time the bot aims at it because this
-     * plan takes that neighbour out first. Its underside does not count — inside
-     * a two-layer slab the eye is never below the cell, so no standing spot can
-     * see it.
+     * Whether {@code pos} has a face a ray can reach from a bot standing in
+     * layer {@code standingY}: one of its top or four sides already open, or
+     * open by the time the bot aims at it because this plan takes that
+     * neighbour out first. Its underside does not count — inside a two-layer
+     * slab the eye is never below the cell, so no standing spot can see it.
      *
      * <p>The head-before-feet order of {@link #addColumn} is the special case
      * this generalises, and the staircase is what made the general rule
@@ -751,10 +802,12 @@ public class ChunkMinerBehavior implements BotBehavior {
      * distinction that matters against the alternative rejected in STR-063.
      * Nothing is given up on: the cell stays work, {@link #slabHasWork} asks the
      * same question so the slab is not declared finished over it, and the
-     * sweep's own back pass picks it up once the neighbour it was waiting for is
-     * gone. Only if a cell still has no open face when everything else in the
-     * slab is mined does the run move on without it, and then it really is
-     * sealed — wedged between the staircase and bedrock or a blacklisted seam.
+     * column that opens it takes it along ({@link #addColumnBefore}), with the
+     * back pass at the end of the slab behind that for a cell no column of the
+     * sweep opens in passing. Only if a cell still has no open face when
+     * everything else in the slab is mined does the run move on without it, and
+     * then it really is sealed — wedged between the staircase and bedrock or a
+     * blacklisted seam.
      * Asking the question in {@code slabHasWork} too is what keeps that case
      * from becoming the hang it would otherwise be: a slab that reports work no
      * column will accept loops SELECT_SLAB → CLEAR → SELECT_SLAB forever.
@@ -780,27 +833,63 @@ public class ChunkMinerBehavior implements BotBehavior {
      * {@link #slabHasWork} would have declared that layer finished. Deferred,
      * this cell is mined from the south a few columns later, from inside the
      * slab, at eye level.
+     *
+     * <p><b>A top face is a face only to an eye above it</b>, which makes it the
+     * one part of this that depends on where the bot stands rather than on the
+     * cell. On the slab's floor the eye is 1.62 up, inside the head layer: over
+     * a foot cell's top — this column's own head cell, the case head-before-feet
+     * is about — and under a head cell's, which is the floor of the slab
+     * overhead and therefore open on every slab but the first. Counted anyway,
+     * it made this rule say yes to the whole head layer, and a real run found
+     * the cell where that matters: the one over the lower step, whose neighbour
+     * along the ring is the upper step. The sweep turned into its row right
+     * there, with the rest of that row and the next one still standing, and the
+     * run died on {@code cannot break -1, 103, -61 (blocks mined: 25)} —
+     * {@code face=up}, three look timeouts from one unchanging spot, the hit
+     * result on the step. Asked from the floor, it now waits for a side the way
+     * the cell under a step does, and goes with the next column of its row,
+     * which opens one.
+     *
+     * <p>The sweep asks from the slab's floor and choosing a slab asks from
+     * wherever the bot is, and that difference is the point rather than a
+     * disagreement. From the slab above, a head cell's top is exactly what the
+     * bot looks down on, and a slab nobody has entered yet has no other face
+     * open anywhere: asked from its own floor, every untouched slab under the
+     * bot would read as finished and the run would end there. For the slab the
+     * bot is standing in the two questions are one question, which is what
+     * keeps a cell only its top opens from looping SELECT_SLAB → CLEAR →
+     * SELECT_SLAB.
      */
-    private boolean hasOpenFace(Level level, BlockPos pos, List<BlockPos> batch) {
+    private boolean hasOpenFace(Level level, BlockPos pos, List<BlockPos> batch, int standingY) {
         for (Direction face : AIMABLE_FACES) {
+            // A standing eye is 1.62 up: over the top of a cell in its own
+            // layer, under the top of one in the layer above.
+            if (face == Direction.UP && pos.getY() > standingY) {
+                continue;
+            }
             BlockPos neighbour = pos.relative(face);
             // A side face is only a face if an eye of this run can get in front
             // of it, and outside the chunk none ever can: those cells are never
             // mined and never walked to, so an opening out there is a hole in
             // the wall rather than a way in. The top face needs no such test —
-            // it is this column's own cell, and the bot looks down into it.
+            // the cell over it is in this column, so in the chunk.
             if (face != Direction.UP && !chunk.equals(new ChunkPos(neighbour))) {
                 continue;
             }
-            // Open already, or open by the time the bot aims at it: this batch
-            // or the standing plan takes that neighbour out first.
-            if (isPassable(level.getBlockState(neighbour))
-                    || batch.contains(neighbour)
-                    || plannedBlocks.contains(neighbour)) {
+            if (isOpen(level, neighbour, batch)) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Whether nothing stands in {@code pos} by the time the bot aims past it:
+     * open already, or taken out first by {@code batch} or the standing plan.
+     */
+    private boolean isOpen(Level level, BlockPos pos, List<BlockPos> batch) {
+        return isPassable(level.getBlockState(pos)) || batch.contains(pos)
+                || plannedBlocks.contains(pos);
     }
 
     /**
@@ -821,11 +910,11 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     // --- Slab geometry ---
 
-    private boolean slabHasWork(Level level, int feetY) {
+    private boolean slabHasWork(Level level, int feetY, int standingY) {
         for (BlockPos column : slabColumns(feetY)) {
             for (BlockPos pos : new BlockPos[] {column, column.above()}) {
-                if (isMinable(pos) && isDiggable(level.getBlockState(pos))
-                        && hasOpenFace(level, pos, List.of())) {
+                if (isMinable(level, pos) && isDiggable(level.getBlockState(pos))
+                        && hasOpenFace(level, pos, List.of(), standingY)) {
                     return true;
                 }
             }
@@ -911,8 +1000,7 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     private BlockPos nextColumn(LocalPlayer player, Level level) {
         List<BlockPos> columns = slabColumns(slabFeetY);
-        int start = columnIndex(columns,
-                sweepColumn != null ? sweepColumn : player.blockPosition());
+        int start = columnIndex(columns, scanStart(player));
         for (int i = 0; i < columns.size(); i++) {
             int ahead = start + i;
             int index = ahead < columns.size()
@@ -939,9 +1027,9 @@ public class ChunkMinerBehavior implements BotBehavior {
      */
     private boolean hasWork(Level level, BlockPos column) {
         for (BlockPos pos : new BlockPos[] {column.above(), column}) {
-            if (isMinable(pos) && !plannedBlocks.contains(pos)
+            if (isMinable(level, pos) && !plannedBlocks.contains(pos)
                     && isDiggable(level.getBlockState(pos))
-                    && hasOpenFace(level, pos, List.of())) {
+                    && hasOpenFace(level, pos, List.of(), column.getY())) {
                 return true;
             }
         }
@@ -972,6 +1060,14 @@ public class ChunkMinerBehavior implements BotBehavior {
         return clip.getType() == HitResult.Type.BLOCK && !clip.getBlockPos().equals(owed)
                 ? clip.getBlockPos()
                 : null;
+    }
+
+    /**
+     * Where {@link #nextColumn} starts looking: the column the sweep took last,
+     * or the bot's own column while the slab has none yet.
+     */
+    private BlockPos scanStart(LocalPlayer player) {
+        return sweepColumn != null ? sweepColumn : player.blockPosition();
     }
 
     /** Index of the bot's own column in the sweep, or 0 if it stands outside. */
@@ -1053,8 +1149,15 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         int top = Math.min(slabFeetY + STAIR_REPAIR_LOOKBACK - 1, fromY);
         for (int y = Math.max(slabFeetY, toY); y <= top; y++) {
-            BlockPos step = SpiralStairs.stepAt(chunk, stairTopY, y);
-            if (step == null || !isPassable(level.getBlockState(step))) {
+            BlockPos step = SpiralStairs.stepAt(chunk, y);
+            if (!isPassable(level.getBlockState(step))) {
+                continue;
+            }
+            // Asked rather than re-derived: the sweep and the repair have to
+            // mean the same thing by "step", or one builds what the other mines.
+            // On a cell already known to be empty this is the ramp's top — no
+            // step is owed in the pocket the bot is standing in.
+            if (!isStep(level, step)) {
                 continue;
             }
             // The cell the bot is standing or breathing in. Nothing can be
@@ -1514,10 +1617,16 @@ public class ChunkMinerBehavior implements BotBehavior {
         // block still standing on every batch; counting it as a retry would
         // enqueue a second task for the block already being mined and spend a
         // stepRetry each time round.
+        //
+        // The same holds when another block of the batch did fail: the retry
+        // re-queues that one, never the block under the pick. Queued with it,
+        // the second task reached a cell its first had emptied, and LOOKING
+        // cannot hit air — reported from a real run, where one failed break at
+        // a row turn cost a second pair of look timeouts on -15, 102, -60.
         BotTask current = BotController.getCurrentTask();
         BlockPos inFlight = current != null ? current.targetPos() : null;
         List<BlockPos> remaining = new ArrayList<>();
-        boolean onlyInFlight = true;
+        List<BlockPos> retry = new ArrayList<>();
         for (BlockPos pos : plannedBlocks) {
             BlockState state = level.getBlockState(pos);
             if (state.isAir()) {
@@ -1532,7 +1641,7 @@ public class ChunkMinerBehavior implements BotBehavior {
             }
             remaining.add(pos);
             if (!pos.equals(inFlight)) {
-                onlyInFlight = false;
+                retry.add(pos);
             }
         }
         blocksMined += plannedBlocks.size() - remaining.size();
@@ -1541,7 +1650,7 @@ public class ChunkMinerBehavior implements BotBehavior {
             stepRetries = 0;
             return null;
         }
-        if (onlyInFlight) {
+        if (retry.isEmpty()) {
             // Nothing to retry and nothing to give up on: the batch is done
             // but for the block being broken. Keep it in the plan so its break
             // is still counted, and let the caller plan the next batch around
@@ -1568,7 +1677,7 @@ public class ChunkMinerBehavior implements BotBehavior {
             // nobody looked at: six position timeouts at one unchanging spot
             // and `cannot break -27, 93, -61 (blocks mined: 0)`, reported
             // from a real world where the way west was missing its floor.
-            BlockPos owed = remaining.get(0);
+            BlockPos owed = retry.get(0);
             BehaviorStatus step = ensureStepToward(player, level,
                     new BlockPos(owed.getX(), slabFeetY, owed.getZ()));
             if (step != null) {
@@ -1581,10 +1690,10 @@ public class ChunkMinerBehavior implements BotBehavior {
                     blocking == null
                             ? "nothing to mend on the way there"
                             : "still standing in the way: " + shortPos(blocking));
-            enqueue(remaining);
+            enqueue(retry);
             return null;
         }
-        return fail("cannot break " + shortPos(remaining.get(0)));
+        return fail("cannot break " + shortPos(retry.get(0)));
     }
 
     /**
@@ -1633,9 +1742,39 @@ public class ChunkMinerBehavior implements BotBehavior {
      * the disagreement is back in a new shape — a column handed over that the
      * plan then refuses, or a slab left over a cell nothing can reach.
      */
-    private boolean isMinable(BlockPos pos) {
+    private boolean isMinable(Level level, BlockPos pos) {
         return pos.getY() >= toY && pos.getY() <= fromY && chunk.equals(new ChunkPos(pos))
-                && !SpiralStairs.isStairCell(chunk, stairTopY, pos);
+                && !isStep(level, pos);
+    }
+
+    /**
+     * Whether this cell is a step of the ramp — the one thing inside the chunk
+     * the sweep leaves standing.
+     *
+     * <p><em>Which</em> column carries the step is pure geometry, pinned to the
+     * world's height grid so that two runs down the same shaft cannot disagree
+     * (see {@link SpiralStairs}). This answers the other half: whether this run
+     * owes a step at this layer at all.
+     *
+     * <p>The top two layers of a range do not get one. They are the pocket the
+     * bot is standing in — air, both of them, on every argument-less start,
+     * because {@code fromY} is taken from the bot's head — so a ramp reaching up
+     * into them would have {@link #repairStairs} trying to build a step in
+     * mid-air on the first tick of every run. The ramp starts at the floor
+     * instead, which is also the level the bot walks off it onto.
+     *
+     * <p><b>Unless one is already standing there</b>, and that clause is the
+     * whole difference between this and the {@code topY} it replaces. A run
+     * resumed further down the shaft — a person restarting a stopped one, or a
+     * restock resume, since resume is {@code start()} — has its own pocket two
+     * layers deep in ground the previous run already cleared, and what is left
+     * standing in those two layers is that run's staircase. Reading the world is
+     * how the miner finds its place again everywhere else; this is the same
+     * question, asked of the ramp.
+     */
+    private boolean isStep(Level level, BlockPos pos) {
+        return SpiralStairs.isStairCell(chunk, pos)
+                && (pos.getY() <= fromY - 2 || !isPassable(level.getBlockState(pos)));
     }
 
     /**

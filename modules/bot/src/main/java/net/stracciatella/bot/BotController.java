@@ -1,5 +1,7 @@
 package net.stracciatella.bot;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Set;
@@ -198,6 +200,10 @@ public class BotController {
     // on this block rather than its neighbour.
     private static final double AIM_LOOKAHEAD_BIAS = 0.3;
     private static final double AIM_EDGE_MARGIN = 0.15;
+    // How much face around the aim point has to be in sight as well before
+    // LOOKING trusts it: the camera eases onto the point and saccades around
+    // it, so a point visible by a hair is one the crosshair keeps missing.
+    private static final double AIM_CLEARANCE = 0.1;
 
     // The vertical extent of vanilla's pickup box, relative to the feet: the
     // player box inflated by 0.5 up and down meets a 0.25-high item lying
@@ -899,7 +905,9 @@ public class BotController {
         // the next block's face, so a raycast aimed at the center actually
         // lands on the neighbor. Aiming at the exposed face guarantees the
         // raycast clears intermediate blocks and lands on the target.
-        double[] aim = aimPoint(player, target, aimFace(client, currentTask), peekNextTask(player));
+        net.minecraft.core.Direction face = aimFace(client, currentTask);
+        double[] aim = visibleAimPoint(client, player, target, face,
+                aimPoint(player, target, face, peekNextTask(player)));
         aimCameraAt(player, aim[0], aim[1], aim[2]);
 
         // Single gate before transitioning to INTERACTING: the client's
@@ -1027,20 +1035,94 @@ public class BotController {
      * it walks until the sight line is clear, and that can only work if "clear"
      * means the line it is going to use.
      *
-     * <p>The humanized aim jitter is deliberately left out — the point here is
-     * the face the camera will settle on, and a clip that wandered with the
-     * per-task offsets would answer a slightly different question on every call.
+     * <p>The humanized aim point is deliberately left out: it wanders with the
+     * per-task offsets and the lean toward the next target, so a clip to it
+     * would answer a slightly different question on every call, and LOOKING
+     * moves it onto a visible part of the face by itself
+     * ({@link #visibleAimPoint}). What this asks is whether the face's centre
+     * is in sight.
      */
     private static boolean hasLineOfSight(Minecraft client, LocalPlayer player, BotTask task) {
         BlockPos target = task.targetPos();
-        net.minecraft.core.Direction face = aimFace(client, task);
-        Vec3 aim = new Vec3(
-                target.getX() + 0.5 + face.getStepX() * 0.5,
-                target.getY() + 0.5 + face.getStepY() * 0.5,
-                target.getZ() + 0.5 + face.getStepZ() * 0.5);
+        return isInSight(client, player, target, faceCentre(target, aimFace(client, task)));
+    }
+
+    /**
+     * Where LOOKING aims: {@code humanized} when the eye can see it and the
+     * face around it, else the nearest of the face centre and the eight points
+     * {@link #AIM_EDGE_MARGIN} in from its rim and corners that it can.
+     *
+     * <p>{@link #aimPoint} is geometry on the face alone, and a point on a face
+     * is not a point in sight. At a row turn the chunk miner hands over a floor
+     * block whose top face is half hidden by the head block beside it, and that
+     * head block is the next task, so the lean toward it moves the aim point
+     * into exactly the hidden half. The camera settled on the head block, the
+     * line-of-sight check to the face centre said clear, and the task spent
+     * two look timeouts and failed. Reported from a real run: {@code -16, 102,
+     * -60} face=up from {@code (-14.74, 102.00, -60.30)}, crosshair on
+     * {@code -15, 103, -60}, {@code los=true}. The lean is not the only
+     * culprit: the jitter alone puts the point out of sight there more than a
+     * third of the time.
+     *
+     * <p>"Can see it" means {@link #AIM_CLEARANCE} of face around the point
+     * is in sight too, because the camera eases onto its aim point and
+     * saccades around it, and a point that is visible by a hair gets looked
+     * past. A candidate that is in sight without that margin is still better
+     * than one that is hidden, and is taken when there is nothing better. When
+     * nothing is in sight at all the humanized point stands, and the
+     * occlusion approach and the look timeout deal with it as before.
+     */
+    private static double[] visibleAimPoint(Minecraft client, LocalPlayer player, BlockPos target,
+                                            net.minecraft.core.Direction face, double[] humanized) {
+        Vec3 aim = new Vec3(humanized[0], humanized[1], humanized[2]);
+        Vec3 across = face.getAxis() == net.minecraft.core.Direction.Axis.X
+                ? new Vec3(0, 1, 0) : new Vec3(1, 0, 0);
+        Vec3 along = face.getAxis() == net.minecraft.core.Direction.Axis.Z
+                ? new Vec3(0, 1, 0) : new Vec3(0, 0, 1);
+        Vec3 centre = faceCentre(target, face);
+        double inset = 0.5 - AIM_EDGE_MARGIN;
+        List<Vec3> candidates = new ArrayList<>();
+        candidates.add(aim);
+        for (int i = -1; i <= 1; i++) {
+            for (int j = -1; j <= 1; j++) {
+                candidates.add(centre.add(across.scale(i * inset)).add(along.scale(j * inset)));
+            }
+        }
+        candidates.sort(Comparator.comparingDouble(aim::distanceToSqr));
+        Vec3 inSight = null;
+        for (Vec3 point : candidates) {
+            if (!isInSight(client, player, target, point)) {
+                continue;
+            }
+            if (isInSight(client, player, target, point.add(across.scale(AIM_CLEARANCE)))
+                    && isInSight(client, player, target, point.subtract(across.scale(AIM_CLEARANCE)))
+                    && isInSight(client, player, target, point.add(along.scale(AIM_CLEARANCE)))
+                    && isInSight(client, player, target, point.subtract(along.scale(AIM_CLEARANCE)))) {
+                return new double[] {point.x, point.y, point.z};
+            }
+            if (inSight == null) {
+                inSight = point;
+            }
+        }
+        return inSight != null ? new double[] {inSight.x, inSight.y, inSight.z} : humanized;
+    }
+
+    /**
+     * Whether a ray from the eye reaches {@code point} without passing through
+     * another block. A ray that ends on the target itself counts as clear —
+     * clip stops at the target's own outline.
+     */
+    private static boolean isInSight(Minecraft client, LocalPlayer player, BlockPos target, Vec3 point) {
         BlockHitResult clip = client.level.clip(new ClipContext(player.getEyePosition(),
-                aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+                point, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
         return clip.getType() != HitResult.Type.BLOCK || clip.getBlockPos().equals(target);
+    }
+
+    private static Vec3 faceCentre(BlockPos pos, net.minecraft.core.Direction face) {
+        return new Vec3(
+                pos.getX() + 0.5 + face.getStepX() * 0.5,
+                pos.getY() + 0.5 + face.getStepY() * 0.5,
+                pos.getZ() + 0.5 + face.getStepZ() * 0.5);
     }
 
     /**

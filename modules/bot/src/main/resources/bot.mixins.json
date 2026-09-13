@@ -6,7 +6,6 @@
 
   ],
   "client": [
-    "ClientCommonPacketListenerImplMixin",
     "ClientLevelAccessor",
     "ClientPacketListenerMixin",
     "MinecraftMixin"

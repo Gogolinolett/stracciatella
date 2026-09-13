@@ -1084,8 +1084,9 @@ public class BotTests {
      * drop in sight used to cost. Whether vanilla inhaled that one in
      * passing is deliberately not asserted.
      *
-     * <p>The list is edited in place and restored, never saved: the test
-     * must not leave a real config behind with cobblestone on it.
+     * <p>The list is edited in place and put back whole, never saved: the
+     * test must not leave a real config behind that it changed, and a later
+     * test in the same run does save whatever it finds.
      */
     @MinecraftTest(name = "Bot ignores a listed drop", timeoutTicks = 400, order = -177)
     public void ignoresListedDrop(TestContext ctx) {
@@ -1100,12 +1101,15 @@ public class BotTests {
         ctx.runCommand("give @s diamond_pickaxe");
         switchToSurvivalAt(ctx, origin, origin.getY());
 
-        // Whether it was already on the player's own list decides whether the
-        // finally may take it off again: an add that was a no-op must not be
-        // undone by a removal that is not, or the test quietly edits a real
-        // config — and a later test in the same run saves that file.
-        final boolean alreadyIgnored = ctx.computeOnClient(mc ->
-                BotController.CONFIG.ignoredItems.contains(cobblestone));
+        // The whole list is set aside and put back, not the one entry. Adding
+        // an entry the list already holds is not a no-op — it appends a second
+        // copy — so a removal skipped on the grounds that the entry was
+        // already there, which is what stood here, leaves that copy behind on
+        // every run of a player who ignores cobblestone themselves, and
+        // `Bot ignore commands edit the list` writes the list to disk later in
+        // the same run. Twelve copies had piled up in a real bot.json.
+        final List<String> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(BotController.CONFIG.ignoredItems));
         ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.add(cobblestone));
         try {
             ctx.runCommand("summon item " + (bait.getX() + 0.5) + " " + bait.getY()
@@ -1142,9 +1146,10 @@ public class BotTests {
             LOGGER.info("Ignored drop test passed ({} ticks, {} blocks from the bait)",
                     elapsed, String.format("%.2f", toBait));
         } finally {
-            if (!alreadyIgnored) {
-                ctx.runOnClient(mc -> BotController.CONFIG.ignoredItems.remove(cobblestone));
-            }
+            ctx.runOnClient(mc -> {
+                BotController.CONFIG.ignoredItems.clear();
+                BotController.CONFIG.ignoredItems.addAll(before);
+            });
         }
     }
 

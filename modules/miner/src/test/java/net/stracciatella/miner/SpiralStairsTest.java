@@ -24,7 +24,13 @@ import org.junit.jupiter.api.Test;
  */
 class SpiralStairsTest {
 
-    private static final int TOP_Y = 64;
+    /**
+     * Where the scans below start. Nothing but a place to begin — the geometry
+     * has no notion of a top any more, which is the whole of
+     * {@link #theRampIsPinnedToTheWorldsHeightGrid}.
+     */
+    private static final int SCAN_TOP = 64;
+
     private static final int LAST = SpiralStairs.CHUNK_SIZE - 1;
 
     @Test
@@ -61,14 +67,15 @@ class SpiralStairsTest {
 
     @Test
     void consecutiveStepsAreOneAcrossAndOneDown() {
-        for (int index = 1; index < SpiralStairs.RING_LENGTH; index++) {
-            int[] previous = SpiralStairs.ringOffset(index - 1);
-            int[] current = SpiralStairs.ringOffset(index);
-            int horizontal = Math.abs(current[0] - previous[0]) + Math.abs(current[1] - previous[1]);
-            assertEquals(1, horizontal, "step " + index + " is not horizontally adjacent");
-            assertEquals(SpiralStairs.stepY(TOP_Y, index - 1) - 1,
-                    SpiralStairs.stepY(TOP_Y, index),
-                    "step " + index + " drops by more than one");
+        // Asked layer by layer rather than step by step, because a layer is now
+        // the only thing the geometry is given: one down is true by construction
+        // and one across is the claim.
+        for (int y = SCAN_TOP; y > SCAN_TOP - 2 * SpiralStairs.RING_LENGTH; y--) {
+            int[] above = SpiralStairs.ringOffset(SpiralStairs.ringIndexAt(y));
+            int[] below = SpiralStairs.ringOffset(SpiralStairs.ringIndexAt(y - 1));
+            int horizontal = Math.abs(below[0] - above[0]) + Math.abs(below[1] - above[1]);
+            assertEquals(1, horizontal,
+                    "the step under y=" + y + " is not horizontally adjacent to it");
         }
     }
 
@@ -78,28 +85,27 @@ class SpiralStairsTest {
         int[] last = SpiralStairs.ringOffset(SpiralStairs.RING_LENGTH - 1);
         int horizontal = Math.abs(first[0] - last[0]) + Math.abs(first[1] - last[1]);
         assertEquals(1, horizontal, "the ring does not close");
-        // One step down from the last lands a full circuit under the first, which
-        // is what makes the next loop continue the same ramp instead of starting
-        // a second one beside it.
-        assertEquals(TOP_Y - SpiralStairs.RING_LENGTH,
-                SpiralStairs.stepY(TOP_Y, SpiralStairs.RING_LENGTH - 1) - 1);
+        // A full circuit lands directly under where it started, which is what
+        // makes the next loop continue the same ramp instead of starting a
+        // second one beside it.
+        assertEquals(SpiralStairs.ringIndexAt(SCAN_TOP),
+                SpiralStairs.ringIndexAt(SCAN_TOP - SpiralStairs.RING_LENGTH));
     }
 
     @Test
     void everyStepIsAStairCellAndTheCellsAroundItAreNot() {
-        for (int index = 0; index < SpiralStairs.RING_LENGTH; index++) {
-            int[] offset = SpiralStairs.ringOffset(index);
-            int y = SpiralStairs.stepY(TOP_Y, index);
-            assertTrue(SpiralStairs.isStairCell(TOP_Y, offset[0], offset[1], y),
-                    "step " + index + " is not recognised");
+        for (int y = SCAN_TOP; y > SCAN_TOP - SpiralStairs.RING_LENGTH; y--) {
+            int[] offset = SpiralStairs.ringOffset(SpiralStairs.ringIndexAt(y));
+            assertTrue(SpiralStairs.isStairCell(offset[0], offset[1], y),
+                    "the step at y=" + y + " is not recognised");
             // The two cells above have to be free, or there is no headroom to
             // walk in and the ramp is a row of blocks in a solid wall.
-            assertFalse(SpiralStairs.isStairCell(TOP_Y, offset[0], offset[1], y + 1),
-                    "the headroom above step " + index + " is claimed");
-            assertFalse(SpiralStairs.isStairCell(TOP_Y, offset[0], offset[1], y + 2),
-                    "the second headroom cell above step " + index + " is claimed");
-            assertFalse(SpiralStairs.isStairCell(TOP_Y, offset[0], offset[1], y - 1),
-                    "the cell under step " + index + " is claimed");
+            assertFalse(SpiralStairs.isStairCell(offset[0], offset[1], y + 1),
+                    "the headroom above the step at y=" + y + " is claimed");
+            assertFalse(SpiralStairs.isStairCell(offset[0], offset[1], y + 2),
+                    "the second headroom cell above the step at y=" + y + " is claimed");
+            assertFalse(SpiralStairs.isStairCell(offset[0], offset[1], y - 1),
+                    "the cell under the step at y=" + y + " is claimed");
         }
     }
 
@@ -107,11 +113,11 @@ class SpiralStairsTest {
     void exactlyOneCellPerLayerIsAStairCell() {
         // The sweep's whole cost for the staircase — and the reason descending
         // through the bot's own column almost never meets one.
-        for (int y = TOP_Y; y > TOP_Y - 3 * SpiralStairs.RING_LENGTH; y--) {
+        for (int y = SCAN_TOP; y > SCAN_TOP - 3 * SpiralStairs.RING_LENGTH; y--) {
             int claimed = 0;
             for (int x = 0; x < SpiralStairs.CHUNK_SIZE; x++) {
                 for (int z = 0; z < SpiralStairs.CHUNK_SIZE; z++) {
-                    if (SpiralStairs.isStairCell(TOP_Y, x, z, y)) {
+                    if (SpiralStairs.isStairCell(x, z, y)) {
                         claimed++;
                     }
                 }
@@ -127,12 +133,12 @@ class SpiralStairsTest {
         // cell the sweep then mines is a bot that fills in its own staircase
         // forever, and one that names a different cell leaves the real step out
         // and builds a pillar beside it.
-        for (int y = TOP_Y + 2; y > TOP_Y - 2 * SpiralStairs.RING_LENGTH; y--) {
-            int index = SpiralStairs.ringIndexAt(TOP_Y, y);
+        for (int y = SCAN_TOP + 2; y > SCAN_TOP - 2 * SpiralStairs.RING_LENGTH; y--) {
+            int index = SpiralStairs.ringIndexAt(y);
             for (int x = 0; x < SpiralStairs.CHUNK_SIZE; x++) {
                 for (int z = 0; z < SpiralStairs.CHUNK_SIZE; z++) {
-                    boolean claimed = SpiralStairs.isStairCell(TOP_Y, x, z, y);
-                    assertEquals(index >= 0 && SpiralStairs.ringIndex(x, z) == index, claimed,
+                    assertEquals(SpiralStairs.ringIndex(x, z) == index,
+                            SpiralStairs.isStairCell(x, z, y),
                             "disagreement at " + x + "," + z + " y=" + y);
                 }
             }
@@ -140,11 +146,28 @@ class SpiralStairsTest {
     }
 
     @Test
-    void nothingAboveTheTopIsAStairCell() {
-        for (int index = 0; index < SpiralStairs.RING_LENGTH; index++) {
-            int[] offset = SpiralStairs.ringOffset(index);
-            assertFalse(SpiralStairs.isStairCell(TOP_Y, offset[0], offset[1], TOP_Y + 1),
-                    "a cell above the mined range is claimed at index " + index);
+    void theRampIsPinnedToTheWorldsHeightGrid() {
+        // The regression this class exists to prevent a second time. The ring
+        // position used to be counted down from a topY the miner took from
+        // wherever the bot was standing when the run began, so restarting a run
+        // two blocks lower rotated every step in the shaft by two and the sweep
+        // ate the staircase it had just left. The layer alone may decide.
+        assertEquals(0, SpiralStairs.ringIndexAt(0));
+        assertEquals(1, SpiralStairs.ringIndexAt(-1));
+        assertEquals(SpiralStairs.RING_LENGTH - 1, SpiralStairs.ringIndexAt(1));
+        assertEquals(0, SpiralStairs.ringIndexAt(SpiralStairs.RING_LENGTH));
+        assertEquals(21, SpiralStairs.ringIndexAt(39));
+
+        // Pinning it to the height grid puts the wrap at y=0, which is inside
+        // every real shaft: the miner's default floor is -59 and a chunk started
+        // at the surface crosses zero on the way down. A ramp that stepped twice
+        // or not at all there would be a two-block climb nobody can make, forty
+        // layers into a run.
+        for (int y = 2; y > -SpiralStairs.RING_LENGTH; y--) {
+            int[] above = SpiralStairs.ringOffset(SpiralStairs.ringIndexAt(y));
+            int[] below = SpiralStairs.ringOffset(SpiralStairs.ringIndexAt(y - 1));
+            assertEquals(1, Math.abs(below[0] - above[0]) + Math.abs(below[1] - above[1]),
+                    "the ramp breaks stride between y=" + y + " and y=" + (y - 1));
         }
     }
 
@@ -152,8 +175,8 @@ class SpiralStairsTest {
     void theChunkInteriorIsNeverAStairCell() {
         for (int x = 1; x < LAST; x++) {
             for (int z = 1; z < LAST; z++) {
-                for (int y = TOP_Y; y > TOP_Y - 70; y--) {
-                    assertFalse(SpiralStairs.isStairCell(TOP_Y, x, z, y),
+                for (int y = SCAN_TOP; y > SCAN_TOP - 70; y--) {
+                    assertFalse(SpiralStairs.isStairCell(x, z, y),
                             "interior column " + x + "," + z + " claimed at y=" + y);
                 }
             }
@@ -166,7 +189,7 @@ class SpiralStairsTest {
         assertEquals(-1, SpiralStairs.ringIndex(0, -1));
         assertEquals(-1, SpiralStairs.ringIndex(SpiralStairs.CHUNK_SIZE, 0));
         assertEquals(-1, SpiralStairs.ringIndex(0, SpiralStairs.CHUNK_SIZE));
-        assertFalse(SpiralStairs.isStairCell(TOP_Y, -1, 0, TOP_Y));
-        assertFalse(SpiralStairs.isStairCell(TOP_Y, SpiralStairs.CHUNK_SIZE, 0, TOP_Y));
+        assertFalse(SpiralStairs.isStairCell(-1, 0, SCAN_TOP));
+        assertFalse(SpiralStairs.isStairCell(SpiralStairs.CHUNK_SIZE, 0, SCAN_TOP));
     }
 }

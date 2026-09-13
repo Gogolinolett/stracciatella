@@ -76,6 +76,34 @@ Decision paths in priority order:
 8. **Edge-distance**: fractional block position checks for when to fire/hold
 9. **Fallback**: block-edge position check
 
+**Whether a jump is owed is a question about the ground and about the step the
+mesh planned, never about how far the target still is.** `gap` is the Chebyshev
+distance from the block the player is *standing in* to the target node's block,
+and for a long time it was enough on its own: `needsJump` fired on `gap > 1`.
+But a node counts as reached anywhere within 0.65 of its centre (the
+intermediate box check, `ARRIVAL_MARGIN`), which is wider than the node's own
+block — so a node ticked off from the near edge of that box leaves the player
+one block short of the node it has just left behind, and the *next* node then
+reads as gap=2 with nothing at all in between: flat ground, solid the whole
+way, and the bot hops over it. The planned step decides instead (`nodeGap > 1`).
+Nothing else moves: a hole to cross is `forwardAir`'s question, a rise is
+`feetToTargetDy`'s and `blockInFront`'s, and all three still fire on their own.
+
+Reported as a bot that "sometimes jumps at corners", and a corner is where it
+shows most — braking into a turn is what leaves the bot furthest from a centre
+when arrival fires — but it is not only corners. Measured on the dead-straight
+corridor of `Bot walk and mine`: the bot hopped at z=998.03 heading for a target
+at z=996, `forwardAir=false`, the target at its own feet level, `nodeGap=1`.
+Across one bot+pathfinding run 4 of 259 jumps were this, every one of them with
+`nodeGap` below `gap`; afterwards **every** jump in the run had `gap == nodeGap`
+and the parkour counts were unchanged to the jump (62 three-gaps, 53 four-gaps,
+53 long-range).
+
+Note the position-based `gap` is still what the *caller* reads out of the
+returned `JumpDecision` to decide `stabilizeForJump`, and still what classifies
+a jump once one is owed (`effectiveGap = max(gap, nodeGap)`, so a gap that has
+shrunk on the approach cannot demote a long jump).
+
 ### Key mechanics
 
 - **Retreat phase** (gap ≥ 5): Player walks backward to back edge of block to maximize sprint runway. Uses a fixed origin reference (recorded when retreat starts) to prevent backProgress from resetting when crossing block boundaries on single-block platforms
@@ -314,6 +342,33 @@ rebuilding a step — are a different permission and do not pass through here.
 - In-game tests in `test/EnderPearlTests.java` (registered by PathfindingModule) — tests EnderPearlTravelMethod at 10/20/30 block flat, uphill, and downhill distances
 - JUnit tests in `src/test/.../MeshPathfinderTest.java` (A* algorithm verification)
 - Run in-game tests: `/stracciatella-test` after joining a world
+
+### One course has a floor
+
+Every course in `PathWalkerTests` is parkour — single blocks with air between —
+so a jump is the right answer everywhere in them, and none of them could ever
+ask whether the walker jumps where it should not. *Flat corner without a hop* is
+the exception: ten blocks, a right-angle turn, ten more, all solid and all at
+one height, and the player's Y may not leave it (`FLOOR_HOP_TOLERANCE`, 0.3,
+against a jump that clears a whole block). It is the same `runMultiCourse` with
+adjacent waypoints — a contiguous chain of them *is* a floor, and the node list
+of a mesh path across one — plus a flag that turns leaving the ground into a
+failure. The turn is the point: arrival is accepted up to 0.65 from a node's
+centre, and a bot braking into a corner is the one that ticks a node off from
+the far edge of that.
+
+### A course has to be checked, not just placed
+
+`buildMultiCourse` places its blocks and then confirms they arrived. A
+`setblock` into a chunk the server has not loaded yet is refused outright —
+*That position is not loaded* in chat, no block, and no error the caller can
+see — while the client's own `hasChunkAt`, which the setup waits on, answers
+yes before the server agrees. A course reaching into the next chunk therefore
+came out with holes in it and the start teleport dropped the player through
+one, so the walk failed as `Player fell` a hundred blocks under a course it had
+never stood on. First repeat only, every time: by the second the blocks of the
+first are still standing. `BUILD_ATTEMPTS` (5) rounds of placing back whatever
+is still air, then the fixture says so rather than the walk taking the blame.
 
 ### EnderPearl cooldown gating in tests
 

@@ -12,8 +12,10 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.Blocks;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.behavior.BehaviorRunner;
+import net.stracciatella.bot.task.MineBlockTask;
 import net.stracciatella.miner.MinerConfig;
 import net.stracciatella.miner.MinerSetup;
+import net.stracciatella.miner.SpiralStairs;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
 import net.stracciatella.testing.api.TestSuite;
@@ -58,6 +60,24 @@ public class ChunkMinerTests {
     private static final int STAND_DX = 7;
     private static final int STAND_DZ = 7;
     private static final int Y = 40;
+
+    /**
+     * Fixture height for the three staircase tests, which is not free to be 40
+     * like everything else here.
+     *
+     * <p>All three are built around the chunk's <em>minimum corner</em> — the one
+     * cell with two faces pointing out of the chunk, which is what they are
+     * about — so they need a fixture whose floor layer is the layer that owes
+     * its step there. The ramp is pinned to the world's height grid (see
+     * {@link SpiralStairs}), so that is a fact about the height and nothing
+     * else: at {@link #Y} the step for the floor layer sits on the east edge
+     * instead, and the corner would come out with the rest of the slab.
+     *
+     * <p>Derived rather than written down, so it follows the geometry if the
+     * ramp is ever re-pinned: the first height at or above {@code Y} whose floor
+     * layer is a corner layer.
+     */
+    private static final int STAIR_Y = Y + SpiralStairs.ringIndexAt(Y - 1);
 
     // ================================================================
     // Test 1: clears the blocks of a single slab
@@ -1980,19 +2000,19 @@ public class ChunkMinerTests {
     @MinecraftTest(name = "Chunk miner leaves a staircase and mends it",
             timeoutTicks = 4000, order = 37)
     public void leavesAndMendsAStaircase(TestContext ctx) {
-        prepareWithFloor(ctx, 1, 0, 0, 7, 0, 1);
-        // The lower slab's foot layer, plus the floor under it. Y - 3 is below
+        prepareWithFloor(ctx, STAIR_Y, 1, 0, 0, 7, 0, 1);
+        // The lower slab's foot layer, plus the floor under it. STAIR_Y - 3 is below
         // the range, so it is never mined and is what the rebuilt step is
         // placed against.
-        fill(ctx, 0, Y - 3, 0, 7, Y - 2, 1, "stone");
+        fill(ctx, 0, STAIR_Y - 3, 0, 7, STAIR_Y - 2, 1, "stone");
         ctx.runCommand("give @s cobblestone 64");
-        final BlockPos lastFilled = new BlockPos(BASE_X + 7, Y - 2, BASE_Z + 1);
+        final BlockPos lastFilled = new BlockPos(BASE_X + 7, STAIR_Y - 2, BASE_Z + 1);
         ctx.waitFor(mc -> !mc.level.getBlockState(lastFilled).isAir());
 
-        runChunkMiner(ctx, Y + 1, Y - 2, true);
+        runChunkMiner(ctx, STAIR_Y + 1, STAIR_Y - 2, true);
 
-        final BlockPos topStep = new BlockPos(BASE_X, Y - 1, BASE_Z);
-        final BlockPos dugStep = new BlockPos(BASE_X + 1, Y - 2, BASE_Z);
+        final BlockPos topStep = new BlockPos(BASE_X, STAIR_Y - 1, BASE_Z);
+        final BlockPos dugStep = new BlockPos(BASE_X + 1, STAIR_Y - 2, BASE_Z);
         assertNotAir(ctx, topStep, "the staircase's top step");
         boolean rebuilt = ctx.computeOnClient(mc ->
                 mc.level.getBlockState(dugStep).is(Blocks.COBBLESTONE));
@@ -2004,7 +2024,7 @@ public class ChunkMinerTests {
         }
         for (int dx = 0; dx <= 7; dx++) {
             for (int dz = 0; dz <= 1; dz++) {
-                for (int y = Y - 2; y <= Y + 1; y++) {
+                for (int y = STAIR_Y - 2; y <= STAIR_Y + 1; y++) {
                     BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
                     if (cell.equals(topStep) || cell.equals(dugStep)) {
                         continue;
@@ -2042,8 +2062,8 @@ public class ChunkMinerTests {
         // Standing inside the chunk, not on its ring: the descent digs its own
         // column, and on a ring column that column holds a step — which would
         // hand the cell under test an open side for as long as the repair takes.
-        prepareWithFloor(ctx, 4, 1, 0, 7, 0, 1);
-        fill(ctx, 0, Y - 3, 0, 7, Y - 2, 1, "stone");
+        prepareWithFloor(ctx, STAIR_Y, 4, 1, 0, 7, 0, 1);
+        fill(ctx, 0, STAIR_Y - 3, 0, 7, STAIR_Y - 2, 1, "stone");
         // A catch floor one layer under the range — never mined (isMinable caps
         // at toY), never asserted on, and it is what keeps this fixture from
         // being a cliff. The worked strip is two columns wide with nothing
@@ -2052,24 +2072,24 @@ public class ChunkMinerTests {
         // blocks in, and it only happened under the load of a full run. The
         // bedrock below invites a step-up jump, and a jump is airborne, where
         // the crouch that normally holds the bot at a rim does not apply.
-        fill(ctx, -2, Y - 3, -2, 9, Y - 3, 3, "stone");
-        final BlockPos walledIn = new BlockPos(BASE_X, Y - 2, BASE_Z);
-        final BlockPos lid = new BlockPos(BASE_X, Y - 1, BASE_Z);
-        final BlockPos stepBeside = new BlockPos(BASE_X + 1, Y - 2, BASE_Z);
-        final BlockPos inward = new BlockPos(BASE_X, Y - 2, BASE_Z + 1);
+        fill(ctx, -2, STAIR_Y - 3, -2, 9, STAIR_Y - 3, 3, "stone");
+        final BlockPos walledIn = new BlockPos(BASE_X, STAIR_Y - 2, BASE_Z);
+        final BlockPos lid = new BlockPos(BASE_X, STAIR_Y - 1, BASE_Z);
+        final BlockPos stepBeside = new BlockPos(BASE_X + 1, STAIR_Y - 2, BASE_Z);
+        final BlockPos inward = new BlockPos(BASE_X, STAIR_Y - 2, BASE_Z + 1);
         setBlock(ctx, inward, "bedrock");
-        setBlock(ctx, new BlockPos(BASE_X - 1, Y - 2, BASE_Z), "stone");
-        setBlock(ctx, new BlockPos(BASE_X, Y - 2, BASE_Z - 1), "stone");
+        setBlock(ctx, new BlockPos(BASE_X - 1, STAIR_Y - 2, BASE_Z), "stone");
+        setBlock(ctx, new BlockPos(BASE_X, STAIR_Y - 2, BASE_Z - 1), "stone");
         ctx.runCommand("give @s cobblestone 64");
 
-        runChunkMiner(ctx, Y + 1, Y - 2, true);
+        runChunkMiner(ctx, STAIR_Y + 1, STAIR_Y - 2, true);
 
         assertNotAir(ctx, lid, "the step over the walled-in cell");
         assertNotAir(ctx, stepBeside, "the step beside the walled-in cell");
         assertNotAir(ctx, walledIn, "the walled-in cell");
         for (int dx = 0; dx <= 7; dx++) {
             for (int dz = 0; dz <= 1; dz++) {
-                for (int y = Y - 2; y <= Y + 1; y++) {
+                for (int y = STAIR_Y - 2; y <= STAIR_Y + 1; y++) {
                     BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
                     if (cell.equals(lid) || cell.equals(stepBeside)
                             || cell.equals(walledIn) || cell.equals(inward)) {
@@ -2111,12 +2131,12 @@ public class ChunkMinerTests {
         // Standing inside the chunk, not on its ring, for the same reason as the
         // walled-in fixture: a descent through a ring column digs the step out
         // and would hand the cell a face while the repair is pending.
-        prepareWithFloor(ctx, 4, 1, 0, 7, 0, 1);
-        fill(ctx, 0, Y - 3, 0, 7, Y - 2, 1, "stone");
-        fill(ctx, -2, Y - 3, -2, 9, Y - 3, 3, "stone");
-        final BlockPos underStep = new BlockPos(BASE_X, Y - 2, BASE_Z);
-        final BlockPos lid = new BlockPos(BASE_X, Y - 1, BASE_Z);
-        final BlockPos stepBeside = new BlockPos(BASE_X + 1, Y - 2, BASE_Z);
+        prepareWithFloor(ctx, STAIR_Y, 4, 1, 0, 7, 0, 1);
+        fill(ctx, 0, STAIR_Y - 3, 0, 7, STAIR_Y - 2, 1, "stone");
+        fill(ctx, -2, STAIR_Y - 3, -2, 9, STAIR_Y - 3, 3, "stone");
+        final BlockPos underStep = new BlockPos(BASE_X, STAIR_Y - 2, BASE_Z);
+        final BlockPos lid = new BlockPos(BASE_X, STAIR_Y - 1, BASE_Z);
+        final BlockPos stepBeside = new BlockPos(BASE_X + 1, STAIR_Y - 2, BASE_Z);
         // The rim, on both outward sides: the cell's own level is already air
         // out there (the prepare clears a margin round the chunk), and rock goes
         // over it. Open to a ray, one cell high, outside the chunk. The rock is
@@ -2124,21 +2144,21 @@ public class ChunkMinerTests {
         // stand out there and mine the cell, and the run would pass with the
         // rule reverted.
         for (BlockPos slot : new BlockPos[] {
-                new BlockPos(BASE_X - 1, Y - 2, BASE_Z),
-                new BlockPos(BASE_X, Y - 2, BASE_Z - 1)}) {
+                new BlockPos(BASE_X - 1, STAIR_Y - 2, BASE_Z),
+                new BlockPos(BASE_X, STAIR_Y - 2, BASE_Z - 1)}) {
             setBlock(ctx, slot.above(), "stone");
             setBlock(ctx, slot.above().above(), "stone");
         }
         ctx.runCommand("give @s cobblestone 64");
 
-        runChunkMiner(ctx, Y + 1, Y - 2, true);
+        runChunkMiner(ctx, STAIR_Y + 1, STAIR_Y - 2, true);
 
         assertNotAir(ctx, lid, "the step over the cell");
         assertNotAir(ctx, stepBeside, "the step beside the cell");
         assertAir(ctx, underStep, "the cell under the step");
         for (int dx = 0; dx <= 7; dx++) {
             for (int dz = 0; dz <= 1; dz++) {
-                for (int y = Y - 2; y <= Y + 1; y++) {
+                for (int y = STAIR_Y - 2; y <= STAIR_Y + 1; y++) {
                     BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
                     if (cell.equals(lid) || cell.equals(stepBeside)) {
                         continue;
@@ -2148,6 +2168,381 @@ public class ChunkMinerTests {
             }
         }
         LOGGER.info("Chunk miner rim slot test passed");
+    }
+
+    // ================================================================
+    // Test 40: a second run does not eat the first run's staircase
+    // ================================================================
+
+    /**
+     * The bug this suite could not see: <b>the ramp moved between runs.</b>
+     *
+     * <p>Reported as a staircase mined away at every layer, and the log said it
+     * plainly — {@code staircase from y=103} on one run and {@code y=101} on the
+     * next, in the same shaft. The ring position used to be counted down from a
+     * {@code topY} the behavior took from wherever the bot was standing at
+     * {@code start()}, so a run that began two blocks lower rotated every step
+     * by two: the sweep mined the cells the previous run had spared and spared
+     * their neighbours instead, layer after layer, and what was left was not a
+     * ramp any more.
+     *
+     * <p>Two starts, both <b>argument-less</b>, because that is the only shape
+     * the bug had: a requested range fixes {@code fromY} and both runs then
+     * agree by accident. The second stands the bot two layers down, the way a
+     * person restarting a stopped run does — and the way a restock resume does,
+     * since resume is {@code start()}. Its slab covers both layers the first run
+     * left steps in, so with the ramp keyed to the run those two cells are
+     * ordinary work; keyed to the layer they are the same two cells as before.
+     *
+     * <p>The refill is the dz=1 row only. The second run needs work in that slab
+     * or it has no reason to look at those layers at all, and the bot needs the
+     * dz=0 row to stand in.
+     */
+    @MinecraftTest(name = "Chunk miner keeps the staircase when a run starts again lower",
+            timeoutTicks = 6000, order = 40)
+    public void keepsTheStaircaseAcrossARestart(TestContext ctx) {
+        prepareWithFloor(ctx, STAIR_Y, 1, 0, 0, 7, 0, 1);
+        fill(ctx, 0, STAIR_Y - 3, 0, 7, STAIR_Y - 2, 1, "stone");
+        ctx.runCommand("give @s cobblestone 64");
+        final BlockPos lastFilled = new BlockPos(BASE_X + 7, STAIR_Y - 2, BASE_Z + 1);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastFilled).isAir());
+
+        final BlockPos topStep = new BlockPos(BASE_X, STAIR_Y - 1, BASE_Z);
+        final BlockPos lowerStep = new BlockPos(BASE_X + 1, STAIR_Y - 2, BASE_Z);
+
+        // Only the bottom is pinned, as in `resumes the layer it stands in`: the
+        // top is what has to keep coming from the bot, because that is the whole
+        // difference between the two runs.
+        final int configuredBottom = MinerSetup.CONFIG.chunkMinerBottomY;
+        MinerSetup.CONFIG.chunkMinerBottomY = STAIR_Y - 2;
+        try {
+            startChunkMiner(ctx, false, 0, 0);
+            awaitChunkMiner(ctx, true);
+            assertNotAir(ctx, topStep, "the first run's top step");
+            assertNotAir(ctx, lowerStep, "the first run's second step");
+
+            fill(ctx, 2, STAIR_Y - 2, 1, 7, STAIR_Y - 2, 1, "stone");
+            final BlockPos refilled = new BlockPos(BASE_X + 7, STAIR_Y - 2, BASE_Z + 1);
+            ctx.waitFor(mc -> !mc.level.getBlockState(refilled).isAir());
+            standAt(ctx, new BlockPos(BASE_X + 4, STAIR_Y - 2, BASE_Z));
+
+            startChunkMiner(ctx, false, 0, 0);
+            awaitChunkMiner(ctx, true);
+        } finally {
+            MinerSetup.CONFIG.chunkMinerBottomY = configuredBottom;
+        }
+
+        assertNotAir(ctx, topStep, "the top step, after a run that started two layers lower");
+        assertNotAir(ctx, lowerStep, "the second step, after a run that started two layers lower");
+        LOGGER.info("Chunk miner staircase-across-a-restart test passed");
+    }
+
+    // ================================================================
+    // Test 41: a top face is no face to an eye on the slab floor
+    // ================================================================
+
+    /**
+     * The head cell over the lower of a slab's two steps — the upper step beside
+     * it, the lower one under it — is the one cell the ramp can leave with
+     * nothing open but its top, and a top face in the head layer is above the
+     * eye of a bot standing on the slab floor. It counted as a face anyway, so
+     * the sweep handed the cell over as soon as it reached it, and a real run
+     * died there: {@code cannot break -1, 103, -61 (blocks mined: 25)},
+     * {@code face=up}, three look timeouts from one unchanging spot with the hit
+     * result on the upper step.
+     *
+     * <p>Built the way that run met it. The upper step is chunk-local (15, 2)
+     * and the lower (15, 3), on the second slab of the range, whose snake runs
+     * its rows from the south: the back pass comes east along row 2 and turns
+     * into row 3 at this very cell. The bot descends at (14, 1), off the ring,
+     * with nothing to dig ahead of it, so the back pass is the first thing the
+     * sweep does. The cell's west and south neighbours are single blocks with
+     * air under them — enough to cover both sides, and nothing a bot on the
+     * floor can climb to put its eye over the top.
+     *
+     * <p>Asserts the cell is mined rather than left: its west neighbour is the
+     * next column of its own row, so it has a side to wait for. Both steps
+     * stay.
+     */
+    @MinecraftTest(name = "Chunk miner waits out a cell only its top face opens",
+            timeoutTicks = 4000, order = 41)
+    public void waitsOutACellOnlyItsTopOpens(TestContext ctx) {
+        // The first head layer at or above Y whose step is chunk-local (15, 2),
+        // derived like STAIR_Y; the layer under it owes its step at (15, 3).
+        final int head = Y + Math.floorMod(
+                SpiralStairs.ringIndexAt(Y) - SpiralStairs.ringIndex(15, 2),
+                SpiralStairs.RING_LENGTH);
+        final int feet = head - 1;
+        prepareWithFloor(ctx, head + 1, 14, 1, 14, 14, 1, 1);
+        fill(ctx, 0, feet - 1, 0, 15, feet - 1, 6, "stone");
+        final BlockPos upperStep = new BlockPos(BASE_X + 15, head, BASE_Z + 2);
+        final BlockPos lowerStep = new BlockPos(BASE_X + 15, feet, BASE_Z + 3);
+        final BlockPos cell = new BlockPos(BASE_X + 15, head, BASE_Z + 3);
+        final BlockPos west = new BlockPos(BASE_X + 14, head, BASE_Z + 3);
+        final BlockPos south = new BlockPos(BASE_X + 15, head, BASE_Z + 4);
+        for (BlockPos pos : new BlockPos[] {upperStep, lowerStep, cell, west, south}) {
+            setBlock(ctx, pos, "stone");
+        }
+        ctx.runCommand("give @s cobblestone 64");
+
+        runChunkMiner(ctx, head + 2, feet, true);
+
+        assertNotAir(ctx, upperStep, "the upper step");
+        assertNotAir(ctx, lowerStep, "the lower step");
+        assertAir(ctx, cell, "the cell over the lower step");
+        assertAir(ctx, west, "the cell's west neighbour");
+        assertAir(ctx, south, "the cell's south neighbour");
+        LOGGER.info("Chunk miner top-face-only cell test passed");
+    }
+
+    // ================================================================
+    // Test 42: the column that opens a waiting cell takes it along
+    // ================================================================
+
+    /**
+     * The cell over the lower step once more, met the way the next real run
+     * met it: on a forward pass, with the rest of its row still ahead. The rule
+     * above has it wait for a side, and the very next column of its row gives
+     * it one — but by then the sweep has scanned past it, and a cell behind the
+     * sweep came back only on the back pass, after every column ahead of it in
+     * the slab. Reported from that run: the sweep went west along row 3 from
+     * (14, 3) and left {@code -1, 103, -61} standing beside the ramp, a slab's
+     * worth of work away from being mined.
+     *
+     * <p>The range is one slab, so its snake runs row 3 from the east: the cell
+     * is the row's first column and the upper step's column is the one before
+     * it. The bot stands in the cleared row 2 at (12, 2) with row 3 standing
+     * from (8, 3) to (14, 3), and a single block south of the cell keeps that
+     * side shut the way the unmined row 4 did in the world.
+     *
+     * <p>Asserts the order: the cell falls before the head block of (12, 3),
+     * i.e. with the column that opened it rather than after the row.
+     */
+    @MinecraftTest(name = "Chunk miner takes a waiting cell with the column that opens it",
+            timeoutTicks = 4000, order = 42)
+    public void takesAWaitingCellWithItsOpener(TestContext ctx) {
+        final int head = Y + Math.floorMod(
+                SpiralStairs.ringIndexAt(Y) - SpiralStairs.ringIndex(15, 2),
+                SpiralStairs.RING_LENGTH);
+        final int feet = head - 1;
+        prepareWithFloor(ctx, feet, 12, 2, 0, 15, 0, 6);
+        final BlockPos upperStep = new BlockPos(BASE_X + 15, head, BASE_Z + 2);
+        final BlockPos lowerStep = new BlockPos(BASE_X + 15, feet, BASE_Z + 3);
+        final BlockPos cell = new BlockPos(BASE_X + 15, head, BASE_Z + 3);
+        final BlockPos south = new BlockPos(BASE_X + 15, head, BASE_Z + 4);
+        for (BlockPos pos : new BlockPos[] {upperStep, lowerStep, cell, south}) {
+            setBlock(ctx, pos, "stone");
+        }
+        for (int dx = 8; dx <= 14; dx++) {
+            setBlock(ctx, new BlockPos(BASE_X + dx, feet, BASE_Z + 3), "stone");
+            setBlock(ctx, new BlockPos(BASE_X + dx, head, BASE_Z + 3), "stone");
+        }
+        ctx.runCommand("give @s cobblestone 64");
+
+        startChunkMiner(ctx, true, head, feet);
+        final List<String> order = new ArrayList<>();
+        ctx.waitFor(mc -> {
+            if (!order.contains("cell") && mc.level.getBlockState(cell).isAir()) {
+                order.add("cell");
+            }
+            for (int dx = 14; dx >= 8; dx--) {
+                String name = "head " + dx;
+                if (!order.contains(name) && mc.level.getBlockState(
+                        new BlockPos(BASE_X + dx, head, BASE_Z + 3)).isAir()) {
+                    order.add(name);
+                }
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertNotAir(ctx, upperStep, "the upper step");
+        assertNotAir(ctx, lowerStep, "the lower step");
+        assertAir(ctx, cell, "the cell over the lower step");
+        final int cellAt = order.indexOf("cell");
+        final int laterAt = order.indexOf("head 12");
+        if (laterAt < 0 || cellAt > laterAt) {
+            throw new AssertionError("Chunk miner took the cell over the lower step in the order "
+                    + order + " — it waited for the back pass instead of going with (14, 3),"
+                    + " the column that opened it");
+        }
+        LOGGER.info("Chunk miner took the waiting cell with its opener (order {})", order);
+    }
+
+    // ================================================================
+    // Test 43: a row turn aims around the block it mines next
+    // ================================================================
+
+    /**
+     * The turn into the next row. The bot works a column behind the one it
+     * mines, so when a row ends it stands one column short of the end, and the
+     * new row's first column lies on its diagonal. With that column's head
+     * block gone, the floor block under it offers its top face, and the head
+     * block of the column beside it hides the half of that face nearer the bot.
+     * Reported from a real run, at the start of a resumed slab: look timeout on
+     * {@code -16, 102, -60} face=up from {@code (-14.74, 102.00, -60.30)}, the
+     * crosshair on {@code -15, 103, -60} — the head block beside it, and the
+     * next task — with {@code los=true}. Then the retry queued the block in
+     * flight a second time, and the bot stared at the cell it had just emptied
+     * for another look timeout. A turn in the middle of a run two days earlier
+     * logged the first half of that line for line.
+     *
+     * <p>The fixture is that world, shifted: row 3 cleared, (0, 4) a floor
+     * block only, (1, 4) and (2, 4) whole, and the bot at the reported spot,
+     * facing south in (1, 3) pressed against row 4. The spot is part of the
+     * fixture, not a detail: from there the head block hides 43% of the top
+     * face but not its centre, so the line-of-sight check has nothing to walk
+     * for, and the lean toward that same head block moves the aim point into
+     * the hidden part. The aim jitter is pinned to zero for the run, because a
+     * draw that cancels the lean lets the old aim through — about one run in
+     * nine, and this test's first run was one of them.
+     *
+     * <p>Asserts that no LOOKING visit runs into the look timeout, and that no
+     * task looks at a cell that is already empty.
+     */
+    @MinecraftTest(name = "Chunk miner aims around the next block at a row turn",
+            timeoutTicks = 3000, order = 43)
+    public void aimsAroundTheNextBlockAtARowTurn(TestContext ctx) {
+        prepareWithFloor(ctx, 1, 3, 0, 3, 2, 5);
+        final List<BlockPos> blocks = new ArrayList<>();
+        blocks.add(new BlockPos(BASE_X, Y, BASE_Z + 4));
+        for (int dx = 1; dx <= 2; dx++) {
+            blocks.add(new BlockPos(BASE_X + dx, Y + 1, BASE_Z + 4));
+            blocks.add(new BlockPos(BASE_X + dx, Y, BASE_Z + 4));
+        }
+        for (BlockPos pos : blocks) {
+            setBlock(ctx, pos, "stone");
+        }
+        final double standX = BASE_X + 1.26;
+        final double standZ = BASE_Z + 3.70;
+        ctx.runCommand("tp @s " + standX + " " + Y + " " + standZ + " 0 0");
+        ctx.waitFor(mc -> mc.player.onGround()
+                && Math.abs(mc.player.getX() - standX) < 0.01
+                && Math.abs(mc.player.getZ() - standZ) < 0.01);
+
+        final int lookTimeout = ctx.computeOnClient(mc -> BotController.CONFIG.lookTimeout);
+        final Object[] lastTask = {null};
+        final int[] looking = {0, 0};
+        final Set<String> emptied = new LinkedHashSet<>();
+        final double configuredOffsetMin = BotController.CONFIG.aimOffsetMin;
+        final double configuredOffsetMax = BotController.CONFIG.aimOffsetMax;
+        BotController.CONFIG.aimOffsetMin = 0.0;
+        BotController.CONFIG.aimOffsetMax = 0.0;
+        try {
+            startChunkMiner(ctx, true, Y + 1, Y);
+            ctx.waitFor(mc -> {
+                var task = BotController.getCurrentTask();
+                boolean inLooking = BotController.getPhase() == BotController.Phase.LOOKING;
+                looking[0] = !inLooking ? 0 : task == lastTask[0] ? looking[0] + 1 : 1;
+                looking[1] = Math.max(looking[1], looking[0]);
+                lastTask[0] = task;
+                if (inLooking && task instanceof MineBlockTask
+                        && mc.level.getBlockState(task.targetPos()).isAir()) {
+                    emptied.add(task.targetPos().toShortString());
+                }
+                return !BehaviorRunner.isActive();
+            });
+            awaitChunkMiner(ctx, true);
+        } finally {
+            BotController.CONFIG.aimOffsetMin = configuredOffsetMin;
+            BotController.CONFIG.aimOffsetMax = configuredOffsetMax;
+        }
+
+        for (BlockPos pos : blocks) {
+            assertAir(ctx, pos, "row 4 block");
+        }
+        if (looking[1] >= lookTimeout || !emptied.isEmpty()) {
+            throw new AssertionError("Chunk miner stared: longest LOOKING visit " + looking[1]
+                    + " ticks against a look timeout of " + lookTimeout
+                    + ", looked at cells already mined: " + (emptied.isEmpty() ? "none" : emptied));
+        }
+        LOGGER.info("Chunk miner turned the row without a look timeout (longest look {} ticks)",
+                looking[1]);
+    }
+
+    // ================================================================
+    // Test 44: a retry leaves the block under the pick out
+    // ================================================================
+
+    /**
+     * One block of a batch fails while the next one is under the pick. The
+     * sweep tops the queue up mid-break, so the retry for the failed block is
+     * decided while the controller is still breaking the next one — and it used
+     * to queue that block again as well. The second task came up after the
+     * first had emptied the cell, and LOOKING, which cannot hit air, spent two
+     * look timeouts on it. Reported from a real run as the second of two pauses
+     * at the start of a slab; the first is test 43's. Test 43 used to catch this
+     * one too, but only through its own failure, and with the aim fixed nothing
+     * fails there any more.
+     *
+     * <p>The fixture makes the failure certain instead of waiting for one: a
+     * single column beside the bot, obsidian over stone. Head goes before feet,
+     * so the obsidian is tried first, and the unenchanted diamond pickaxe needs
+     * 188 ticks for it against a break budget pinned to 60. The task fails, the
+     * controller takes the stone, and the queue is empty while the stone
+     * breaks, which is exactly when the sweep verifies its batch. Both config
+     * values the case hangs on are pinned, because the suite reads the
+     * player's own files: a budget that lets the obsidian break never retries
+     * it, and a run without step retries fails on the first verification.
+     * With one retry the run ends on the obsidian's second failure.
+     *
+     * <p>Asserts that the retry was queued while the stone was still being
+     * broken, without which this would pass on a fixture that no longer reaches
+     * the case; that no task looked at a cell that was already empty; and that
+     * the run ended on the obsidian.
+     */
+    @MinecraftTest(name = "Chunk miner leaves the block under the pick out of a retry",
+            timeoutTicks = 3000, order = 44)
+    public void leavesTheBlockUnderThePickOutOfARetry(TestContext ctx) {
+        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        final BlockPos feet = stand.offset(1, 0, 0);
+        final BlockPos head = feet.above();
+        setBlock(ctx, feet, "stone");
+        setBlock(ctx, head, "obsidian");
+
+        final boolean[] retriedMidBreak = {false};
+        final Set<String> emptied = new LinkedHashSet<>();
+        final int configuredBreakTicks = BotController.CONFIG.maxBreakTicks;
+        final int configuredRetries = MinerSetup.CONFIG.maxStepRetries;
+        BotController.CONFIG.maxBreakTicks = 60;
+        MinerSetup.CONFIG.maxStepRetries = 1;
+        try {
+            startChunkMiner(ctx, true, Y + 1, Y);
+            ctx.waitFor(mc -> {
+                var task = BotController.getCurrentTask();
+                var queued = BotController.getTaskQueue().peek();
+                if (BotController.getPhase() == BotController.Phase.INTERACTING
+                        && task != null && task.targetPos().equals(feet)
+                        && queued != null && queued.targetPos().equals(head)) {
+                    retriedMidBreak[0] = true;
+                }
+                if (BotController.getPhase() == BotController.Phase.LOOKING
+                        && task instanceof MineBlockTask
+                        && mc.level.getBlockState(task.targetPos()).isAir()) {
+                    emptied.add(task.targetPos().toShortString());
+                }
+                return !BehaviorRunner.isActive();
+            });
+            awaitChunkMiner(ctx, false);
+        } finally {
+            BotController.CONFIG.maxBreakTicks = configuredBreakTicks;
+            MinerSetup.CONFIG.maxStepRetries = configuredRetries;
+        }
+
+        final String status = ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine());
+        if (!retriedMidBreak[0]) {
+            throw new AssertionError("The obsidian was never retried while the stone was under"
+                    + " the pick, so the fixture no longer reaches the case — run ended: " + status);
+        }
+        if (!emptied.isEmpty()) {
+            throw new AssertionError("Chunk miner looked at cells already mined: " + emptied);
+        }
+        if (!status.startsWith("cannot break " + head.getX() + ", " + head.getY() + ", " + head.getZ())) {
+            throw new AssertionError("Run should have ended on the obsidian at " + head.toShortString()
+                    + ", ended: " + status);
+        }
+        assertAir(ctx, feet, "stone under the obsidian");
+        LOGGER.info("Chunk miner retried the obsidian without queuing the stone again ({})", status);
     }
 
     private static String shortList(Set<BlockPos> cells) {
@@ -2177,7 +2572,16 @@ public class ChunkMinerTests {
      */
     private BlockPos prepareWithFloor(TestContext ctx, int standDx, int standDz,
                                       int fromDx, int toDx, int fromDz, int toDz) {
-        final BlockPos stand = new BlockPos(BASE_X + standDx, Y, BASE_Z + standDz);
+        return prepareWithFloor(ctx, Y, standDx, standDz, fromDx, toDx, fromDz, toDz);
+    }
+
+    /**
+     * The same at a chosen height, for the staircase fixtures — see
+     * {@link #STAIR_Y} for why they cannot use {@link #Y}.
+     */
+    private BlockPos prepareWithFloor(TestContext ctx, int y, int standDx, int standDz,
+                                      int fromDx, int toDx, int fromDz, int toDz) {
+        final BlockPos stand = new BlockPos(BASE_X + standDx, y, BASE_Z + standDz);
         ctx.runOnClient(mc -> {
             BehaviorRunner.stop();
             BotController.stop();
@@ -2190,8 +2594,8 @@ public class ChunkMinerTests {
         // Clear the chunk plus a margin, so nothing from world generation
         // lands in a column the test never mentions. Done before the floor is
         // laid, so the player is never left standing over the cleared volume.
-        fill(ctx, -1, Y - 4, -1, 17, Y + 6, 17, "air");
-        fill(ctx, fromDx, Y - 1, fromDz, toDx, Y - 1, toDz, "stone");
+        fill(ctx, -1, y - 4, -1, 17, y + 6, 17, "air");
+        fill(ctx, fromDx, y - 1, fromDz, toDx, y - 1, toDz, "stone");
         ctx.runCommand("give @s diamond_pickaxe");
         standAt(ctx, stand);
         return stand;

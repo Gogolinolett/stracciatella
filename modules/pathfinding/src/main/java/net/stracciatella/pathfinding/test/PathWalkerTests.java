@@ -25,6 +25,10 @@ public class PathWalkerTests {
     private static final Logger LOGGER = LoggerFactory.getLogger("PathWalkerTests");
     private static final int CLEAR_RADIUS = 5;
     private static final double ARRIVAL_RADIUS = 0.6;
+    /** A jump clears a good block; well under that is still unmistakably one. */
+    private static final double FLOOR_HOP_TOLERANCE = 0.3;
+    /** Rounds of placing a course before its holes count as a broken fixture. */
+    private static final int BUILD_ATTEMPTS = 5;
 
     @MinecraftTest(name = "PathWalker 1-block gap", timeoutTicks = 80, order = -100, repeat = 5)
     public void gap1(TestContext ctx) {
@@ -191,6 +195,30 @@ public class PathWalkerTests {
     @MinecraftTest(name = "Corner 4→4", timeoutTicks = 80, order = -67, repeat = 3)
     public void corner_4_4(TestContext ctx) { runCorner(ctx, 15, 4, 4); }
 
+    /**
+     * The one course with a floor. Every other test here is parkour — single
+     * blocks with air between them — so a jump is the right answer everywhere
+     * and nothing ever asked whether the walker jumps where it should not.
+     * Ten blocks, a right-angle turn, ten more, all solid and all at one
+     * height: there is nothing here to jump over, so any tick off the ground
+     * is a bug. The turn is the point. Arrival at a node is accepted up to
+     * 0.65 from its centre, and a bot braking into a corner is the one that
+     * ticks a node off from the far edge of that — a block behind where the
+     * jump logic assumes it stands.
+     */
+    @MinecraftTest(name = "Flat corner without a hop", timeoutTicks = 400, order = -60, repeat = 3)
+    public void flatCorner(TestContext ctx) {
+        List<BlockPos> course = new ArrayList<>();
+        for (int z = 0; z <= 10; z++) {
+            course.add(new BlockPos(0, 0, -z));
+        }
+        for (int x = 1; x <= 10; x++) {
+            course.add(new BlockPos(-x, 0, -10));
+        }
+        runMultiCourse(ctx, new BlockPos(100, 30, 300), true,
+                course.toArray(new BlockPos[0]));
+    }
+
     private void runChain(TestContext ctx, int index, int gap1, int gap2) {
         BlockPos origin = new BlockPos(500 + index * 30, 30, 200);
         runMultiCourse(ctx, origin,
@@ -208,6 +236,16 @@ public class PathWalkerTests {
     }
 
     private void runMultiCourse(TestContext ctx, BlockPos origin, BlockPos... relPositions) {
+        runMultiCourse(ctx, origin, false, relPositions);
+    }
+
+    /**
+     * {@code feetOnTheFloor} turns the course into one the walker may not leave
+     * the ground on. Only a contiguous course can ask for it — on a parkour
+     * course jumping is the whole exercise.
+     */
+    private void runMultiCourse(TestContext ctx, BlockPos origin, boolean feetOnTheFloor,
+            BlockPos... relPositions) {
         // Stop any residual PathWalker from a previous timed-out test
         ctx.runOnClient(mc -> PathWalker.stop());
 
@@ -270,6 +308,11 @@ public class PathWalkerTests {
                 throw new AssertionError("Player fell at " + mc.player.blockPosition()
                         + " (y=" + String.format("%.2f", playerY) + ")");
             }
+            if (feetOnTheFloor && playerY > finalMinY + 1 + FLOOR_HOP_TOLERANCE) {
+                PathWalker.stop();
+                throw new AssertionError("Player jumped at " + mc.player.blockPosition()
+                        + " (y=" + String.format("%.2f", playerY) + ") with flat ground all the way");
+            }
 
             double hDist = horizontalDistance(mc.player.position(),
                     worldEnd.getX() + 0.5, worldEnd.getZ() + 0.5);
@@ -308,6 +351,33 @@ public class PathWalkerTests {
                 positions.length,
                 minX - CLEAR_RADIUS, minY - CLEAR_RADIUS, minZ - CLEAR_RADIUS,
                 maxX + CLEAR_RADIUS, maxY + CLEAR_RADIUS, maxZ + CLEAR_RADIUS);
+
+        // A `setblock` into a chunk the server has not loaded yet is refused
+        // outright — "That position is not loaded" in chat, no block, no error
+        // the caller can see — and the client's own hasChunkAt says yes before
+        // the server agrees, so the wait before this does not cover it. A
+        // course that reaches into the next chunk therefore comes out with
+        // holes in it and the start teleport drops the player through one, at
+        // which point the walk fails as "Player fell" a hundred blocks below
+        // the course it never stood on. Place whatever is missing again.
+        for (int attempt = 0; attempt < BUILD_ATTEMPTS; attempt++) {
+            ctx.waitTicks(2);
+            List<BlockPos> missing = new ArrayList<>();
+            for (BlockPos pos : positions) {
+                if (ctx.computeOnClient(mc -> mc.level.getBlockState(pos).isAir())) {
+                    missing.add(pos);
+                }
+            }
+            if (missing.isEmpty()) {
+                return;
+            }
+            LOGGER.info("Course came out with {} hole(s), placing them again", missing.size());
+            for (BlockPos pos : missing) {
+                ctx.runCommand("setblock " + pos.getX() + " " + pos.getY() + " " + pos.getZ() + " stone");
+            }
+        }
+        throw new AssertionError("Course could not be built after " + BUILD_ATTEMPTS
+                + " attempts — the server keeps refusing blocks around " + positions[0]);
     }
 
     private void runCourse(TestContext ctx, BlockPos origin, BlockPos relStart, BlockPos relEnd) {
