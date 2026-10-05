@@ -28,12 +28,6 @@ public abstract class LevelChunkMixin {
         if (oldState == null) {
             return;
         }
-        // Only regenerate when air↔solid flips — sub-state edits (redstone
-        // power, waterlogged, growth stages, leaf decay) don't change
-        // walkability and we'd just waste a full chunk re-walk.
-        if (oldState.isAir() == newState.isAir()) {
-            return;
-        }
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) {
@@ -45,6 +39,17 @@ public abstract class LevelChunkMixin {
         // reads via Minecraft.getInstance().level, so we'd otherwise regenerate
         // against stale client data when the server thread fires first.
         if (self.getLevel() != mc.level) {
+            return;
+        }
+        // Only regenerate when what the mesh reads changed: collision or fluid.
+        // Sub-state edits (redstone power, growth stages, leaf decay) don't
+        // change walkability and we'd just waste a full chunk re-walk. Asking
+        // isAir alone, as this did, missed a block placed into grass or snow —
+        // neither is air, and the mesh kept walking through the new block.
+        if (oldState.isAir() == newState.isAir()
+                && oldState.getFluidState().isEmpty() == newState.getFluidState().isEmpty()
+                && oldState.getCollisionShape(mc.level, pos).isEmpty()
+                        == newState.getCollisionShape(mc.level, pos).isEmpty()) {
             return;
         }
 

@@ -250,7 +250,7 @@ If COLLECTING exits while the queue has more work, and the bot has ended up with
 ### Key integration points
 
 - **PathWalker**: Bot calls `PathWalker.start(path)` for navigation, monitors `PathWalker.isActive()`. Creates its own `CameraController` instance for aiming (separate from PathWalker's camera), and drives it via the high-level `aimAt` / `isAimedAt` APIs so no yaw/pitch math lives in the bot. Targets within `reachDistance + 2.5` skip the pipeline entirely — POSITIONING walks the last couple of blocks directly (no pathfinding ceremony for two steps).
-- **MeshManager**: Bot queries `MeshManager.meshes` to find walkable standoff nodes near targets. Standoff scoring is line-biased (`1.05 × distToPlayer + horizDistToTarget`) so the chosen node lies on the straight player→target line — the player-nearest rule produced a visible sideways dog-leg right before the target.
+- **MeshManager**: `beginNavigation` first meshes the rectangle of bot and target ± 1 chunk itself (`MeshManager.ensureArea`, a band 16 above and below both heights) — nothing else builds those meshes, and without them every walk used to fall through to POSITIONING. The start node comes from `MeshManager.findOrBuildNearestNode`. Bot then queries `MeshManager.meshes` to find walkable standoff nodes near targets. Standoff scoring is line-biased (`1.05 × distToPlayer + horizDistToTarget`) so the chosen node lies on the straight player→target line — the player-nearest rule produced a visible sideways dog-leg right before the target.
 - **MeshPathfinder**: Bot uses A* to find paths from player to standoff positions.
 
 ## Block Interaction

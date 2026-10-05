@@ -10,12 +10,12 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.state.BlockState;
 import net.stracciatella.pathfinding.ChunkCoordinate;
 import net.stracciatella.pathfinding.display.PathDisplay;
 import net.stracciatella.pathfinding.logic.MeshManager;
 import net.stracciatella.pathfinding.logic.MeshPathfinder;
 import net.stracciatella.pathfinding.logic.PathWalker;
+import net.stracciatella.pathfinding.logic.Terrain;
 import net.stracciatella.pathfinding.logic.mesh.MeshNode;
 import net.stracciatella.pathfinding.place.PathPlacement;
 import org.slf4j.Logger;
@@ -75,7 +75,12 @@ public final class Journey {
      * bot stands a moment longer and the client never stutters.
      */
     private static final int CHUNKS_PER_TICK = 2;
-    /** Band around the traveller's height that a route actually uses. */
+    /**
+     * Band a route actually uses: from below the lower of the traveller's and
+     * the target's height to above the higher one. Both ends, because a trip
+     * up out of a mine to a chest on the surface walks every layer in between,
+     * and a band around the feet alone hid the far end of every climb.
+     */
     private static final int BAND_ABOVE = 16;
     private static final int BAND_BELOW = 32;
     /**
@@ -84,6 +89,8 @@ public final class Journey {
      * would only cost hasChunk calls.
      */
     private static final int KEEP_RADIUS = 8;
+    /** Chunks of padding either side of the straight line, while it works. */
+    private static final int CORRIDOR_PAD = 1;
     /** A single leg may not take longer than this. */
     private static final int LEG_TIMEOUT_TICKS = 600;
     /**
@@ -122,6 +129,15 @@ public final class Journey {
     private static BlockPos target;
     private static Phase phase = Phase.MESHING;
     private static final Deque<ChunkCoordinate> pending = new ArrayDeque<>();
+    /** The band the queued chunks are meshed over, fixed when they are queued. */
+    private static int bandMinY;
+    private static int bandMaxY;
+    /**
+     * Whether the corridor has been widened to the whole window around the
+     * player — set the moment the narrow one stops helping, cleared as soon as
+     * the journey makes progress again.
+     */
+    private static boolean wide;
     private static int totalTicks;
     private static int legTicks;
     private static int stalledLegs;
@@ -158,6 +174,7 @@ public final class Journey {
         stillTicks = 0;
         legTarget = null;
         legLength = 0;
+        wide = false;
         bestDistance = Math.sqrt(player.blockPosition().distSqr(destination));
         phase = Phase.MESHING;
         queueCorridor(player);
@@ -226,19 +243,16 @@ public final class Journey {
      * chunk the client hands out for those would be cached and would make the
      * chunk permanently nodeless (see {@code MeshManager.isChunkLoaded}). They
      * come back into the queue on the next leg, by which time they may have
-     * arrived.
+     * arrived. A chunk that already has a mesh is rebuilt when that mesh does
+     * not cover the band: skipping it on "has a mesh" alone kept the band of
+     * the first leg that saw it, and a hill rising above it stayed invisible.
      */
     private static void tickMeshing(LocalPlayer player, Level level) {
         int built = 0;
         while (built < CHUNKS_PER_TICK && !pending.isEmpty()) {
-            ChunkCoordinate coord = pending.poll();
-            if (MeshManager.hasMesh(player, coord) || !MeshManager.isChunkLoaded(level, coord)) {
-                continue;
+            if (MeshManager.ensureMesh(level, player, pending.poll(), bandMinY, bandMaxY)) {
+                built++;
             }
-            int feetY = player.blockPosition().getY();
-            MeshManager.generateMesh(level.getChunk(coord.x(), coord.z()), player,
-                    feetY - BAND_BELOW, feetY + BAND_ABOVE);
-            built++;
         }
         if (pending.isEmpty()) {
             phase = Phase.PLANNING;
@@ -263,8 +277,15 @@ public final class Journey {
 
         List<MeshNode> path = new MeshPathfinder().findPathTowards(start, goal);
         if (path.isEmpty()) {
-            // Nowhere reachable is closer than where we stand. Mending the way
-            // ahead is the only move left, and only if this server allows it.
+            // Nowhere reachable is closer than where we stand — inside the
+            // corridor. The way round may well lie outside it, so look at the
+            // whole window once before concluding there is none.
+            if (!wide) {
+                widen(player);
+                return;
+            }
+            // Mending the way ahead is the only move left, and only if this
+            // server allows it.
             if (tryBridge(player, level)) {
                 phase = Phase.PLACING;
                 return;
@@ -336,6 +357,7 @@ public final class Journey {
         if (bestDistance - distance > PROGRESS_EPSILON) {
             bestDistance = distance;
             stalledLegs = 0;
+            wide = false;
         } else {
             // Failure-only diagnostics, and the reason this class had none is
             // the reason a real failure could not be read at all: ninety seconds
@@ -369,6 +391,10 @@ public final class Journey {
                 phase = Phase.PLACING;
                 return;
             }
+            // Nothing to mend, so the next leg searches the whole window: a leg
+            // that ends no closer is one whose way round the corridor did not
+            // contain.
+            wide = true;
         }
 
         // Keep the cache bounded as we move; the player's surroundings are what
@@ -379,13 +405,26 @@ public final class Journey {
         phase = Phase.MESHING;
     }
 
+    /** Re-mesh with the corridor widened to the whole window, then plan again. */
+    private static void widen(LocalPlayer player) {
+        LOGGER.info("Journey widening its search around {} towards {}",
+                shortPos(player.blockPosition()), shortPos(target));
+        wide = true;
+        queueCorridor(player);
+        phase = Phase.MESHING;
+    }
+
     /**
      * Queue the chunks between the player and the target for meshing, clipped to
-     * the window around the player that can plausibly be loaded.
+     * the window around the player that can plausibly be loaded — or the whole
+     * window, once the corridor has been widened.
      */
     private static void queueCorridor(LocalPlayer player) {
         pending.clear();
         BlockPos feet = player.blockPosition();
+        bandMinY = Math.min(feet.getY(), target.getY()) - BAND_BELOW;
+        bandMaxY = Math.max(feet.getY(), target.getY()) + BAND_ABOVE;
+        int pad = wide ? KEEP_RADIUS : CORRIDOR_PAD;
         int playerChunkX = feet.getX() >> 4;
         int playerChunkZ = feet.getZ() >> 4;
         int targetChunkX = target.getX() >> 4;
@@ -407,11 +446,11 @@ public final class Journey {
         for (int step = 0; step <= steps; step++) {
             int centerX = playerChunkX + (length == 0 ? 0 : Math.round((float) spanX * step / length));
             int centerZ = playerChunkZ + (length == 0 ? 0 : Math.round((float) spanZ * step / length));
-            // One chunk of padding around each point on the line: a route rarely
-            // runs down the exact straight line, and a corridor one chunk wide
-            // makes every sidestep a dead end.
-            for (int dx = -1; dx <= 1; dx++) {
-                for (int dz = -1; dz <= 1; dz++) {
+            // Padding around each point on the line: a route rarely runs down
+            // the exact straight line, and a corridor one chunk wide makes every
+            // sidestep a dead end.
+            for (int dx = -pad; dx <= pad; dx++) {
+                for (int dz = -pad; dz <= pad; dz++) {
                     int x = centerX + dx;
                     int z = centerZ + dz;
                     if (Math.abs(x - playerChunkX) > KEEP_RADIUS
@@ -480,8 +519,7 @@ public final class Journey {
      * this accepts is a cell the mesh will turn into a node.
      */
     private static boolean isSolidFloor(Level level, LocalPlayer player, BlockPos pos) {
-        BlockState state = level.getBlockState(pos);
-        return state.entityCanStandOn(level, pos, player);
+        return Terrain.isStandable(level, pos, player);
     }
 
     private static Status fail(String reason) {

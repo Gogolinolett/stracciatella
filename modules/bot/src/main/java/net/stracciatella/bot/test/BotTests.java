@@ -2311,6 +2311,45 @@ public class BotTests {
         LOGGER.info("Teleport stop test passed ({} of {} blocks left)", remaining, blocks.size());
     }
 
+    /**
+     * A wall between the bot and its block, and no mesh anywhere near it. Every
+     * other walk in this suite builds its mesh in the fixture first, which is the
+     * one thing production never did: the standoff search read only meshes that
+     * already existed, so without them every walk fell through to POSITIONING's
+     * straight line — here into the wall, short of reach.
+     */
+    @MinecraftTest(name = "Bot walks round a wall on a mesh it built itself", timeoutTicks = 400, order = -162)
+    public void walksRoundWallOnOwnMesh(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1820, 30, 1820);
+        final BlockPos blockPos = origin.offset(0, 0, -8);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, 12);
+        // Nine wide and three high, halfway: the straight line is shut, and the
+        // way round either end is five blocks off it.
+        ctx.runCommand("fill " + (origin.getX() - 4) + " " + origin.getY() + " " + (origin.getZ() - 4) + " "
+                + (origin.getX() + 4) + " " + (origin.getY() + 2) + " " + (origin.getZ() - 4) + " stone");
+        ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        boolean[] walkedPath = {false};
+        ctx.runOnClient(mc -> {
+            net.stracciatella.pathfinding.logic.MeshManager.meshes.remove(mc.player);
+            BotController.enqueueTask(new MineBlockTask(blockPos));
+        });
+        ctx.waitFor(mc -> {
+            walkedPath[0] |= net.stracciatella.pathfinding.logic.PathWalker.isActive();
+            return mc.level.getBlockState(blockPos).isAir();
+        });
+        waitForBotIdle(ctx);
+        if (!walkedPath[0]) {
+            throw new AssertionError("The block was mined without the PathWalker ever running — "
+                    + "the walk round the wall was not the planned one");
+        }
+        LOGGER.info("Walked round the wall on a mesh it built itself");
+    }
+
     /** Eye to block centre, the distance {@code BotController} positions by. */
     private static double distanceToBlock(net.minecraft.client.player.LocalPlayer player,
                                           BlockPos target) {
@@ -2726,7 +2765,10 @@ public class BotTests {
                 for (int dz = -1; dz <= 1; dz++) {
                     int chunkX = cx + dx;
                     int chunkZ = cz + dz;
-                    if (mc.level.hasChunk(chunkX, chunkZ)) {
+                    // Not level.hasChunk: on the client it says yes for a chunk it
+                    // does not have, and the mesh of that placeholder lands on (0,0).
+                    if (net.stracciatella.pathfinding.logic.MeshManager.isChunkLoaded(mc.level,
+                            new net.stracciatella.pathfinding.ChunkCoordinate(chunkX, chunkZ))) {
                         net.stracciatella.pathfinding.logic.MeshManager.generateMesh(
                                 mc.level.getChunk(chunkX, chunkZ), mc.player);
                     }

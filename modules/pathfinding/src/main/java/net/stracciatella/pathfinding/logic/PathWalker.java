@@ -37,6 +37,8 @@ public class PathWalker {
     private static double targetOffsetZ = 0.0;
     private static final double ARRIVAL_RADIUS = 0.18;
     private static final double BRAKE_RADIUS = 0.6;
+    /** Speed towards the target (blocks/tick) below which there is nothing to brake. */
+    private static final double BRAKE_MIN_SPEED = 0.05;
     private static final double ARRIVAL_MARGIN = 0.15;
     // Final-node arrival: standing anywhere within this radius of the TRUE
     // block center counts as arrived — no walk-to-center afterwards. Must stay
@@ -602,7 +604,15 @@ public class PathWalker {
         if (angleDeltaAfter >= CameraController.WALK_TURN_MAX_DEG) {
             canMoveForward = false;
         }
-        if (distance <= BRAKE_RADIUS && shouldBrakeForNextTurn()) {
+        // Coast into a turn — but only while there is momentum to coast on. The
+        // brake zone is not inside the arrival region: it is measured to the
+        // offset target, up to 0.85 from a block centre against the box's 0.65,
+        // and above a drop the node's height is only reached by walking off the
+        // edge. From a standstill the brake therefore held the bot short of a
+        // node it could never arrive at — measured stepping off a barrel, the
+        // first move of a leg: canMove=false, speed 0, for a hundred ticks.
+        if (distance <= BRAKE_RADIUS && shouldBrakeForNextTurn()
+                && (player.getDeltaMovement().x * dx + player.getDeltaMovement().z * dz) / distance > BRAKE_MIN_SPEED) {
             canMoveForward = false;
         }
         if (isMovingAway(player, targetX, targetZ)) {
@@ -1171,19 +1181,23 @@ public class PathWalker {
                 break decide;
             }
 
-            int baseY = (int) Math.floor(player.getY()) - 1;
+            // The floor block, also when the floor is a dirt path or farmland and
+            // the feet stand a little below the top of their block. "No floor"
+            // means nothing to collide with: a hole full of grass or water is
+            // still a hole.
+            int baseY = (int) Math.floor(player.getY() - 0.5);
             if (gap > 1) {
                 for (int i = 1; i <= gap; i++) {
-                    if (player.level().getBlockState(new BlockPos(playerX + stepX * i, baseY, playerZ + stepZ * i)).isAir()) {
+                    if (!Terrain.hasCollision(player.level(), new BlockPos(playerX + stepX * i, baseY, playerZ + stepZ * i))) {
                         forwardAir = true;
                         break;
                     }
                 }
             } else {
-                forwardAir = player.level().getBlockState(new BlockPos(playerX + stepX, baseY, playerZ + stepZ)).isAir();
+                forwardAir = !Terrain.hasCollision(player.level(), new BlockPos(playerX + stepX, baseY, playerZ + stepZ));
             }
 
-            landingSolid = !player.level().getBlockState(new BlockPos(target.getX(), target.getY(), target.getZ())).isAir();
+            landingSolid = Terrain.hasCollision(player.level(), target.getBlockPos());
 
             if (!landingSolid) {
                 reason = "landing-not-solid";
@@ -1200,11 +1214,10 @@ public class PathWalker {
                 break decide;
             }
 
-            boolean blockInFront = false;
-            if (gap == 1) {
-                BlockPos frontPos = new BlockPos(playerX + stepX, (int) Math.floor(player.getY() + 0.01), playerZ + stepZ);
-                blockInFront = !player.level().getBlockState(frontPos).isAir();
-            }
+            // A step only if it rises more than vanilla steps up on its own —
+            // grass or a torch at the feet is not one, and neither is a slab.
+            boolean blockInFront = gap == 1
+                    && Terrain.isStepUp(player.level(), playerX + stepX, playerZ + stepZ, player.getY());
 
             // Step-up: target is 1 block higher or there's a block face at foot level
             // Only jump when close to the block face; rawDistance avoids target-offset interfering.
@@ -2127,7 +2140,11 @@ public class PathWalker {
         public double physicsAirDrag = 0.91;
         public double physicsJumpVelocity = 0.42;
         public double physicsSprintJumpBoost = 0.2;
-        public double physicsAirAccelFactor = 0.02;
+        // Times MOVEMENT_SPEED (0.1): vanilla's air acceleration is 0.02 a tick.
+        // The default used to be 0.02, i.e. ten times too little; the config the
+        // suite runs with had long been calibrated to 0.2, so only a fresh
+        // install ever simulated jumps with the wrong value.
+        public double physicsAirAccelFactor = 0.2;
         public double physicsMaxWalkSpeedFactor = 1.0;
         public double physicsMaxSprintSpeedFactor = 1.3;
         public double physicsGroundAccelFactorWalk = 1.0;
@@ -2216,7 +2233,7 @@ public class PathWalker {
                 physicsSprintJumpBoost = 0.2;
             }
             if (physicsAirAccelFactor <= 0.0) {
-                physicsAirAccelFactor = 0.02;
+                physicsAirAccelFactor = 0.2;
             }
             if (physicsMaxWalkSpeedFactor <= 0.0) {
                 physicsMaxWalkSpeedFactor = 1.0;

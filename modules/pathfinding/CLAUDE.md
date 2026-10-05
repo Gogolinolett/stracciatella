@@ -16,10 +16,11 @@ net.stracciatella.pathfinding
 ├── logic/
 │   ├── PathWalker.java               # Core autonomous movement controller (static, tick-driven)
 │   ├── ChunkMeshBuilder.java         # Converts chunks into walkable node graphs
-│   ├── MeshManager.java              # Stores meshes per entity per chunk, handles cross-chunk linking, node lookup
-│   ├── MeshPathfinder.java           # A* algorithm with admissible Euclidean heuristic (scale=9), closed set
+│   ├── MeshManager.java              # Stores meshes per entity per chunk, band coverage (ensureMesh/ensureArea), cross-chunk linking, node lookup, batched invalidation
+│   ├── MeshPathfinder.java           # A* algorithm with admissible horizontal heuristic (scale=9.8), closed set
+│   ├── Terrain.java                  # The shared block predicates: isPassable, isStandable, hasCollision, isStepUp
 │   └── mesh/
-│       ├── Mesh.java                 # HashMap<BlockPos, MeshNode> container for one chunk
+│       ├── Mesh.java                 # HashMap<BlockPos, MeshNode> container for one chunk + the Y band it was built over
 │       ├── MeshNode.java             # Graph vertex: x, y, z + List<Neighbor>. Has equals/hashCode on (x,y,z)
 │       ├── Neighbor.java             # Weighted edge: target node + cost
 │       └── IMeshProvider.java        # Interface for mesh sources
@@ -38,12 +39,13 @@ net.stracciatella.pathfinding
 └── test/
     ├── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
     ├── JourneyTests.java             # In-game tests: a 400-block bridge, an unloaded target, and a way walled off mid-journey
+    ├── MeshTests.java                # In-game tests: grass, a two-high corridor, an open diagonal, a chunk corner, a staircase journey
     └── EnderPearlTests.java          # In-game tests: ender pearl throwing at various distances/elevations
 ```
 
 ## Key data flow
 
-1. **Mesh generation**: Chunk loads → `LevelChunkMixin` → `MeshManager.generateMesh()` → `ChunkMeshBuilder` scans blocks, creates MeshNodes where player can stand (solid block + 2 air above), connects neighbors via reachability checks → stores in `MeshManager.meshes` → reconnects border nodes with adjacent chunks
+1. **Mesh generation**: on demand — `MeshManager.ensureMesh/ensureArea/findOrBuildNearestNode` (Journey, BotController, `/path`) → `ChunkMeshBuilder` scans blocks, creates MeshNodes where a player can stand (`Terrain.isStandable` floor + 2 `Terrain.isPassable` cells above), connects neighbors via reachability checks → stores in `MeshManager.meshes` → relinks border nodes with adjacent chunks
 2. **Pathfinding**: `/path find` → `MeshPathfinder.findPath(start, end)` → A* search → returns `List<MeshNode>`
 3. **Path walking**: `PathWalker.start(path)` → each tick: get target node, calculate jump decision, update aim/rotation, apply movement keys → when node reached, advance index → when path done, `stop()`
 4. **Navigation**: `/navigate to <x> <y> <z>` → `Navigator.navigate(target)` → evaluates all registered `TravelMethod`s via `canUse()`/`cost()` → picks cheapest → `start()` → ticks until `SUCCEEDED`/`FAILED` → on failure, tries next fallback method
@@ -108,7 +110,7 @@ shrunk on the approach cannot demote a long jump).
 
 - **Retreat phase** (gap ≥ 5): Player walks backward to back edge of block to maximize sprint runway. Uses a fixed origin reference (recorded when retreat starts) to prevent backProgress from resetting when crossing block boundaries on single-block platforms
 - **Sprint suppression** (gap = 2): Sprint set to false on jump tick to prevent overshooting single-block platforms. Exception: any diagonal gap=2 (both axes non-zero) enables sprint because the euclidean distance (≥ sqrt(5) ≈ 2.24) exceeds non-sprint jump range (~1.8 blocks).
-- **Hold movement block** (gap ≤ 2): When simulation/edge-distance says "hold", forward movement is blocked to prevent walking past the edge. Exception: any diagonal gap=2 skips this block — the simulation's air acceleration model (10x too low) can't predict diagonal sprint-jump landings, so its hold would deadlock the player. The edge-distance fallback handles diagonal timing instead.
+- **Hold movement block** (gap ≤ 2): When simulation/edge-distance says "hold", forward movement is blocked to prevent walking past the edge. Exception: any diagonal gap=2 skips this block — the simulation's air acceleration model (10x too low) can't predict diagonal sprint-jump landings, so its hold would deadlock the player. The edge-distance fallback handles diagonal timing instead. Note: "10x too low" was the code default (`physicsAirAccelFactor` 0.02); the `pathwalker.json` the suite runs with has long held the calibrated 0.2, and the default is now 0.2 too. Whether the exception is still needed with the correct value has not been re-measured.
 - **Landing brake**: Activates after any jump landing (prevSegGap ≥ 2) on an intermediate platform when more path follows. The camera keeps turning smoothly toward the next target (never snaps); at high speed (>0.1 b/t) the momentum is countered with movement keys — the momentum direction relative to the view is quantized to the 8 key directions (S, S+A/D, A/D, W+A/D, W; max 22.5° off) and the opposing combo is pressed, like a human braking with S or a counter-strafe. At low speed (≤0.1 b/t), releases all keys and lets friction handle it. Targets: gap≤1→0.03, gap≤2→0.04, gap≥3→0.08
 - **Post-brake air release**: After a landing brake + gap=2 jump, releases forward key within 1.0 blocks of target to prevent air acceleration overshoot
 - **Pre-landing air deceleration**: When airborne approaching an intermediate platform from a gap≥3 jump with a sharp turn (≥60°) ahead, releases forward key within 1.0 blocks to reduce landing speed
@@ -153,26 +155,32 @@ PathWalker has extensive debug logging. **Always read the logs when editing Path
 ## ChunkMeshBuilder — mesh generation
 
 ### Node creation rules
-- Solid block at Y, air at Y+1, air at Y+2 → walkable node at (X, Y, Z)
-- Search limits: horizontal=5, up=3, down=5, max safe drop=3, diagonal=5
+- `Terrain.isStandable` floor at Y, `Terrain.isPassable` at Y+1 and Y+2 → walkable node at (X, Y, Z)
+- **Passable** = no collision, no fluid, not a hazard (fire, cobweb, berry bush, wither rose, powder snow). Grass, flowers, torches, rails, carpets are passable; water and lava are not (no swimming)
+- **Standable** = full top face, or a collision top of at least 0.8 covering the whole block (dirt path, farmland, soul sand, mud); never magma. Slabs and stairs are not — a node stands a whole block above its floor, so a half-block floor would plan half-block-wrong steps
+- Edge limits: horizontal reach 5 (`EDGE_REACH`), up 1, drop 3, diagonal reach 4.0 (4.5 when dropping), no diagonal step-ups
 
 ### Neighbor connection
-- Brute-force search within radius for each node
-- `isBlockReachable()`: validates height constraints, diagonal limits, line-of-sight (Bresenham)
-- `movementCost()`: gap=1→10, gap=2→22, gap=3→40, gap=4→65, gap>4→100, plus height/diagonal penalties
+- Brute-force search within reach for each node, against a **node lookup** (position → node in whichever mesh holds it), never against a pair of meshes
+- `isBlockReachable()`: height and diagonal limits, then a Bresenham line at the source's height with **2** free cells per column for a walk and **3** for a jump (gap ≥ 2 or a step up), side columns on diagonal steps; a drop also needs the target column free from the source's head height down
+- `movementCost()`: `round(10 × horizontal distance)` + jump surcharge by gap (0, 0, 4, 12, 30, 55; a step up counts as a jump, at least 4) + height (5 per block up, 2 per block down). Every jump costs more than walking the same ground
 
 ### Cross-chunk connectivity
-- `MeshManager.connectAdjacentMeshes()` links border nodes when neighbor chunks exist
-- `reconnectBorderNodes()` rebuilds edges for nodes on chunk boundaries
+- `MeshManager.connectAdjacentMeshes()` collects the new chunk's border nodes and the loaded neighbours' border nodes facing it, and relinks each once against all of the entity's meshes
+- `evictBeyond()` relinks the remaining borders facing an evicted chunk, so nothing keeps links into dropped meshes
+
+### Mesh bands
+- A `Mesh` remembers the Y band it was built over. `MeshManager.ensureMesh` rebuilds a mesh over the union when a caller needs layers it does not cover; `findOrBuildNearestNode` meshes a missing chunk's whole column and only widens an existing band to reach the position
+- `BotController.beginNavigation` meshes the rectangle of bot and target ± 1 chunk over a band 16 above/below both (`ensureArea`) before its standoff search
 
 ### Mesh invalidation on block changes
 
-`LevelChunkMixin.setBlockState` triggers `MeshManager.invalidateMesh` when:
-1. The state change is an air↔solid flip (sub-state edits like waterlogged or growth stages don't affect walkability — skipped).
-2. The chunk's level is the client's level (filters out the server-thread fire in single-player so we don't regenerate twice against stale data).
+`LevelChunkMixin.setBlockState` marks the chunk dirty via `MeshManager.invalidateMesh` when:
+1. The chunk's level is the client's level (filters out the server-thread fire in single-player so we don't regenerate twice against stale data).
+2. Air-ness, fluid presence or collision emptiness changed (sub-state edits like growth stages don't affect walkability — skipped).
 3. At least one entity already has a mesh for that chunk (no point burning CPU on chunks no bot uses).
 
-Without this, mining a wall would leave the mesh thinking the wall is still solid, and subsequent A* searches route around the hole the bot just dug. Meshes are still built on-demand (chunk-load is intentionally a no-op).
+`MeshManager.flushInvalidations` (START_CLIENT_TICK) rebuilds each dirty chunk once per tick over its own band, so a `/fill` costs one rebuild per chunk, not per block. Without invalidation, mining a wall would leave the mesh thinking the wall is still solid, and subsequent A* searches route around the hole the bot just dug. Meshes are still built on-demand (chunk-load is intentionally a no-op).
 
 ## Commands (`/path`)
 
@@ -261,9 +269,13 @@ keeps its own "has it been started" flag.
 
 Bounds, all of them because an unattended bot must not walk forever: `CHUNKS_PER_TICK`
 (2) meshes under a per-tick budget so a long route is not paid for in one frame,
-`BAND_ABOVE`/`BAND_BELOW` (16/32) mesh only the Y band a route uses — the band is
-a **parameter** of mesh generation, not a new default, so ordinary `/path` meshing
-is unchanged — `KEEP_RADIUS` (8) evicts meshes outside a window around the player,
+`BAND_ABOVE`/`BAND_BELOW` (16/32) mesh only the Y band a route uses — from below the
+lower of feet and target to above the higher one, and a chunk whose mesh does not
+cover that band is rebuilt (`MeshManager.ensureMesh`); the band is a **parameter**
+of mesh generation, not a new default, so ordinary `/path` meshing is unchanged —
+`CORRIDOR_PAD` (1) chunk either side of the straight line, widened to the whole
+`KEEP_RADIUS` window when a leg stalls or the narrow corridor yields no path at all
+(and narrowed again on progress), `KEEP_RADIUS` (8) evicts meshes outside a window around the player,
 `LEG_TIMEOUT_TICKS` (600), `TOTAL_TIMEOUT_TICKS` (12000), and `STALLED_LEGS_LIMIT`
 (2): a leg that ends no closer than it started is a stall, and the **second** one
 ends the journey — the first is what triggers an attempt to mend the way ahead,
@@ -340,6 +352,7 @@ rebuilding a step — are a different permission and do not pass through here.
 
 - In-game tests in `test/PathWalkerTests.java` (registered by PathfindingModule)
 - In-game tests in `test/EnderPearlTests.java` (registered by PathfindingModule) — tests EnderPearlTravelMethod at 10/20/30 block flat, uphill, and downhill distances
+- In-game tests in `test/MeshTests.java` — the mesh on real terrain: grass and flowers, a two-high corridor, an open diagonal (no planned jumps), every walking link across a chunk corner, and a journey up a staircase above its starting band
 - JUnit tests in `src/test/.../MeshPathfinderTest.java` (A* algorithm verification)
 - Run in-game tests: `/stracciatella-test` after joining a world
 

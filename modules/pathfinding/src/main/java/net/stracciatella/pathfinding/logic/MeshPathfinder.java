@@ -62,7 +62,7 @@ public class MeshPathfinder {
         // start so the comparison needs no null case; a result that is still the
         // start at the end means nothing better was reachable.
         MeshNode bestTowards = start;
-        double bestTowardsDistance = heuristic(start, end);
+        double bestTowardsDistance = distanceSq(start, end);
 
         while (!openSet.isEmpty()) {
             // Get node with lowest F score
@@ -75,7 +75,7 @@ public class MeshPathfinder {
             closedSet.add(current);
 
             if (allowPartial) {
-                double distance = heuristic(current, end);
+                double distance = distanceSq(current, end);
                 if (distance < bestTowardsDistance) {
                     bestTowardsDistance = distance;
                     bestTowards = current;
@@ -127,15 +127,27 @@ public class MeshPathfinder {
         return path;
     }
 
-    // Euclidean distance heuristic scaled to stay admissible.
-    // Cheapest diagonal move: gap=1 diagonal = cost 13 (base 10 + diagonal 3).
-    // Euclidean distance for diagonal: sqrt(2) ≈ 1.414.
-    // Scale must satisfy: scale * sqrt(2) <= 13, so scale <= 9.19. Use 9.0.
+    // Horizontal Euclidean distance, scaled to stay admissible. An edge costs
+    // round(10 * its horizontal length) plus surcharges that are never negative
+    // (ChunkMeshBuilder.movementCost), so the cheapest cost per block is the
+    // diagonal step, 14 / sqrt(2) = 9.90. 9.8 stays under it with room for the
+    // rounding of longer edges.
+    //
+    // Height stays out of it. A drop costs 2 per block, and a heuristic that
+    // charged 9 per block of height — as this one did — overestimated every
+    // route with a drop in it and A* stopped returning the cheapest path.
     private double heuristic(MeshNode a, MeshNode b) {
+        double dx = a.getX() - b.getX();
+        double dz = a.getZ() - b.getZ();
+        return 9.8 * Math.sqrt(dx * dx + dz * dz);
+    }
+
+    /** Straight-line closeness, height included, for the partial answer. */
+    private double distanceSq(MeshNode a, MeshNode b) {
         double dx = a.getX() - b.getX();
         double dy = a.getY() - b.getY();
         double dz = a.getZ() - b.getZ();
-        return 9.0 * Math.sqrt(dx * dx + dy * dy + dz * dz);
+        return dx * dx + dy * dy + dz * dz;
     }
 
     // Helper class for the PriorityQueue

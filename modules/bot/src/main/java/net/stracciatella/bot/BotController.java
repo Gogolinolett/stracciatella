@@ -133,6 +133,15 @@ public class BotController {
      */
     private static final double CONTACT_DISTANCE = 1.0;
     /**
+     * Layers meshed above the higher and below the lower of the bot's and the
+     * target's height for a walk. A band rather than the whole column, because
+     * the meshes a walk builds stay and are rebuilt on every block the bot then
+     * breaks in them.
+     */
+    private static final int NAV_BAND = 16;
+    /** Chunks meshed around the rectangle of bot and target, for a way round. */
+    private static final int NAV_AREA_PAD_CHUNKS = 1;
+    /**
      * Ticks the walk may fail to get any closer before the edge of reach is
      * accepted as the best place on offer. Some targets cannot be approached at
      * all — one across a gap the floor check refuses to step into, one behind a
@@ -2369,13 +2378,22 @@ public class BotController {
             return;
         }
 
+        // Nothing else builds the meshes this walk needs. The standoff search
+        // reads only meshes that already exist, so without this a session that
+        // had not meshed the area some other way never once walked a path here —
+        // every walk fell through to POSITIONING's straight line.
+        Level level = Minecraft.getInstance().level;
+        MeshManager.ensureArea(level, player, player.blockPosition(), target, NAV_AREA_PAD_CHUNKS,
+                Math.min(player.getBlockY(), target.getY()) - NAV_BAND,
+                Math.max(player.getBlockY(), target.getY()) + NAV_BAND);
+
         MeshNode standoff = findStandoffNode(player, target);
         if (standoff == null) {
             transitionTo(Phase.POSITIONING);
             return;
         }
 
-        MeshNode startNode = findNearestNode(player, player.blockPosition());
+        MeshNode startNode = MeshManager.findOrBuildNearestNode(level, player, player.blockPosition());
         if (startNode == null) {
             transitionTo(Phase.POSITIONING);
             return;
@@ -2771,52 +2789,6 @@ public class BotController {
         }
 
         return best;
-    }
-
-    /**
-     * Find the nearest mesh node to the given position.
-     */
-    private static MeshNode findNearestNode(LocalPlayer player, BlockPos pos) {
-        HashMap<ChunkCoordinate, Mesh> meshesForPlayer = MeshManager.meshes.get(player);
-        if (meshesForPlayer == null) {
-            return null;
-        }
-
-        ChunkCoordinate chunkCoord = new ChunkCoordinate(pos.getX() >> 4, pos.getZ() >> 4);
-
-        // Try generating mesh if it doesn't exist
-        Mesh mesh = meshesForPlayer.get(chunkCoord);
-        if (mesh == null) {
-            Level level = Minecraft.getInstance().level;
-            if (level != null) {
-                MeshManager.generateMesh(level.getChunk(pos), player);
-                mesh = meshesForPlayer.get(chunkCoord);
-            }
-        }
-        if (mesh == null) {
-            return null;
-        }
-
-        // Try exact match first
-        MeshNode exact = mesh.getNodes().get(pos);
-        if (exact != null) {
-            return exact;
-        }
-
-        // Nearest in chunk
-        MeshNode nearest = null;
-        double bestDist = Double.MAX_VALUE;
-        for (MeshNode node : mesh.getNodes().values()) {
-            double dx = node.getX() - pos.getX();
-            double dy = node.getY() - pos.getY();
-            double dz = node.getZ() - pos.getZ();
-            double dist = dx * dx + dy * dy + dz * dz;
-            if (dist < bestDist) {
-                bestDist = dist;
-                nearest = node;
-            }
-        }
-        return nearest;
     }
 
     // --- Eating ---
