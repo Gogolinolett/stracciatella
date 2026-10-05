@@ -1830,6 +1830,15 @@ public class BotController {
      * nothing ahead at all leave the key alone. Not for every walk: the
      * bridging step crouches at an edge and must not jump off it, and the
      * opportunistic step during a break has to keep the target in reach.
+     *
+     * <p>Nor onto the task's own target: the walk is going to that block, so
+     * climbing it is never the way there, and from beside it a floor block
+     * with its head cell open passes every test above. The chunk miner hands
+     * over exactly that at each row turn — the corner's head block has just
+     * gone, the floor block under it is next, and the occluded approach
+     * presses the bot into the corner diagonally short of it until the cell
+     * ahead is that block. The bot hopped onto it after the first block of
+     * every corner and mined it from on top.
      */
     private static void stepUpIfBlocked(Minecraft client, LocalPlayer player,
                                         double dirX, double dirZ) {
@@ -1843,7 +1852,8 @@ public class BotController {
                 player.getX() + dirX / length * STEP_UP_LOOKAHEAD,
                 player.getY(),
                 player.getZ() + dirZ / length * STEP_UP_LOOKAHEAD);
-        if (ahead.equals(feet) || !hasCollision(level, ahead)) {
+        if (ahead.equals(feet) || !hasCollision(level, ahead)
+                || (currentTask != null && ahead.equals(currentTask.targetPos()))) {
             return;
         }
         if (hasCollision(level, ahead.above()) || hasCollision(level, ahead.above(2))

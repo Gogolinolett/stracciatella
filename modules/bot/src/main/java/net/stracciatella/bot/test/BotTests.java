@@ -1949,6 +1949,104 @@ public class BotTests {
         }
     }
 
+    // ================================================================
+    // Test 31: the block the approach walks up to is not a ledge
+    // ================================================================
+
+    /**
+     * The block an approach walks up to is the work, not a step on the way.
+     *
+     * <p>Built the way the chunk miner meets it at a row turn. The head block of
+     * the corner column has just gone, the floor block under it is the next task
+     * and stands diagonally ahead, and the head block beside it hides that
+     * block's top face. {@code approachOccluded} walks the bot at the target from
+     * where its last break left it — pressed against the row, 0.4 short of the
+     * column — and from there the cell 0.6 ahead at foot height is the target
+     * with nothing over it: a one-block rise by every test the step-up asks. The
+     * bot hopped onto the block and mined it from on top, reported as a jump
+     * after the first block of every corner. Logged in the chunk suite from
+     * {@code (3021.60, 42.00, 3010.70)} with the target {@code 3022, 42, 3011}
+     * as the cell ahead.
+     *
+     * <p>The bot is teleported to that spot rather than left to walk into it,
+     * because the spot is the whole precondition: a tenth of a block further
+     * along the row the face is in sight, nothing walks, and the test would pass
+     * on a controller that still jumps.
+     */
+    @MinecraftTest(name = "Bot walks up to a corner instead of climbing onto it",
+            timeoutTicks = 400, order = -163)
+    public void walksUpToACornerWithoutClimbingIt(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1780, 30, 1780);
+        final BlockPos target = origin.offset(1, 0, 1);
+        // The row the corner ends, two high: its head block hides the target's
+        // top face, and its foot block is what the bot stands pressed against.
+        final BlockPos row = origin.offset(0, 0, 1);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("fill " + row.getX() + " " + row.getY() + " " + row.getZ() + " "
+                + row.getX() + " " + (row.getY() + 1) + " " + row.getZ() + " stone");
+        ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " "
+                + target.getZ() + " stone");
+        ctx.waitFor(mc -> !mc.level.getBlockState(row.above()).isAir()
+                && !mc.level.getBlockState(target).isAir());
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        // Facing the middle of the target's top face, where the break before it
+        // left the camera. That line runs through the row's head block.
+        final double standX = origin.getX() + 0.6;
+        final double standZ = origin.getZ() + 0.69;
+        double dx = target.getX() + 0.5 - standX;
+        double dy = target.getY() + 1.0 - (origin.getY() + 1.62);
+        double dz = target.getZ() + 0.5 - standZ;
+        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double pitch = -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        ctx.runCommand("tp @s " + standX + " " + origin.getY() + " " + standZ
+                + " " + yaw + " " + pitch);
+        ctx.waitFor(mc -> mc.player.onGround()
+                && Math.abs(mc.player.getX() - standX) < 0.01
+                && Math.abs(mc.player.getZ() - standZ) < 0.01);
+        // The teleport alarm has to have come and gone before there is work to
+        // stop: it only acts on a queue that holds something.
+        ctx.waitTicks(5);
+
+        final double floorY = origin.getY();
+        final double[] highest = {floorY};
+        final boolean[] approached = {false};
+        try {
+            ctx.runOnClient(mc -> {
+                BotController.setPolicy(BotPolicy.none().withApproachOccluded());
+                BotController.enqueueTask(new MineBlockTask(target));
+            });
+            // A walk on a flat floor never lifts the feet, and half a block is
+            // under anything here a body could step onto without jumping.
+            ctx.waitFor(mc -> {
+                highest[0] = Math.max(highest[0], mc.player.getY());
+                approached[0] |= BotController.getPhase() == BotController.Phase.POSITIONING;
+                return highest[0] > floorY + 0.5 || mc.level.getBlockState(target).isAir();
+            }, 300);
+
+            if (highest[0] > floorY + 0.5) {
+                throw new AssertionError("The bot left the floor by "
+                        + String.format(java.util.Locale.US, "%.2f", highest[0] - floorY)
+                        + " blocks walking up to " + target.toShortString()
+                        + " — it climbed the block it was about to mine");
+            }
+            if (!approached[0]) {
+                throw new AssertionError("The bot mined " + target.toShortString()
+                        + " without walking at it: its top face was in sight from the start,"
+                        + " so this fixture no longer reaches the corner it was built for");
+            }
+            LOGGER.info("Corner approach test passed: mined {} without leaving the floor",
+                    target.toShortString());
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.stop();
+                BotController.setPolicy(null);
+            });
+        }
+    }
+
     /**
      * The bot must walk up to the block, not stop at the far edge of its reach.
      *
