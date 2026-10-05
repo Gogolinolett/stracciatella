@@ -35,7 +35,12 @@ public final class ContainerTransfer {
 
     /**
      * The menu slot holding the next thing to put in the chest, or -1 when
-     * nothing in the inventory is loot.
+     * nothing in the inventory is loot that the chest still has room for.
+     *
+     * <p>Room is asked before the click, the way a person sees a full chest and
+     * shuts it. Clicking to find out cost a stalled click per tick until a
+     * timeout ran out: six seconds and sixty shift-clicks into every full
+     * barrel of a camp.
      */
     public static int nextDeposit(LocalPlayer player, RestockNeeds needs) {
         AbstractContainerMenu menu = player.containerMenu;
@@ -46,7 +51,8 @@ public final class ContainerTransfer {
             }
             // The bot's own hotbar is fair game: a stack of loot is loot
             // wherever it sits, and the manifest protects the tools by name.
-            if (isLoot(player, needs, slot.getItem())) {
+            if (isLoot(player, needs, slot.getItem())
+                    && hasRoom(menu, slot.getItem(), s -> isContainerSlot(player, s))) {
                 return i;
             }
         }
@@ -54,8 +60,22 @@ public final class ContainerTransfer {
     }
 
     /**
+     * Whether the inventory holds loot at all, room or no room — what decides
+     * whether a full chest is the end of the trip or only of this stop.
+     */
+    public static boolean hasLoot(LocalPlayer player, RestockNeeds needs) {
+        for (Slot slot : player.containerMenu.slots) {
+            if (isCarrySlot(player, slot) && slot.hasItem() && isLoot(player, needs, slot.getItem())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * The menu slot holding the next thing to take out, or -1 when the manifest
-     * is satisfied or the chest has nothing that would help.
+     * is satisfied, the chest has nothing that would help, or the bot has no
+     * room for it.
      */
     public static int nextWithdraw(LocalPlayer player, RestockNeeds needs) {
         AbstractContainerMenu menu = player.containerMenu;
@@ -66,12 +86,34 @@ public final class ContainerTransfer {
             }
             ItemStack stack = slot.getItem();
             for (RestockNeeds.Need need : needs.needs()) {
-                if (need.matcher().test(stack) && RestockNeeds.shortfallOf(player, need) > 0) {
+                if (need.matcher().test(stack) && RestockNeeds.shortfallOf(player, need) > 0
+                        && hasRoom(menu, stack, s -> isCarrySlot(player, s))) {
                     return i;
                 }
             }
         }
         return -1;
+    }
+
+    /**
+     * Whether a shift-click of {@code stack} would find somewhere to go among
+     * the slots {@code side} accepts: an empty slot that takes it, or a stack of
+     * the same item with room left — the two places vanilla's quick move tries.
+     */
+    private static boolean hasRoom(AbstractContainerMenu menu, ItemStack stack,
+                                   java.util.function.Predicate<Slot> side) {
+        for (Slot slot : menu.slots) {
+            if (!side.test(slot) || !slot.mayPlace(stack)) {
+                continue;
+            }
+            ItemStack there = slot.getItem();
+            if (there.isEmpty()
+                    || (ItemStack.isSameItemSameComponents(there, stack)
+                            && there.getCount() < Math.min(there.getMaxStackSize(), slot.getMaxStackSize(there)))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

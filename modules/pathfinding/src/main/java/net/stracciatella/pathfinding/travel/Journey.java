@@ -295,7 +295,10 @@ public final class Journey {
         }
 
         PathDisplay.setHighlightedPath(path);
-        PathWalker.start(path);
+        // A stretch of a trip: Journey judges arrival itself, so the walker
+        // need not stop dead on the leg's last node, and crosses open ground
+        // in straight lines with sprint-jumps.
+        PathWalker.startTravel(path);
         legTicks = 0;
         legTarget = path.get(path.size() - 1).getBlockPos();
         legLength = path.size();

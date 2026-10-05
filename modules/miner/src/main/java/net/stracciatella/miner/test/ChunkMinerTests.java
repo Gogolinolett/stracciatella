@@ -241,10 +241,16 @@ public class ChunkMinerTests {
      * break, leaving COLLECTING as soon as the ground is clear — trades
      * against picking the drops up at all, and nothing else in the suite would
      * notice a corridor mined clean with the cobblestone left lying in it.
+     *
+     * <p>The floor reaches two blocks past the last column: {@link #prepare}'s
+     * ends flush with it, and a drop from that column could pop over the edge
+     * into the cleared volume four blocks down, out of reach — one cobblestone
+     * short of the count however the miner collects.
      */
     @MinecraftTest(name = "Chunk miner clears a corridor", timeoutTicks = 3000, order = 17)
     public void clearsCorridor(TestContext ctx) {
-        final BlockPos stand = prepare(ctx, STAND_DX, STAND_DZ);
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 3, STAND_DX + 6, STAND_DZ - 3, STAND_DZ + 3);
         final int columns = 4;
         for (int dx = 1; dx <= columns; dx++) {
             setBlock(ctx, stand.offset(dx, 0, 0), "stone");
@@ -264,6 +270,71 @@ public class ChunkMinerTests {
         int collected = ctx.computeOnClient(
                 mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE));
         LOGGER.info("Chunk miner corridor test passed ({} cobblestone)", collected);
+    }
+
+    /**
+     * Drops lying beside the corridor before the run starts, and the run must
+     * not stop for them while there is still work: COLLECTING may only begin
+     * once the corridor is down. The bot mines on, picks up what it passes or
+     * can step to while breaking, and sweeps the rest when the slab is done —
+     * so both drops and every cobblestone still end up in the inventory.
+     *
+     * <p>Sticks rather than anything the run digs, so the player's own ignore
+     * list cannot be the reason a bait stays on the ground.
+     *
+     * <p>The floor reaches two blocks past the last column, where
+     * {@link #prepare}'s ends flush with it: a drop pops up to a block sideways,
+     * and one from the last column went over that edge into the cleared pit
+     * below, four blocks down and out of any collect walk's reach — measured at
+     * x=3020.45 against a floor ending at 3020.
+     */
+    @MinecraftTest(name = "Chunk miner mines on with drops lying about", timeoutTicks = 3000, order = 17)
+    public void minesOnWithDropsLyingAbout(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 3, STAND_DX + 6, STAND_DZ - 3, STAND_DZ + 3);
+        final int columns = 4;
+        final List<BlockPos> corridor = new ArrayList<>();
+        for (int dx = 1; dx <= columns; dx++) {
+            setBlock(ctx, stand.offset(dx, 0, 0), "stone");
+            setBlock(ctx, stand.offset(dx, 1, 0), "stone");
+            corridor.add(stand.offset(dx, 0, 0));
+            corridor.add(stand.offset(dx, 1, 0));
+        }
+        for (BlockPos bait : List.of(stand.offset(1, 0, 2), stand.offset(3, 0, -2))) {
+            ctx.runCommand("summon item " + (bait.getX() + 0.5) + " " + bait.getY() + " "
+                    + (bait.getZ() + 0.5) + " {Item:{id:\"minecraft:stick\",count:1}}");
+        }
+        ctx.waitFor(mc -> mc.level.getEntities(net.minecraft.world.entity.EntityType.ITEM,
+                new net.minecraft.world.phys.AABB(stand).inflate(6.0), e -> true).size() >= 2);
+
+        String[] stoppedFor = {null};
+        startChunkMiner(ctx, true, Y + 1, Y);
+        ctx.waitFor(mc -> {
+            if (stoppedFor[0] == null && BotController.getPhase() == BotController.Phase.COLLECTING) {
+                for (BlockPos pos : corridor) {
+                    if (!mc.level.getBlockState(pos).isAir()) {
+                        stoppedFor[0] = pos.toShortString();
+                        break;
+                    }
+                }
+            }
+            return !BehaviorRunner.isActive();
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+        if (ctx.computeOnClient(mc -> MinerSetup.chunkMiner().failed())) {
+            ctx.fail("Chunk miner aborted: "
+                    + ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine()));
+            return;
+        }
+        if (stoppedFor[0] != null) {
+            ctx.fail("the bot stopped to collect while " + stoppedFor[0]
+                    + " was still standing — it should mine on and pick the drops up as it goes");
+            return;
+        }
+        int timeout = 120 * net.stracciatella.testing.runner.TestRunner.getTickMultiplier();
+        ctx.waitFor(mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE) >= corridor.size()
+                && countItem(mc, net.minecraft.world.item.Items.STICK) >= 2, timeout);
+        LOGGER.info("Mined on past the drops and swept them up afterwards");
     }
 
     // ================================================================

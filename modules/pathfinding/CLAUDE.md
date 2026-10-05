@@ -18,7 +18,7 @@ net.stracciatella.pathfinding
 │   ├── ChunkMeshBuilder.java         # Converts chunks into walkable node graphs
 │   ├── MeshManager.java              # Stores meshes per entity per chunk, band coverage (ensureMesh/ensureArea), cross-chunk linking, node lookup, batched invalidation
 │   ├── MeshPathfinder.java           # A* algorithm with admissible horizontal heuristic (scale=9.8), closed set
-│   ├── Terrain.java                  # The shared block predicates: isPassable, isStandable, hasCollision, isStepUp
+│   ├── Terrain.java                  # The shared block predicates: isPassable, isStandable, hasCollision, isStepUp, isStraightWalk
 │   └── mesh/
 │       ├── Mesh.java                 # HashMap<BlockPos, MeshNode> container for one chunk + the Y band it was built over
 │       ├── MeshNode.java             # Graph vertex: x, y, z + List<Neighbor>. Has equals/hashCode on (x,y,z)
@@ -38,7 +38,7 @@ net.stracciatella.pathfinding
 │   └── LevelChunkMixin.java          # Triggers mesh generation on chunk load
 └── test/
     ├── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
-    ├── JourneyTests.java             # In-game tests: a 400-block bridge, an unloaded target, and a way walled off mid-journey
+    ├── JourneyTests.java             # In-game tests: a 400-block bridge, an unloaded target, a way walled off mid-journey, a straight line across open ground
     ├── MeshTests.java                # In-game tests: grass, a two-high corridor, an open diagonal, a chunk corner, a staircase journey
     └── EnderPearlTests.java          # In-game tests: ender pearl throwing at various distances/elevations
 ```
@@ -47,7 +47,7 @@ net.stracciatella.pathfinding
 
 1. **Mesh generation**: on demand — `MeshManager.ensureMesh/ensureArea/findOrBuildNearestNode` (Journey, BotController, `/path`) → `ChunkMeshBuilder` scans blocks, creates MeshNodes where a player can stand (`Terrain.isStandable` floor + 2 `Terrain.isPassable` cells above), connects neighbors via reachability checks → stores in `MeshManager.meshes` → relinks border nodes with adjacent chunks
 2. **Pathfinding**: `/path find` → `MeshPathfinder.findPath(start, end)` → A* search → returns `List<MeshNode>`
-3. **Path walking**: `PathWalker.start(path)` → each tick: get target node, calculate jump decision, update aim/rotation, apply movement keys → when node reached, advance index → when path done, `stop()`
+3. **Path walking**: `PathWalker.start(path)` → each tick: get target node, calculate jump decision, update aim/rotation, apply movement keys → when node reached, advance index → when path done, `stop()`. `PathWalker.startTravel(path)` is the same walk in travel mode (Journey only — see *Travel mode* below)
 4. **Navigation**: `/navigate to <x> <y> <z>` → `Navigator.navigate(target)` → evaluates all registered `TravelMethod`s via `canUse()`/`cost()` → picks cheapest → `start()` → ticks until `SUCCEEDED`/`FAILED` → on failure, tries next fallback method
 
 ## PathWalker — the core component
@@ -62,6 +62,19 @@ PathWalker is entirely **static**. It simulates keyboard input (forward, sprint,
 - **Final-node settling**: while standing inside the final arrival disc but still above the 0.12 speed gate, target steering is skipped entirely — the camera yaw is held (spring settles, no turn) and the 8-way counter-brake kills the momentum until arrival fires. Without this, the desired yaw orbits the walk target during the brake-out ticks and the camera follows (the post-landing pirouette)
 - **Desired-yaw freeze near nodes**: below 0.5 blocks horizontal distance the atan2 yaw target flips ~180° when stepping past the point — `stableDesiredYaw` freezes the target at its last stable value through that zone (movement aim + landing-brake retarget). Combined with the camera module's 35°/tick angular-velocity cap, this removes the remaining one-tick gaze snaps
 - **Target offset**: random X/Z offset (0.05–0.25) added for natural-looking movement, suppressed for long jumps
+- **A passed node counts as reached** (`hasPassedNode`): a node the player has gone beyond — past it toward the next node, or past it along the incoming direction — is ticked off without being touched, so a jump that carries past its landing block walks on instead of turning back to it first. Only where nothing depends on touching it: not the final node, on the ground on the node's level, the next step a plain walk on the same Y (gap ≤ 1), and `Terrain.isStraightWalk` clear from the player to the next node. A jump's take-off node never qualifies, because the step after it is not a walk
+
+### Travel mode (`startTravel`, Journey only)
+
+The node-by-node walk follows the A* grid: straight and diagonal steps, one node at a time, a gaze that turns with every node. Across open ground a person picks a point far ahead, walks a roughly straight line at it, sprint-jumps on level ground and corrects the heading now and then. `Journey` starts its legs with `startTravel`, and on a level, walkable run of the path `tickCruise` takes the tick instead of the node walk:
+
+- **Aim far, hold the heading.** `chooseCruiseTarget` takes the farthest node up to `CRUISE_LOOKAHEAD` (32) ahead that the path reaches on one Y in gap-1 steps and that `Terrain.isStraightWalk` (headroom 2) reaches in a straight line from the player — at least two nodes beyond the current one, never the path's last node (the last stretch is the node walk's, with its precise arrival). The yaw towards it is fixed (`cruiseYaw`) and fed through the camera spring; the walk key goes down once the camera is aligned, sprint always.
+- **Correct now and then.** The heading is re-taken every `CRUISE_REFRESH_MIN`–`MAX` (15–40) ticks, when the target node has been passed, or when the player has drifted more than `CRUISE_LINE_TOLERANCE` (0.35) off the line it was taken along. Nodes the player has drawn level with are ticked off as it goes (`passCruiseNodes`). No run found → the node walk takes over, and the search is retried only after `CRUISE_RETRY_TICKS` (10).
+- **Sprint-jump on level ground** (`shouldCruiseJump`): sprinting at ≥ `CRUISE_JUMP_MIN_SPEED` (0.12), facing within `CRUISE_JUMP_FACING_DEG` (10°) of the heading, at least `CRUISE_JUMP_LENGTH` (4) from the aim, and those 4 blocks ahead a straight walk with headroom **3** for the arc. After each landing a 0–3 tick holdoff, so the jumps are not metronomic.
+- Choosing a cruise target clears an armed landing brake: it exists for narrow platforms, and a run that passes the straight-walk test is not one.
+- A travel walk's final node uses the ordinary arrival box, not the final-node settle: the end of a leg is where the next leg starts, not a place to stand, and `Journey` judges arrival at the destination itself.
+
+`Terrain.isStraightWalk` is the shared safety test: it samples the line every 0.25 blocks at the body's centre and ±0.3 to each side (`BODY_HALF_WIDTH`), each sample needing a standable floor at the given Y and the given number of passable cells above. Travel mode stays out of `start(path)` on purpose: the bot's walks to a work face and the parkour courses want the node walk's precision, and a straight-line cruise there would cut corners the mesh routed round. Measured by *Journey crosses open ground in a straight line* (heading within 10° of the bearing on ≥ 75% of the run, at least two take-offs, no step back over 0.5).
 
 ### Jump decision system (`shouldJumpNow()`)
 
@@ -253,7 +266,8 @@ all.** The client holds no block data out there, so the mesh has no nodes — no
 matter of search effort. `Journey` therefore walks in **legs**: aim at the best
 node the mesh currently has in the target's direction
 (`MeshPathfinder.findPathTowards`, the partial-answer variant of the same A*),
-walk it, mesh whatever streamed in on the way, ask again.
+walk it, mesh whatever streamed in on the way, ask again. Each leg is walked in
+travel mode (`PathWalker.startTravel`, see *Travel mode* above).
 
 Two things the module was missing fall out of that for free. **Re-planning**:
 `PathWalker` keeps the node list it was handed whatever happens to the world — the

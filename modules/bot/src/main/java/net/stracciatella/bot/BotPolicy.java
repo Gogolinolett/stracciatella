@@ -26,10 +26,11 @@ public record BotPolicy(
         boolean fastCollectExit,
         boolean orderedTasks,
         boolean approachOccluded,
-        boolean autoEat) {
+        boolean autoEat,
+        boolean collectWhileMining) {
 
     private static final BotPolicy NONE =
-            new BotPolicy(false, false, false, 0, false, false, false, false, false);
+            new BotPolicy(false, false, false, 0, false, false, false, false, false, false);
 
     /**
      * Everything off — the execution layer behaves exactly as it did before
@@ -42,19 +43,19 @@ public record BotPolicy(
     /** Stop the run on any health decrease. */
     public BotPolicy withDamageStop() {
         return new BotPolicy(true, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat, collectWhileMining);
     }
 
     /** Stop the run when a player attacks the bot, even for zero damage. */
     public BotPolicy withPlayerAttackStop() {
         return new BotPolicy(stopOnDamage, true, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat, collectWhileMining);
     }
 
     /** Stop the run once fewer than {@code minFreeSlots} main slots are empty. */
     public BotPolicy withInventoryFullStop(int minFreeSlots) {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, true, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat, collectWhileMining);
     }
 
     /**
@@ -63,7 +64,7 @@ public record BotPolicy(
      */
     public BotPolicy withOpportunisticCollection() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                true, fastCollectExit, orderedTasks, approachOccluded, autoEat);
+                true, fastCollectExit, orderedTasks, approachOccluded, autoEat, collectWhileMining);
     }
 
     /**
@@ -73,7 +74,7 @@ public record BotPolicy(
      */
     public BotPolicy withFastCollectExit() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, true, orderedTasks, approachOccluded, autoEat);
+                opportunisticCollection, true, orderedTasks, approachOccluded, autoEat, collectWhileMining);
     }
 
     /**
@@ -98,7 +99,7 @@ public record BotPolicy(
      */
     public BotPolicy withOrderedTasks() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, true, approachOccluded, autoEat);
+                opportunisticCollection, fastCollectExit, true, approachOccluded, autoEat, collectWhileMining);
     }
 
     /**
@@ -129,7 +130,7 @@ public record BotPolicy(
      */
     public BotPolicy withApproachOccluded() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, true, autoEat);
+                opportunisticCollection, fastCollectExit, orderedTasks, true, autoEat, collectWhileMining);
     }
 
     /**
@@ -149,6 +150,23 @@ public record BotPolicy(
      */
     public BotPolicy withAutoEat() {
         return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
-                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, true);
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, true, collectWhileMining);
+    }
+
+    /**
+     * Never stop to fetch a drop. After a break the bot goes straight on to
+     * the next work; what landed outside the pickup box is picked up on the
+     * way — walked at while the next blocks break (with
+     * {@link #withOpportunisticCollection}) or passed over walking to them —
+     * and whatever is still lying around when the behavior runs out of work
+     * there is its own to sweep up, with {@code BotController.sweepDrops}.
+     *
+     * <p>Stopping after every batch to walk each straggler down, the way
+     * COLLECTING does, is the beat that reads as a machine: a person mining
+     * keeps the button down and picks the loot up as they go.
+     */
+    public BotPolicy withCollectWhileMining() {
+        return new BotPolicy(stopOnDamage, stopOnPlayerAttack, stopWhenInventoryFull, minFreeSlots,
+                opportunisticCollection, fastCollectExit, orderedTasks, approachOccluded, autoEat, true);
     }
 }

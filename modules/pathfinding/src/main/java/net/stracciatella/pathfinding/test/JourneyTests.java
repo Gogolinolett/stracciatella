@@ -303,6 +303,115 @@ public class JourneyTests {
     }
 
     /**
+     * Open level ground and a target off both axes. A journey crosses it the
+     * way a person does: one straight line at the target, sprinting and
+     * sprint-jumping, its heading corrected now and then — not the grid's run of
+     * straight and diagonal steps with the camera swinging between them. And it
+     * never turns back to touch a node a jump carried it past.
+     *
+     * <p>Three measurements, each failing on the node-by-node walk: the share of
+     * walking ticks whose yaw is within {@link #HEADING_TOLERANCE_DEG} of the
+     * bearing to the target (a grid walk heads along the axis or the diagonal,
+     * 22 degrees either side of it); the number of times the feet leave the
+     * ground (none, on flat ground, without sprint-jumps); and the largest step
+     * back along the line from the furthest point reached.
+     */
+    @MinecraftTest(name = "Journey crosses open ground in a straight line", timeoutTicks = 2000, order = 53)
+    public void journeyCrossesOpenGroundStraight(TestContext ctx) {
+        final int z0 = ORIGIN_Z + 80;
+        final BlockPos start = new BlockPos(ORIGIN_X + 2, ORIGIN_Y + 1, z0 + 2);
+        final BlockPos target = new BlockPos(ORIGIN_X + 42, ORIGIN_Y + 1, z0 + 18);
+        try {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+            ctx.runCommand("gamemode creative");
+            ctx.runCommand("tp @s " + (ORIGIN_X + 22.5) + " " + (ORIGIN_Y + 8) + " " + (z0 + 10.5));
+            ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level, new ChunkCoordinate(ORIGIN_X >> 4, z0 >> 4))
+                    && MeshManager.isChunkLoaded(mc.level,
+                            new ChunkCoordinate((ORIGIN_X + 44) >> 4, (z0 + 20) >> 4)));
+            ctx.runCommand("fill " + ORIGIN_X + " " + ORIGIN_Y + " " + z0 + " "
+                    + (ORIGIN_X + 44) + " " + ORIGIN_Y + " " + (z0 + 20) + " stone");
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y + 1) + " " + z0 + " "
+                    + (ORIGIN_X + 44) + " " + (ORIGIN_Y + 4) + " " + (z0 + 20) + " air");
+            ctx.waitFor(mc -> !mc.level.getBlockState(target.below()).isAir());
+            standAt(ctx, start);
+
+            final double lineX = target.getX() - start.getX();
+            final double lineZ = target.getZ() - start.getZ();
+            final double lineLength = Math.sqrt(lineX * lineX + lineZ * lineZ);
+            final float bearing = (float) Math.toDegrees(Math.atan2(-lineX, lineZ));
+            final int[] walkingTicks = {0};
+            final int[] onHeadingTicks = {0};
+            final int[] takeOffs = {0};
+            final boolean[] wasOnGround = {true};
+            final double[] furthest = {0.0};
+            final double[] worstBack = {0.0};
+
+            ctx.runOnClient(mc -> Journey.start(target));
+            ctx.waitFor(mc -> {
+                if (Journey.status() == Journey.Status.FAILED) {
+                    throw new AssertionError("journey failed: " + Journey.failReason());
+                }
+                double along = ((mc.player.getX() - (start.getX() + 0.5)) * lineX
+                        + (mc.player.getZ() - (start.getZ() + 0.5)) * lineZ) / lineLength;
+                furthest[0] = Math.max(furthest[0], along);
+                worstBack[0] = Math.max(worstBack[0], furthest[0] - along);
+                boolean onGround = mc.player.onGround();
+                if (wasOnGround[0] && !onGround) {
+                    takeOffs[0]++;
+                }
+                wasOnGround[0] = onGround;
+                // The first and last few blocks are turning onto the line and
+                // coming off it; the heading is measured in between.
+                if (along > 3.0 && along < lineLength - 4.0) {
+                    walkingTicks[0]++;
+                    float off = Math.abs(net.minecraft.util.Mth.wrapDegrees(mc.player.getYRot() - bearing));
+                    if (off <= HEADING_TOLERANCE_DEG) {
+                        onHeadingTicks[0]++;
+                    }
+                }
+                return Journey.status() == Journey.Status.ARRIVED;
+            });
+
+            double distance = ctx.computeOnClient(mc -> Math.sqrt(mc.player.blockPosition().distSqr(target)));
+            if (distance > 2.5) {
+                ctx.fail("journey reported arrival " + String.format("%.2f", distance) + " blocks from " + target);
+                return;
+            }
+            double onHeading = walkingTicks[0] == 0 ? 0.0 : (double) onHeadingTicks[0] / walkingTicks[0];
+            String summary = String.format("heading held %.0f%% of %d ticks, %d take-offs, worst step back %.2f",
+                    onHeading * 100, walkingTicks[0], takeOffs[0], worstBack[0]);
+            if (onHeading < MIN_ON_HEADING_SHARE) {
+                ctx.fail("the walk did not hold a straight line at the target: " + summary);
+                return;
+            }
+            if (takeOffs[0] < 2) {
+                ctx.fail("no sprint-jumps across open level ground: " + summary);
+                return;
+            }
+            if (worstBack[0] > MAX_STEP_BACK) {
+                ctx.fail("the walk turned back along its line: " + summary);
+                return;
+            }
+            LOGGER.info("Journey crossed open ground straight: {}", summary);
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+        }
+    }
+
+    /** How far off the bearing to the target the yaw may be and still count as on the line. */
+    private static final float HEADING_TOLERANCE_DEG = 10.0f;
+    /** Share of the walk the yaw has to stay on the line. */
+    private static final double MIN_ON_HEADING_SHARE = 0.75;
+    /** Largest step back along the line the walk may take. */
+    private static final double MAX_STEP_BACK = 0.5;
+
+    /**
      * A short flat walkway along +X at {@code z}, three wide with headroom. Short
      * enough that one fill lays it with the player standing in the middle, which
      * is what makes the span resident on the server — see {@link #buildBridge}.

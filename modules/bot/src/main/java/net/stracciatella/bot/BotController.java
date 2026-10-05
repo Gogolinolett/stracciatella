@@ -190,10 +190,13 @@ public class BotController {
     // EDGE_STEP_CLEARANCE.
     private static final double EDGE_STEP_OVERHANG = 0.8;
 
-    // Opportunistic collection (policy-gated, INTERACTING only). The range is
-    // deliberately short: a drop further than this can't be fetched and
-    // returned from without the break suffering, and COLLECTING gets it anyway.
-    private static final double OPPORTUNISTIC_ITEM_RANGE = 3.0;
+    // Opportunistic collection (policy-gated, INTERACTING only). Reach, not
+    // less: with collectWhileMining there is no collect round behind it any
+    // more, so this walk is how a straggler beside the work gets picked up.
+    // It cannot cost the break — every step has to keep the target in reach
+    // and in sight (isStepSafe), so a drop on the far side simply is not
+    // walked at.
+    private static final double OPPORTUNISTIC_ITEM_RANGE = 4.0;
     // Vanilla's pickup reach: Player.touch inflates the player box by 1.0
     // horizontally, so a 0.6-wide player takes a 0.25-wide item up to
     // 0.3 + 1.0 + 0.125 blocks out on an axis. Inside it, walking closer only
@@ -213,6 +216,11 @@ public class BotController {
     // LOOKING trusts it: the camera eases onto the point and saccades around
     // it, so a point visible by a hair is one the crosshair keeps missing.
     private static final double AIM_CLEARANCE = 0.1;
+    // How squarely a face has to be seen to be aimed at: the sine of the angle
+    // between the eye's ray and the face plane. 0.2 is about 12 degrees — the
+    // top of a foot block, 0.62 below the eye, clears it out to three blocks;
+    // further out the ray grazes the face and the front is the safer aim.
+    private static final double MIN_FACE_VIEW_SINE = 0.2;
 
     // The vertical extent of vanilla's pickup box, relative to the feet: the
     // player box inflated by 0.5 up and down meets a 0.25-high item lying
@@ -277,6 +285,11 @@ public class BotController {
     // session. Prevents exit during the server→client sync delay after a block
     // breaks but before the drop entity syncs to the client.
     private static boolean itemsSeenThisCollect = false;
+    /**
+     * Where a behavior asked COLLECTING to sweep ({@link #sweepDrops}), or null
+     * for the ordinary collect after a break, which looks around the bot.
+     */
+    private static net.minecraft.world.phys.AABB sweepArea;
     // Last phaseTick on which items were visible in the AABB. COLLECTING only
     // exits once items have been absent for a sustained window (not just a
     // single transient tick between pickup and next spawn/sync).
@@ -444,6 +457,7 @@ public class BotController {
         taskQueue.clear();
         lastMinedPos = null;
         itemsSeenThisCollect = false;
+        sweepArea = null;
         lastItemSeenTick = 0;
         stateConfirmTicks = 0;
         completionSequence = -1;
@@ -494,6 +508,31 @@ public class BotController {
 
     public static boolean isPaused() {
         return paused;
+    }
+
+    /**
+     * Walk to every drop lying inside {@code area} until none is left that the
+     * collect walk can reach, then go idle. For a behavior that collects while
+     * mining ({@link BotPolicy#withCollectWhileMining}) and has run out of work
+     * where it stands: the stragglers nobody walked past.
+     *
+     * <p>The phase stays COLLECTING with no current task, so {@link #isActive}
+     * reads false during it — whoever started it watches {@link #getPhase}.
+     *
+     * @return whether the sweep started; only from idle with nothing queued
+     */
+    public static boolean sweepDrops(net.minecraft.world.phys.AABB area) {
+        if (paused || phase != Phase.IDLE || !taskQueue.isEmpty()) {
+            return false;
+        }
+        sweepArea = area;
+        // Nothing to wait for: the drops are already lying there, so the exit
+        // needs no sighting first.
+        itemsSeenThisCollect = true;
+        lastItemSeenTick = 0;
+        lastMinedPos = null;
+        transitionTo(Phase.COLLECTING);
+        return true;
     }
 
     public static Phase getPhase() {
@@ -1137,11 +1176,50 @@ public class BotController {
     /**
      * The face of the task's target block to aim at and interact with: the
      * task's own choice when it has one (placement dictates its face), else
-     * the face most directly visible from the bot's eye.
+     * the open face the camera reaches with the least turn.
+     *
+     * <p>Mining does not care which face is clicked, and a person picks the one
+     * the crosshair is already nearest to. Digging a two-high column, that is
+     * the <em>top</em> of the foot block: with the head block gone the
+     * crosshair sits just above it, while the face most directly in view — the
+     * front, which is what this used to take — is half a block further down.
+     * Every lower block of a corridor cost that extra swing of the head.
+     *
+     * <p>A face only counts when it is open and seen from outside at an angle
+     * a ray can hit reliably ({@link #MIN_FACE_VIEW_SINE}); with none such the
+     * most directly visible face is taken, as before.
      */
     private static net.minecraft.core.Direction aimFace(Minecraft client, BotTask task) {
         net.minecraft.core.Direction preferred = task.preferredFace();
-        return preferred != null ? preferred : BlockInteractor.faceTowardPlayer(client, task.targetPos());
+        if (preferred != null) {
+            return preferred;
+        }
+        BlockPos target = task.targetPos();
+        LocalPlayer player = client.player;
+        Vec3 eye = player.getEyePosition();
+        Vec3 look = player.getViewVector(1.0f);
+        net.minecraft.core.Direction best = null;
+        double bestDot = -2.0;
+        for (net.minecraft.core.Direction face : net.minecraft.core.Direction.values()) {
+            if (!client.level.getBlockState(target.relative(face)).isAir()) {
+                continue;
+            }
+            Vec3 toFace = faceCentre(target, face).subtract(eye);
+            double distance = toFace.length();
+            // How squarely the eye looks onto the face: the sine of the angle
+            // between the ray and the face plane, negative from behind it.
+            double outward = -(toFace.x * face.getStepX() + toFace.y * face.getStepY()
+                    + toFace.z * face.getStepZ());
+            if (distance < 1.0e-6 || outward / distance < MIN_FACE_VIEW_SINE) {
+                continue;
+            }
+            double dot = toFace.dot(look) / distance;
+            if (dot > bestDot) {
+                bestDot = dot;
+                best = face;
+            }
+        }
+        return best != null ? best : BlockInteractor.faceTowardPlayer(client, target);
     }
 
     private static void tickInteracting(Minecraft client, LocalPlayer player) {
@@ -1439,6 +1517,16 @@ public class BotController {
             taskTotalTicks = 0;
             lookRetryUsed = false;
             continueSeam();
+        } else if (policy.collectWhileMining()) {
+            // Straight on to the next work: no stop to fetch what fell outside
+            // the pickup box. It is picked up walking there or while the next
+            // blocks break, and the behavior sweeps what is left at the end.
+            lastMinedPos = null;
+            currentTask = null;
+            transitionTo(Phase.IDLE);
+            if (!taskQueue.isEmpty() && !paused) {
+                startNextTask();
+            }
         } else {
             // Need to walk (or nothing left) — collect drops first.
             // Don't delay here: COLLECTING begins immediately so the bot
@@ -2000,8 +2088,10 @@ public class BotController {
                 collectNoProgressTicks = 0;
             }
 
-            // Find nearby item entities within 8 blocks
-            net.minecraft.world.phys.AABB searchBox = player.getBoundingBox().inflate(8.0);
+            // Find nearby item entities within 8 blocks — or, on a sweep, in
+            // the area the behavior asked for.
+            net.minecraft.world.phys.AABB searchBox = sweepArea != null
+                    ? sweepArea : player.getBoundingBox().inflate(8.0);
             var items = client.level.getEntities(
                     net.minecraft.world.entity.EntityType.ITEM, searchBox, e -> true);
 
@@ -2223,7 +2313,7 @@ public class BotController {
         // inventory has grown and no item is left nearby.
         boolean queued = taskQueue.peek() != null;
         boolean doneCollecting = itemsSeenThisCollect && !itemsNearby
-                && (queued || policy.fastCollectExit()
+                && (queued || policy.fastCollectExit() || sweepArea != null
                         || phaseTicks > lastItemSeenTick + CONFIG.itemAbsenceTicks);
         boolean timedOut = phaseTicks > CONFIG.collectWaitMax;
         if (doneCollecting || timedOut) {
@@ -2243,6 +2333,7 @@ public class BotController {
             releaseMovementKeys();
             lastMinedPos = null;
             itemsSeenThisCollect = false;
+            sweepArea = null;
             lastItemSeenTick = 0;
             currentTask = null;
             transitionTo(Phase.IDLE);

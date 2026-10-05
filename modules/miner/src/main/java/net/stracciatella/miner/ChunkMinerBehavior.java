@@ -155,6 +155,9 @@ public class ChunkMinerBehavior implements BotBehavior {
     // the next one is chosen next to. Null until the slab's first column, and
     // again after every descent, where the bot's own cell is the anchor.
     private BlockPos sweepColumn;
+    // Whether the current slab's leftover drops have been swept up — once, when
+    // its last column is mined; see tickClear.
+    private boolean slabSwept;
     // Steps the repair has already reported as unbuildable. A log latch only —
     // the cell is looked at again every time, because a dam or a floor laid
     // next to it can give it the face it was missing.
@@ -208,6 +211,10 @@ public class ChunkMinerBehavior implements BotBehavior {
                 .withPlayerAttackStop()
                 .withOpportunisticCollection()
                 .withFastCollectExit()
+                // No stop after a batch to walk each straggler down: the bot
+                // mines on and picks drops up as it goes, and the slab's last
+                // drops are swept once it is done (tickClear).
+                .withCollectWhileMining()
                 // The serpentine already is the order, and it is the one thing
                 // about this behaviour that must not be second-guessed: every
                 // step of it is adjacent, which is what keeps the bot from
@@ -286,6 +293,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         pendingPlacement = null;
         groundworkAfterOpening = null;
         sweepColumn = null;
+        slabSwept = false;
         stepsWithoutSupport.clear();
         stairFillerWarned = false;
         stepRetries = 0;
@@ -456,6 +464,7 @@ public class ChunkMinerBehavior implements BotBehavior {
             if (slabHasWork(level, feetY, player.blockPosition().getY())) {
                 slabFeetY = feetY;
                 sweepColumn = null;
+                slabSwept = false;
                 phase = Phase.DESCEND;
                 LOGGER.info("Chunk miner: working slab y={}..{}", feetY, feetY + 1);
                 return BehaviorStatus.RUNNING;
@@ -585,6 +594,19 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         BlockPos column = nextColumn(player, level);
         if (column == null) {
+            // The slab is mined. What fell where nobody walked past is still
+            // lying on its floor — collectWhileMining never stops to fetch it —
+            // so the bot picks it up now, once, before it moves on and before
+            // a run can end here with loot on the ground.
+            if (!slabSwept) {
+                slabSwept = BotController.sweepDrops(new AABB(
+                        chunk.getMinBlockX(), slabFeetY - 1, chunk.getMinBlockZ(),
+                        chunk.getMaxBlockX() + 1, slabFeetY + 2, chunk.getMaxBlockZ() + 1));
+                return BehaviorStatus.RUNNING;
+            }
+            if (BotController.getPhase() == BotController.Phase.COLLECTING) {
+                return BehaviorStatus.RUNNING;
+            }
             phase = Phase.SELECT_SLAB;
             return BehaviorStatus.RUNNING;
         }

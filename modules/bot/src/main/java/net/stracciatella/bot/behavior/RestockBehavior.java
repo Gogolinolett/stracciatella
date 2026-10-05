@@ -74,11 +74,14 @@ public class RestockBehavior implements BotBehavior {
     private static final double TELEPORT_JUMP_DISTANCE = 32.0;
 
     /**
-     * Ticks a transfer may go without moving anything before it is abandoned.
-     * A chest can be full, or hold nothing the manifest wants, and the honest
-     * answer then is to close it rather than to click forever.
+     * Clicks in a row that may move nothing before the container is given up
+     * on. Whether a stack fits is asked before clicking
+     * ({@code ContainerTransfer.nextDeposit}), so a refused click is the
+     * exception — a container that will not take the item — and one retry is
+     * all a person gives it. This used to be sixty, with a click every other
+     * tick, and it was how every full barrel was found out: six seconds each.
      */
-    private static final int TRANSFER_STALL_TICKS = 60;
+    private static final int TRANSFER_STALL_CLICKS = 1;
 
     /**
      * Ticks the bot holds one block before the exit command goes out. Not the
@@ -118,7 +121,7 @@ public class RestockBehavior implements BotBehavior {
     /** Whether the current phase has already handed its destination to {@link Journey}. */
     private boolean journeyStarted;
     private int clickCooldown;
-    private int stalledTicks;
+    private int stalledClicks;
     private int deposited;
     private int withdrawn;
     /**
@@ -166,7 +169,7 @@ public class RestockBehavior implements BotBehavior {
         phaseTicks = 0;
         journeyStarted = false;
         clickCooldown = 0;
-        stalledTicks = 0;
+        stalledClicks = 0;
         deposited = 0;
         withdrawn = 0;
         stop = 0;
@@ -331,7 +334,9 @@ public class RestockBehavior implements BotBehavior {
             // one's over would have the next storage closed on its first
             // unsatisfied click — the count is a statement about one container,
             // not about the trip.
-            stalledTicks = 0;
+            stalledClicks = 0;
+            // A glance at what is in there before the first click.
+            clickCooldown = HumanBehavior.randomRestockClickDelay(config);
             return enter(Phase.TRANSFER);
         }
         if (!isStorageBlock(level, storage().pos())) {
@@ -375,14 +380,23 @@ public class RestockBehavior implements BotBehavior {
         if (withdrawSlot >= 0) {
             return move(player, withdrawSlot, false);
         }
-        // Nothing more to put in (no loot is left anywhere in the inventory) and
-        // nothing here the manifest wants. Whether the trip is finished is
-        // therefore exactly whether the manifest is still short of something —
-        // another storage may hold it.
-        workLeft = needs.shortfall(player) != null;
-        LOGGER.info("Transfer done at {}: {} stacks in, {} stacks out, manifest {}",
-                storage(), deposited, withdrawn,
-                workLeft ? "still short" : "satisfied");
+        // Nothing more that fits in, and nothing here the manifest wants or the
+        // bot has room for. The trip goes on if loot is left over that did not
+        // fit — this storage is full — or the manifest is still short of
+        // something another storage may hold.
+        boolean full = ContainerTransfer.hasLoot(player, needs);
+        workLeft = full || needs.shortfall(player) != null;
+        if (full) {
+            LOGGER.info("Transfer stalled at {} after {} in, {} out — nothing more fits here",
+                    storage(), deposited, withdrawn);
+        } else {
+            LOGGER.info("Transfer done at {}: {} stacks in, {} stacks out, manifest {}",
+                    storage(), deposited, withdrawn,
+                    workLeft ? "still short" : "satisfied");
+        }
+        // Shut at once: the gap after the last click, or the glance on
+        // opening when nothing fitted at all, was the beat a person takes to
+        // see there is nothing more to do — well inside half a second.
         return enter(Phase.CLOSE);
     }
 
@@ -397,16 +411,17 @@ public class RestockBehavior implements BotBehavior {
         ContainerTransfer.quickMove(player, menuSlot);
         ItemStack after = player.containerMenu.slots.get(menuSlot).getItem();
         if (unchanged(before, after)) {
-            stalledTicks++;
-            if (stalledTicks > TRANSFER_STALL_TICKS) {
-                // A click the planner wanted and the container would not take:
-                // this one is full, or holds a stack there is no room for. There
-                // is work left by construction — the planner had just named
-                // it — so the next storage gets the trip, and the one after
-                // that, until the list runs out.
+            stalledClicks++;
+            if (stalledClicks > TRANSFER_STALL_CLICKS) {
+                // A click the planner wanted and the container would not take,
+                // although the room check said it would: something about this
+                // container refuses the item. There is work left by
+                // construction — the planner had just named it — so the next
+                // storage gets the trip, and the one after that, until the
+                // list runs out.
                 workLeft = true;
                 LOGGER.info("Transfer stalled at {} after {} in, {} out —"
-                        + " nothing more fits here", storage(), deposited, withdrawn);
+                        + " the container refused a stack", storage(), deposited, withdrawn);
                 return enter(Phase.CLOSE);
             }
             // Not a hard failure: the other direction may still have work, and
@@ -414,7 +429,7 @@ public class RestockBehavior implements BotBehavior {
             clickCooldown = 1;
             return BehaviorStatus.RUNNING;
         }
-        stalledTicks = 0;
+        stalledClicks = 0;
         if (depositing) {
             deposited++;
         } else {

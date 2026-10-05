@@ -31,6 +31,10 @@ public final class Terrain {
     private static final double MIN_FLOOR_TOP = 0.8;
     /** Vanilla's step height: anything up to this much above the feet is walked onto. */
     private static final double STEP_HEIGHT = 0.6;
+    /** Half of a player's 0.6-wide hitbox. */
+    private static final double BODY_HALF_WIDTH = 0.3;
+    /** Spacing of the samples along a straight walk. */
+    private static final double LINE_SAMPLE_STEP = 0.25;
 
     private Terrain() {
     }
@@ -98,6 +102,43 @@ public final class Terrain {
         }
         VoxelShape shape = state.getCollisionShape(level, pos);
         return !shape.isEmpty() && pos.getY() + shape.max(Direction.Axis.Y) - feetY > STEP_HEIGHT;
+    }
+
+    /**
+     * Whether a body can walk the straight line from {@code (fromX, fromZ)} to
+     * {@code (toX, toZ)} on the floor at {@code floorY}: a standable floor and
+     * {@code headroom} passable cells over it along the whole line, under the
+     * body's whole width. Asked every quarter block, at the centre and both
+     * edges of the body, so no corner of a hole or a wall slips in between.
+     *
+     * <p>The walker's licence to leave the node-by-node route — a grid path of
+     * straight and diagonal steps is not how anyone crosses open ground.
+     */
+    public static boolean isStraightWalk(BlockGetter level, Entity entity, double fromX, double fromZ,
+                                         double toX, double toZ, int floorY, int headroom) {
+        double dx = toX - fromX;
+        double dz = toZ - fromZ;
+        double length = Math.sqrt(dx * dx + dz * dz);
+        int steps = Math.max(1, (int) Math.ceil(length / LINE_SAMPLE_STEP));
+        double sideX = length < 1.0e-6 ? 0.0 : -dz / length * BODY_HALF_WIDTH;
+        double sideZ = length < 1.0e-6 ? 0.0 : dx / length * BODY_HALF_WIDTH;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int i = 0; i <= steps; i++) {
+            double t = (double) i / steps;
+            for (int side = -1; side <= 1; side++) {
+                int x = (int) Math.floor(fromX + dx * t + sideX * side);
+                int z = (int) Math.floor(fromZ + dz * t + sideZ * side);
+                if (!isStandable(level, pos.set(x, floorY, z), entity)) {
+                    return false;
+                }
+                for (int up = 1; up <= headroom; up++) {
+                    if (!isPassable(level, pos.set(x, floorY + up, z))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     /** Collision-free blocks that a body must still not walk into. */

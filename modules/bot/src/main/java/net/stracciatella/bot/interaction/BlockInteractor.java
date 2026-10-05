@@ -107,7 +107,7 @@ public class BlockInteractor {
             return;
         }
 
-        Direction face = fixedFace != null ? fixedFace : faceTowardPlayer(mc, targetPos);
+        Direction face = fixedFace != null ? fixedFace : faceUnderCrosshair(mc, targetPos);
 
         if (currentType == InteractionType.ATTACK) {
             // Once the client has removed the block there is nothing left to
@@ -323,6 +323,21 @@ public class BlockInteractor {
      * direction hint in the destroy-block packets and as the aim point in
      * LOOKING.
      */
+    /**
+     * The face of {@code target} the crosshair is on — the face a player's own
+     * client names in its dig packets — or the most visible face when the
+     * crosshair is elsewhere. The two used to be the same face, until the aim
+     * learned to take the top of a block rather than its front.
+     */
+    private static Direction faceUnderCrosshair(Minecraft mc, BlockPos target) {
+        if (mc.hitResult instanceof BlockHitResult hit
+                && hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK
+                && hit.getBlockPos().equals(target)) {
+            return hit.getDirection();
+        }
+        return faceTowardPlayer(mc, target);
+    }
+
     public static Direction faceTowardPlayer(Minecraft mc, BlockPos target) {
         double px = mc.player.getX();
         double py = mc.player.getEyeY();

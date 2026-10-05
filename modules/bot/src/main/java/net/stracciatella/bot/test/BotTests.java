@@ -1650,12 +1650,29 @@ public class BotTests {
                 BehaviorRunner.start(RestockProbeBehavior.ID);
             });
 
-            ctx.waitFor(mc -> !BehaviorRunner.isActive());
+            // How long the first screen — the full barrel's — stays open. A
+            // person sees it is full and shuts it.
+            int[] firstOpenTicks = {0};
+            boolean[] firstClosed = {false};
+            ctx.waitFor(mc -> {
+                boolean open = !(mc.player.containerMenu instanceof net.minecraft.world.inventory.InventoryMenu);
+                if (open && !firstClosed[0]) {
+                    firstOpenTicks[0]++;
+                } else if (!open && firstOpenTicks[0] > 0) {
+                    firstClosed[0] = true;
+                }
+                return !BehaviorRunner.isActive();
+            });
             ctx.runOnClient(mc -> BotController.stop());
 
             if (probe.starts != 2) {
                 throw new AssertionError("The probe was started " + probe.starts
                         + " times, expected 2 (start, then resume after the restock)");
+            }
+            if (firstOpenTicks[0] > FULL_STORAGE_OPEN_TICKS) {
+                throw new AssertionError("The full barrel stayed open for " + firstOpenTicks[0]
+                        + " ticks, expected at most " + FULL_STORAGE_OPEN_TICKS
+                        + " — half a second to see it is full and shut it");
             }
             if (countItem(ctx, Items.DIAMOND_PICKAXE) < 1) {
                 throw new AssertionError("The bot came home without the pickaxe; it lay in the"
@@ -1898,6 +1915,12 @@ public class BotTests {
      * humanized offset of up to 0.3, which now and then lifts the ray over the
      * corner on its own, and a test that passes on that is a test that reports
      * the weather.
+     *
+     * <p>The target wears a cap. The bot aims at the open face it reaches with
+     * the least turn, and from here the target's top is open and just in view
+     * over the stone — at that face the line is clear from the start, nothing
+     * needs approaching, and the test asks nothing. Covered, the near face is
+     * the only one left, which is the geometry this is about.
      */
     @MinecraftTest(name = "Bot walks until the face it aims at is in sight",
             timeoutTicks = 400, order = -167)
@@ -1905,14 +1928,18 @@ public class BotTests {
         final BlockPos origin = new BlockPos(1560, 30, 1560);
         final BlockPos occluder = origin.offset(1, 0, 0);
         final BlockPos target = origin.offset(3, 0, 0);
+        final BlockPos cap = target.above();
         setupTest(ctx, origin);
         buildPlatform(ctx, origin, CLEAR_RADIUS);
         ctx.runCommand("setblock " + occluder.getX() + " " + occluder.getY() + " "
                 + occluder.getZ() + " stone");
         ctx.runCommand("setblock " + target.getX() + " " + target.getY() + " "
                 + target.getZ() + " stone");
+        ctx.runCommand("setblock " + cap.getX() + " " + cap.getY() + " "
+                + cap.getZ() + " stone");
         ctx.waitFor(mc -> !mc.level.getBlockState(occluder).isAir()
-                && !mc.level.getBlockState(target).isAir());
+                && !mc.level.getBlockState(target).isAir()
+                && !mc.level.getBlockState(cap).isAir());
         ctx.runCommand("give @s diamond_pickaxe");
         switchToSurvivalAt(ctx, origin, origin.getY());
 
@@ -2350,6 +2377,58 @@ public class BotTests {
         LOGGER.info("Walked round the wall on a mesh it built itself");
     }
 
+    /**
+     * A two-high column two blocks out, across a trench the bot will not step
+     * into, so it mines both blocks from where it stands. Once the head block
+     * is gone the crosshair sits just above the foot block's top, and that is
+     * where a person hits it — not on the front face half a block further
+     * down, which is what the most-directly-visible rule took from this far.
+     */
+    @MinecraftTest(name = "Bot takes the lower block from the top", timeoutTicks = 300, order = -161)
+    public void takesLowerBlockFromTheTop(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1860, 30, 1860);
+        final BlockPos foot = origin.offset(0, 0, -2);
+        final BlockPos head = foot.above();
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("fill " + (origin.getX() - 1) + " " + (origin.getY() - 2) + " " + (origin.getZ() - 1)
+                + " " + (origin.getX() + 1) + " " + (origin.getY() - 1) + " " + (origin.getZ() - 1) + " air");
+        ctx.runCommand("setblock " + foot.getX() + " " + foot.getY() + " " + foot.getZ() + " stone");
+        ctx.runCommand("setblock " + head.getX() + " " + head.getY() + " " + head.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        List<net.minecraft.core.Direction> footFaces = new ArrayList<>();
+        startProbe(ctx, BotPolicy.none().withOrderedTasks(), List.of(head, foot));
+        ctx.waitFor(mc -> {
+            if (BotController.getPhase() == BotController.Phase.INTERACTING
+                    && BotController.getCurrentTask() != null
+                    && BotController.getCurrentTask().targetPos().equals(foot)
+                    && mc.hitResult instanceof net.minecraft.world.phys.BlockHitResult hit
+                    && hit.getBlockPos().equals(foot)) {
+                footFaces.add(hit.getDirection());
+            }
+            return !BehaviorRunner.isActive();
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+
+        if (ctx.computeOnClient(mc -> !mc.level.getBlockState(foot).isAir()
+                || !mc.level.getBlockState(head).isAir())) {
+            throw new AssertionError("The column is not down — the test measured nothing");
+        }
+        if (footFaces.isEmpty()) {
+            throw new AssertionError("Never saw the crosshair on the foot block while breaking it");
+        }
+        long up = footFaces.stream().filter(face -> face == net.minecraft.core.Direction.UP).count();
+        if (up * 2 < footFaces.size()) {
+            throw new AssertionError("The foot block was hit on " + footFaces.get(0)
+                    + " (UP on " + up + " of " + footFaces.size() + " ticks) — expected its top,"
+                    + " where the crosshair already is once the head block is gone");
+        }
+        LOGGER.info("Took the lower block from the top ({} of {} ticks on UP)", up, footFaces.size());
+    }
+
     /** Eye to block centre, the distance {@code BotController} positions by. */
     private static double distanceToBlock(net.minecraft.client.player.LocalPlayer player,
                                           BlockPos target) {
@@ -2369,6 +2448,13 @@ public class BotTests {
      * particular geometry needs a particular number of blocks.
      */
     private static final double MIN_APPROACH_STEP = 0.2;
+
+    /**
+     * Ticks a full container may stay open: half a second, the most a person
+     * takes to see there is no room and shut it. It used to be six seconds of
+     * shift-clicks into the full slots.
+     */
+    private static final int FULL_STORAGE_OPEN_TICKS = 10;
 
     /**
      * How far from the block the bot may still be when it starts breaking it.
