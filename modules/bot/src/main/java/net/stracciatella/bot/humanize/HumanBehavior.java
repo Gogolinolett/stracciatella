@@ -126,6 +126,14 @@ public class HumanBehavior {
     }
 
     /**
+     * Columns of a row aimed at one by one before the bot settles on one angle
+     * for the rest of it, uniform in [rowSettleColumnsMin, rowSettleColumnsMax].
+     */
+    public static int randomRowSettleColumns(BotConfig config) {
+        return randomIntInRange(config.rowSettleColumnsMin, config.rowSettleColumnsMax);
+    }
+
+    /**
      * Gap in ticks between two shift-clicks inside an open container, uniform in
      * [restockClickDelayMin, restockClickDelayMax]. Emptying thirty stacks into a
      * chest in thirty consecutive ticks is not something a person's hand does.

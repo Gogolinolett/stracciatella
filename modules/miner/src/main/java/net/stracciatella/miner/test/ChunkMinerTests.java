@@ -2817,6 +2817,195 @@ public class ChunkMinerTests {
         }
     }
 
+    // ================================================================
+    // Test 48: one heading for the rest of a row
+    // ================================================================
+
+    /**
+     * Columns a row may take before the heading has to stand. A person
+     * starting a row turns into it and finds, within the first one to three
+     * columns, the angle from which each next column comes into the crosshair
+     * by walking on — the bound is the upper end of that.
+     */
+    private static final int ROW_SETTLE_COLUMNS = 3;
+    /**
+     * How far yaw and pitch may each wander from the angle once it stands. Not
+     * zero: the camera's micro-saccades move them by up to half a degree and a
+     * third of one on their own. Aimed per block, a turn to the next column is
+     * tens of degrees at working distance, and so is the pitch swing from a
+     * head block to the foot block under it.
+     */
+    private static final double MAX_ROW_ANGLE_DRIFT = 3.0;
+
+    /**
+     * Two neighbouring rows of a slab, two high and fourteen long: the first
+     * runs east, the snake turns, the second runs back west beside the one just
+     * cleared — which is every row of a real slab after its first. A person
+     * mining a row does not aim anew at every column: after the first one to
+     * three columns they have found a heading from which walking on brings the
+     * next column under the crosshair, and they keep it to the row's end.
+     * Collecting is the exception the requirement names, so COLLECTING ticks
+     * are left out; the body stepping toward a drop while the camera holds is
+     * not a turn and needs no exception.
+     *
+     * <p>Measured as the largest yaw and pitch difference from the angle the
+     * row had when the first block of its fourth column began to break, over
+     * every later tick that works a block of that row while the block still
+     * stands. The first: the angle found over three columns may be turned onto
+     * as the fourth comes up, but that column is worked at it. The second: once
+     * the row's last block is gone, turning to the next row is the next piece
+     * of work. Aimed per block, the same run turned 9 to 34 degrees of yaw per
+     * column and swung the pitch by 25 to 35.
+     */
+    @MinecraftTest(name = "Chunk miner holds its heading along a row", timeoutTicks = 6000, order = 48)
+    public void holdsItsHeadingAlongARow(TestContext ctx) {
+        final int eastRow = 6;
+        final int westRow = 7;
+        prepareWithFloor(ctx, 0, eastRow, 0, 15, eastRow - 1, westRow + 1);
+        fill(ctx, 1, Y, eastRow, 14, Y + 1, westRow, "stone");
+        final BlockPos lastCell = new BlockPos(BASE_X + 14, Y + 1, BASE_Z + westRow);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastCell).isAir());
+
+        final RowAimTrace trace = new RowAimTrace(BASE_Z + eastRow, BASE_Z + westRow);
+        startChunkMiner(ctx, true, Y + 1, Y);
+        ctx.waitFor(mc -> {
+            trace.sample(mc);
+            return !BehaviorRunner.isActive();
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+        if (ctx.computeOnClient(mc -> MinerSetup.chunkMiner().failed())) {
+            throw new AssertionError("Chunk miner aborted: "
+                    + ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine()) + " — " + trace);
+        }
+        for (int dx = 1; dx <= 14; dx++) {
+            for (int dz = eastRow; dz <= westRow; dz++) {
+                assertAir(ctx, new BlockPos(BASE_X + dx, Y, BASE_Z + dz), "row block " + dx + "/" + dz);
+                assertAir(ctx, new BlockPos(BASE_X + dx, Y + 1, BASE_Z + dz), "row head " + dx + "/" + dz);
+            }
+        }
+        LOGGER.info("Row heading trace: {}", trace);
+        for (int row = 0; row < 2; row++) {
+            if (trace.heldColumns(row) < 1) {
+                throw new AssertionError("Row " + row + " never got past its settling columns — " + trace);
+            }
+            if (trace.drift(row) > MAX_ROW_ANGLE_DRIFT) {
+                throw new AssertionError("Row " + row + " did not keep its heading: yaw wandered "
+                        + Math.round(trace.drift(row) * 10) / 10.0 + " degrees after column "
+                        + ROW_SETTLE_COLUMNS + ", allowed " + MAX_ROW_ANGLE_DRIFT + " — " + trace);
+            }
+            if (trace.pitchDrift(row) > MAX_ROW_ANGLE_DRIFT) {
+                throw new AssertionError("Row " + row + " did not keep its angle: pitch wandered "
+                        + Math.round(trace.pitchDrift(row) * 10) / 10.0 + " degrees after column "
+                        + ROW_SETTLE_COLUMNS + ", allowed " + MAX_ROW_ANGLE_DRIFT + " — " + trace);
+            }
+        }
+    }
+
+    /**
+     * Per row: the columns in the order they were worked, and from the column
+     * after the settling ones on, how far the yaw strayed from the heading it
+     * started that column with. Field arithmetic only, sampled on the tick
+     * thread; the per-column summary is built as text once per column.
+     */
+    private static final class RowAimTrace {
+        private final int[] rowZ;
+        private final BlockPos[] lastColumn = new BlockPos[2];
+        private final int[] columns = new int[2];
+        private final float[] heading = new float[2];
+        private final boolean[] headingSet = new boolean[2];
+        private final double[] drift = new double[2];
+        private final float[] headingPitch = new float[2];
+        private final double[] pitchDrift = new double[2];
+        private final StringBuilder log = new StringBuilder();
+        private float columnYawStart;
+        private float columnLastYaw;
+        private double columnYawTravel;
+        private float columnPitchMin;
+        private float columnPitchMax;
+        private boolean columnOpen;
+
+        RowAimTrace(int... rowZ) {
+            this.rowZ = rowZ;
+        }
+
+        void sample(Minecraft mc) {
+            LocalPlayer player = mc.player;
+            var task = BotController.getCurrentTask();
+            if (player == null || task == null
+                    || task.interactionType() != net.stracciatella.bot.task.InteractionType.ATTACK) {
+                return;
+            }
+            BlockPos target = task.targetPos();
+            int row = target.getZ() == rowZ[0] ? 0 : target.getZ() == rowZ[1] ? 1 : -1;
+            if (row < 0) {
+                return;
+            }
+            float yaw = player.getYRot();
+            float pitch = player.getXRot();
+            BlockPos column = new BlockPos(target.getX(), 0, target.getZ());
+            if (!column.equals(lastColumn[row])) {
+                closeColumn();
+                lastColumn[row] = column;
+                columns[row]++;
+                log.append(" r").append(row).append("#").append(columns[row])
+                        .append(" x=").append(target.getX())
+                        .append(String.format(java.util.Locale.US, " body=(%.2f,%.2f)",
+                                player.getX(), player.getZ()));
+                columnYawStart = yaw;
+                columnLastYaw = yaw;
+                columnYawTravel = 0;
+                columnPitchMin = pitch;
+                columnPitchMax = pitch;
+                columnOpen = true;
+            }
+            if (!headingSet[row] && columns[row] > ROW_SETTLE_COLUMNS
+                    && BotController.getPhase() == BotController.Phase.INTERACTING) {
+                heading[row] = yaw;
+                headingPitch[row] = pitch;
+                headingSet[row] = true;
+            }
+            columnYawTravel += Math.abs(Mth.degreesDifference(columnLastYaw, yaw));
+            columnLastYaw = yaw;
+            columnPitchMin = Math.min(columnPitchMin, pitch);
+            columnPitchMax = Math.max(columnPitchMax, pitch);
+            // While the block still stands: once it is gone the hand moves on,
+            // and after a row's last block that is the turn into the next row.
+            if (headingSet[row] && BotController.getPhase() != BotController.Phase.COLLECTING
+                    && !mc.level.getBlockState(target).isAir()) {
+                drift[row] = Math.max(drift[row], Math.abs(Mth.degreesDifference(heading[row], yaw)));
+                pitchDrift[row] = Math.max(pitchDrift[row], Math.abs(pitch - headingPitch[row]));
+            }
+        }
+
+        private void closeColumn() {
+            if (!columnOpen) {
+                return;
+            }
+            log.append(String.format(java.util.Locale.US, " yaw=%.1f->%.1f travel=%.1f pitch=%.1f..%.1f;",
+                    columnYawStart, columnLastYaw, columnYawTravel, columnPitchMin, columnPitchMax));
+            columnOpen = false;
+        }
+
+        int heldColumns(int row) {
+            return columns[row] - ROW_SETTLE_COLUMNS;
+        }
+
+        double drift(int row) {
+            return drift[row];
+        }
+
+        double pitchDrift(int row) {
+            return pitchDrift[row];
+        }
+
+        @Override
+        public String toString() {
+            closeColumn();
+            return String.format(java.util.Locale.US, "drift=[%.1f, %.1f] pitchDrift=[%.1f, %.1f] columns=[%d, %d]%s",
+                    drift[0], drift[1], pitchDrift[0], pitchDrift[1], columns[0], columns[1], log);
+        }
+    }
+
     private static String shortList(Set<BlockPos> cells) {
         return cells.isEmpty() ? "nowhere"
                 : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());
