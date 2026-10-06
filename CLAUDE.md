@@ -119,7 +119,7 @@ modules/<name>/
 
 **Miner**:
 - `DiamondMinerBehavior.java` — Diamond strip miner (LOCATE → DESCEND → TUNNEL), plans `MineBlockTask` batches on the BotController
-- `ChunkMinerBehavior.java` — Chunk miner (SELECT_SLAB → DESCEND → CLEAR), serpentine 2-layer slabs, resumes by reading the world rather than saving a cursor
+- `ChunkMinerBehavior.java` — Chunk miner (SELECT_SLAB → (EXIT) → DESCEND → CLEAR), serpentine 2-layer slabs, a staircase that reaches the ground around the chunk, resumes by reading the world rather than saving a cursor
 
 **Testing**:
 - `TestRunner.java` — Singleton test execution engine

@@ -16,7 +16,23 @@ import net.stracciatella.pathfinding.logic.mesh.Neighbor;
 public class MeshPathfinder {
 
     public List<MeshNode> findPath(MeshNode start, MeshNode end) {
-        return search(start, end, false);
+        return search(start, end, false, List.of());
+    }
+
+    /**
+     * The path to the first of {@code ends}, in the caller's order of preference,
+     * that is reachable from {@code start}; empty if none is.
+     *
+     * <p>For a goal that is any of several nodes — the places to stand for a
+     * block in reach — where the best-placed one may be cut off: the top of a
+     * pillar beside the block, which no walk gets onto. It costs nothing over
+     * {@link #findPath} to the first: that search runs as before, and only when
+     * it drains without reaching it is the rest of the list looked up among the
+     * nodes it visited, which are exactly the reachable ones.
+     */
+    public List<MeshNode> findPathToFirst(MeshNode start, List<MeshNode> ends) {
+        if (ends.isEmpty()) return Collections.emptyList();
+        return search(start, ends.get(0), false, ends.subList(1, ends.size()));
     }
 
     /**
@@ -38,10 +54,10 @@ public class MeshPathfinder {
      * "walk a stretch and reconsider" and "there is no way out of here".
      */
     public List<MeshNode> findPathTowards(MeshNode start, MeshNode end) {
-        return search(start, end, true);
+        return search(start, end, true, List.of());
     }
 
-    private List<MeshNode> search(MeshNode start, MeshNode end, boolean allowPartial) {
+    private List<MeshNode> search(MeshNode start, MeshNode end, boolean allowPartial, List<MeshNode> alternatives) {
         // Return empty if invalid inputs
         if (start == null || end == null) return Collections.emptyList();
 
@@ -108,7 +124,15 @@ public class MeshPathfinder {
             }
         }
 
-        // No path found. For a partial answer, hand back the closest approach —
+        // No path found. The closed set now holds everything reachable, with a
+        // way to each of them in cameFrom.
+        for (MeshNode alternative : alternatives) {
+            if (closedSet.contains(alternative)) {
+                return reconstructPath(cameFrom, alternative);
+            }
+        }
+
+        // For a partial answer, hand back the closest approach —
         // unless that is still the start, which means there was nowhere to go.
         if (allowPartial && !bestTowards.equals(start)) {
             return reconstructPath(cameFrom, bestTowards);

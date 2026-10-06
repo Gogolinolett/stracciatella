@@ -13,5 +13,6 @@ dependencies {
     compileOnly(projects.loader)
     compileOnly(project(":modules:bot"))
     compileOnly(project(":modules:gui"))
+    compileOnly(project(":modules:pathfinding"))
     compileOnly(project(":modules:testing"))
 }

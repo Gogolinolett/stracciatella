@@ -3,6 +3,7 @@ package net.stracciatella.bot.task;
 import java.util.ArrayDeque;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
 
 /**
  * Queue of bot tasks. Tasks can be taken in FIFO order ({@link #poll()}) or
@@ -12,6 +13,14 @@ import net.minecraft.core.BlockPos;
  * replaying a fixed scan order.
  */
 public class TaskQueue {
+
+    /**
+     * What turning round costs, in blocks of distance: a block straight behind
+     * counts this much further away than the same block straight ahead, one to
+     * the side half as much. A person takes the block in front of them before
+     * an equally near one they would have to turn round for.
+     */
+    private static final double TURN_COST_BLOCKS = 3.0;
 
     private final ArrayDeque<BotTask> queue = new ArrayDeque<>();
 
@@ -33,27 +42,29 @@ public class TaskQueue {
 
     /**
      * Returns (without removing) the task whose current target is nearest to
-     * {@code from}. Ties keep insertion order. Null when empty.
+     * the block {@code from}, a target away from the {@code view} direction
+     * seen from {@code eye} counting further ({@link #TURN_COST_BLOCKS}). Ties
+     * keep insertion order. Null when empty.
      */
-    public BotTask peekNearest(BlockPos from) {
+    public BotTask peekNearest(BlockPos from, Vec3 eye, Vec3 view) {
         BotTask best = null;
-        double bestDistSq = Double.MAX_VALUE;
+        double bestCost = Double.MAX_VALUE;
         for (BotTask task : queue) {
-            double distSq = task.targetPos().distSqr(from);
-            if (distSq < bestDistSq) {
-                bestDistSq = distSq;
+            BlockPos target = task.targetPos();
+            Vec3 toTarget = Vec3.atCenterOf(target).subtract(eye).normalize();
+            double turn = Math.acos(Math.max(-1.0, Math.min(1.0, toTarget.dot(view)))) / Math.PI;
+            double cost = Math.sqrt(target.distSqr(from)) + TURN_COST_BLOCKS * turn;
+            if (cost < bestCost) {
+                bestCost = cost;
                 best = task;
             }
         }
         return best;
     }
 
-    /**
-     * Removes and returns the task whose current target is nearest to
-     * {@code from}. Ties keep insertion order. Null when empty.
-     */
-    public BotTask pollNearest(BlockPos from) {
-        BotTask best = peekNearest(from);
+    /** {@link #peekNearest}, and take it. */
+    public BotTask pollNearest(BlockPos from, Vec3 eye, Vec3 view) {
+        BotTask best = peekNearest(from, eye, view);
         if (best != null) {
             queue.remove(best);
         }

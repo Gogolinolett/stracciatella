@@ -141,6 +141,28 @@ public class MeshPathfinderTest {
     }
 
     /**
+     * The places to stand for a block in reach, best first, where the best is
+     * cut off — the top of a pillar beside it. The answer is the path to the
+     * first one a path reaches, not none and not the nearest.
+     */
+    @Test
+    public void toFirstSkipsTheGoalsNoPathReaches() {
+        Map<String, MeshNode> grid = buildGrid(10, 10, (x, z) -> x == 5);
+        MeshNode start = grid.get("1,1");
+        MeshNode cutOff = grid.get("8,1");
+        MeshNode far = grid.get("4,8");
+        MeshNode near = grid.get("2,1");
+
+        List<MeshNode> path = new MeshPathfinder().findPathToFirst(start, List.of(cutOff, far, near));
+
+        Assertions.assertFalse(path.isEmpty(), "a reachable goal is on the list");
+        Assertions.assertEquals(start, path.get(0), "a path starts where the bot stands");
+        Assertions.assertEquals(far, path.get(path.size() - 1), "the list's order decides, not the distance");
+        Assertions.assertTrue(new MeshPathfinder().findPathToFirst(start, List.of(cutOff)).isEmpty(),
+                "nothing reachable on the list is no path");
+    }
+
+    /**
      * Four-connected grid of walkable nodes, minus whatever {@code wall} rejects.
      */
     private Map<String, MeshNode> buildGrid(int width, int depth, WallAt wall) {

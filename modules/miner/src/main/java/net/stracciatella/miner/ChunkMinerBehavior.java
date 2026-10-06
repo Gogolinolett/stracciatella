@@ -10,10 +10,12 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.item.ItemStack;
@@ -34,6 +36,7 @@ import net.stracciatella.bot.behavior.BotBehavior;
 import net.stracciatella.bot.behavior.RestockNeeds;
 import net.stracciatella.bot.humanize.HumanBehavior;
 import net.stracciatella.bot.interaction.InventoryHelper;
+import net.stracciatella.bot.interaction.ServerBlockSync;
 import net.stracciatella.bot.task.BotTask;
 import net.stracciatella.bot.task.MineBlockTask;
 import net.stracciatella.bot.task.PlaceBlockTask;
@@ -110,6 +113,12 @@ public class ChunkMinerBehavior implements BotBehavior {
      * above the next slab's floor, out of the way and still in view.
      */
     private static final int STAIR_REPAIR_LOOKBACK = 4;
+
+    /**
+     * How long a cell broken by mistake waits, with the controller idle, for
+     * the server to settle the break before it is put back regardless.
+     */
+    private static final int PUT_BACK_WAIT_TICKS = 40;
     /**
      * Filler blocks the run wants to carry. A stack, because a cap, a dam or a
      * bridged floor is one block at a time and a chunk rarely needs dozens —
@@ -122,9 +131,28 @@ public class ChunkMinerBehavior implements BotBehavior {
 
     private enum Phase {
         SELECT_SLAB,
+        EXIT,
         DESCEND,
         CLEAR
     }
+
+    /**
+     * Cells kept free over a step of the way out that is climbed from, and over
+     * the top one, which is only walked off: a step up wants three free cells
+     * over the step it leaves ({@code ChunkMeshBuilder}'s jump headroom), a walk
+     * two.
+     */
+    private static final int EXIT_CLIMB_HEADROOM = 3;
+    private static final int EXIT_WALK_HEADROOM = 2;
+    /** The farthest a bot walks down off the top step onto the ground outside: the mesh's drop. */
+    private static final int EXIT_MAX_DROP = 3;
+    private static final int NO_EXIT = Integer.MIN_VALUE;
+    /**
+     * How far from the chunk edge the block lies that brings the bot back down
+     * after building the way out: far enough that standing next to it is not
+     * standing on the staircase.
+     */
+    private static final int WAY_DOWN_MARGIN = 3;
 
     private final MinerConfig config;
 
@@ -158,6 +186,20 @@ public class ChunkMinerBehavior implements BotBehavior {
     // Whether the current slab's leftover drops have been swept up — once, when
     // its last column is mined; see tickClear.
     private boolean slabSwept;
+    // A stair slip rolled when the last column was planned, carried out once
+    // that column's batch is done; see tickClear.
+    private boolean stairSlipOwed;
+    // A cell broken by mistake — a knocked-out step, a floor block dug too
+    // deep — that goes back in once the server has settled its break; see
+    // tickClear. The sweep holds until then.
+    private BlockPos putBack;
+    private int putBackWaitTicks;
+    // The way out: looked for once a run, when its top slab is done; the layer
+    // whose step it is walked off from; and where the bot stood before it went
+    // up to build it, so the descent can bring it back down first.
+    private boolean exitChecked;
+    private int exitTop;
+    private BlockPos exitFrom;
     // Steps the repair has already reported as unbuildable. A log latch only —
     // the cell is looked at again every time, because a dam or a floor laid
     // next to it can give it the face it was missing.
@@ -294,6 +336,12 @@ public class ChunkMinerBehavior implements BotBehavior {
         groundworkAfterOpening = null;
         sweepColumn = null;
         slabSwept = false;
+        stairSlipOwed = false;
+        putBack = null;
+        putBackWaitTicks = 0;
+        exitChecked = false;
+        exitTop = NO_EXIT;
+        exitFrom = null;
         stepsWithoutSupport.clear();
         stairFillerWarned = false;
         stepRetries = 0;
@@ -444,6 +492,7 @@ public class ChunkMinerBehavior implements BotBehavior {
 
         return switch (phase) {
             case SELECT_SLAB -> tickSelectSlab(player, level);
+            case EXIT -> tickExit(player, level);
             case DESCEND -> tickDescend(player, level);
             case CLEAR -> tickClear(player, level);
         };
@@ -460,6 +509,20 @@ public class ChunkMinerBehavior implements BotBehavior {
      * slab nobody has opened yet — see {@link #hasOpenFace}.
      */
     private BehaviorStatus tickSelectSlab(LocalPlayer player, Level level) {
+        // Once the top slab is done, and only for a run that goes below it: a
+        // single slab leaves its floor standing and no pit to get out of.
+        // After the top slab rather than before, because the pocket a run
+        // starts in can be a hole the bot has no way out of to the ring yet.
+        if (!exitChecked && fromY - 2 >= toY
+                && !slabHasWork(level, fromY - 1, player.blockPosition().getY())) {
+            exitChecked = true;
+            exitTop = findExitTop(level);
+            if (exitTop != NO_EXIT) {
+                exitFrom = player.blockPosition();
+                phase = Phase.EXIT;
+                return BehaviorStatus.RUNNING;
+            }
+        }
         for (int feetY = fromY - 1; feetY >= toY - 1; feetY -= SLAB_HEIGHT) {
             if (slabHasWork(level, feetY, player.blockPosition().getY())) {
                 slabFeetY = feetY;
@@ -472,6 +535,195 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         LOGGER.info("Chunk miner finished: chunk {} cleared, {} blocks mined", chunk, blocksMined);
         return BehaviorStatus.SUCCEEDED;
+    }
+
+    /**
+     * Make the staircase reach daylight. The ramp starts at the floor of the
+     * run's top slab, and a run started below the ground around it — in a
+     * hollow, a dug pocket, under a hillside — leaves a sheer wall between that
+     * floor and the ground outside: more than the three blocks a mesh edge
+     * drops, and more than the one it climbs. A restock that teleports out
+     * then cannot walk back in, and one that walks out cannot leave.
+     * Reported from a real run: started at y=102, the ground around the chunk
+     * at 107 to 111, every way back ending in {@code no way towards}.
+     *
+     * <p>So the ramp goes on up, one step per layer as below, until the step it
+     * is walked off from has the ground outside beside it ({@link
+     * #findExitTop}). Built from the bottom, a layer at a time — the missing
+     * step first, then the cells over it — because the bot climbs what it has
+     * built to reach the next layer. The same pass mends the ramp between the
+     * slab and the top of the run, which a run started further down the shaft
+     * has never looked at.
+     *
+     * <p>Nothing here is fatal before it is tried. A step with nothing to
+     * build against, no filler, a liquid in the way or a block that may not be
+     * mined end the way out where it is, with a warning, and the run goes on:
+     * the pit is not more dangerous for it, only harder to return to. What is
+     * tried is held to the bar of every other placement and break.
+     */
+    private BehaviorStatus tickExit(LocalPlayer player, Level level) {
+        for (int y = fromY - 2; y <= exitTop; y++) {
+            BlockPos step = SpiralStairs.stepAt(chunk, y);
+            BlockState state = level.getBlockState(step);
+            if (!state.getFluidState().isEmpty()) {
+                return endExit("water or lava stands where the step at " + shortPos(step) + " goes");
+            }
+            if (state.getCollisionShape(level, step).isEmpty()) {
+                if (player.getBoundingBox().intersects(new AABB(step))) {
+                    return endExit("standing where the step at " + shortPos(step) + " goes");
+                }
+                if (InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
+                    return endExit("no filler block for the step at " + shortPos(step));
+                }
+                BlockPos support = PlaceBlockTask.findSupport(level, step, player.getEyePosition());
+                if (support == null) {
+                    return endExit("nothing to build the step at " + shortPos(step) + " against");
+                }
+                LOGGER.info("Chunk miner: building the way out, a step at {}", shortPos(step));
+                return planPlacement(step, support, "step of the way out");
+            }
+            List<BlockPos> dig = new ArrayList<>();
+            int headroom = y < exitTop ? EXIT_CLIMB_HEADROOM : EXIT_WALK_HEADROOM;
+            for (int k = 1; k <= headroom; k++) {
+                BlockPos cell = step.above(k);
+                if (isWalkSpace(level, cell)) {
+                    continue;
+                }
+                BlockState blocking = level.getBlockState(cell);
+                if (!isDiggable(blocking) || touchesFluid(level, cell)) {
+                    return endExit("cannot dig through " + blockName(blocking) + " at " + shortPos(cell));
+                }
+                dig.add(cell);
+            }
+            if (!dig.isEmpty()) {
+                LOGGER.info("Chunk miner: digging the way out at {}", shortPos(dig.get(0)));
+                plan(dig);
+                return BehaviorStatus.RUNNING;
+            }
+        }
+        LOGGER.info("Chunk miner: the way out is open, off the step at {}",
+                shortPos(SpiralStairs.stepAt(chunk, exitTop)));
+        phase = Phase.SELECT_SLAB;
+        return BehaviorStatus.RUNNING;
+    }
+
+    private BehaviorStatus endExit(String why) {
+        LOGGER.warn("Chunk miner: the way out stops short, {}", why);
+        phase = Phase.SELECT_SLAB;
+        return BehaviorStatus.RUNNING;
+    }
+
+    /**
+     * The layer whose step the way out is walked off from, or {@link #NO_EXIT}.
+     * Going up from the run's top step, the first layer that has, just outside
+     * the chunk beside its step, room to stand under the open sky with ground
+     * at most {@link #EXIT_MAX_DROP} below. Rock there, or a cave or an
+     * overhang, is wall the ramp climbs past. Open sky with no ground under it —
+     * a cliff, or the pit of a chunk mined next door — is not something a
+     * staircase gets the bot onto, and there is no way out to build.
+     *
+     * <p>Once the ramp has had to climb, the ground has to be no lower than the
+     * run's top floor: the climb is for ground that rises over the pit's rim,
+     * and a ledge to drop off behind a rock lip is not that — a rim test that
+     * stood two blocks of rock outside the corner had the first version climb
+     * a layer and build a step into the slab for a drop back to below the floor.
+     *
+     * <p>On level ground that is the run's own top step and nothing gets built:
+     * the cells over it are the top slab, already mined.
+     */
+    private int findExitTop(Level level) {
+        for (int y = fromY - 2; y < level.getMaxY() - EXIT_CLIMB_HEADROOM; y++) {
+            BlockPos step = SpiralStairs.stepAt(chunk, y);
+            int lowestGround = y > fromY - 2 ? fromY - 2 : y - EXIT_MAX_DROP;
+            boolean drop = false;
+            for (int[] d : SpiralStairs.outward(SpiralStairs.ringIndexAt(y))) {
+                BlockPos beside = step.offset(d[0], 0, d[1]);
+                if (isWalkSpace(level, beside.above()) && isWalkSpace(level, beside.above(2))
+                        && isUnderSky(level, beside.above())) {
+                    if (hasGroundWithinDrop(level, beside, lowestGround)) {
+                        if (y > fromY - 2) {
+                            LOGGER.info("Chunk miner: the way out of the pit climbs to {}", shortPos(step));
+                        }
+                        return y;
+                    }
+                    drop = true;
+                }
+            }
+            if (drop) {
+                LOGGER.info("Chunk miner: the staircase meets an open drop beside {}, no way out to build",
+                        shortPos(step));
+                return NO_EXIT;
+            }
+        }
+        return NO_EXIT;
+    }
+
+    /** Room for a body: nothing to collide with and no liquid. */
+    private static boolean isWalkSpace(Level level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        return state.getCollisionShape(level, pos).isEmpty() && state.getFluidState().isEmpty();
+    }
+
+    /** Nothing solid over {@code pos} but leaves, all the way up. */
+    private static boolean isUnderSky(Level level, BlockPos pos) {
+        BlockPos.MutableBlockPos cell = pos.mutable();
+        for (; cell.getY() <= level.getMaxY(); cell.move(Direction.UP)) {
+            BlockState state = level.getBlockState(cell);
+            if (!state.getCollisionShape(level, cell).isEmpty() && !state.is(BlockTags.LEAVES)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether a body stepping onto {@code beside} lands on ground no more than
+     * the mesh's drop down and no lower than {@code lowestGround}.
+     */
+    private static boolean hasGroundWithinDrop(Level level, BlockPos beside, int lowestGround) {
+        for (int k = 0; k <= EXIT_MAX_DROP && beside.getY() - k >= lowestGround; k++) {
+            BlockPos floor = beside.below(k);
+            if (level.getBlockState(floor).isFaceSturdy(level, floor, Direction.UP)) {
+                return true;
+            }
+            if (!isWalkSpace(level, floor)) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean touchesFluid(Level level, BlockPos pos) {
+        for (Direction dir : Direction.values()) {
+            if (dir != Direction.DOWN && !level.getFluidState(pos.relative(dir)).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A block of the slab under the run's top floor, well inside the chunk and
+     * nearest to where the bot stood before it went up to build the way out.
+     * Mining it brings the bot back down the staircase onto that floor, where
+     * the descent can dig through its own column — up on the staircase, that
+     * column is the staircase. Null when the layer has nothing to dig.
+     */
+    private BlockPos wayBackDown(Level level, BlockPos from) {
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        int y = fromY - 2;
+        for (int x = WAY_DOWN_MARGIN; x < SpiralStairs.CHUNK_SIZE - WAY_DOWN_MARGIN; x++) {
+            for (int z = WAY_DOWN_MARGIN; z < SpiralStairs.CHUNK_SIZE - WAY_DOWN_MARGIN; z++) {
+                BlockPos pos = new BlockPos(chunk.getMinBlockX() + x, y, chunk.getMinBlockZ() + z);
+                double distance = pos.distSqr(from);
+                if (distance < bestDistance && isMinable(level, pos) && isDiggable(level.getBlockState(pos))) {
+                    best = pos;
+                    bestDistance = distance;
+                }
+            }
+        }
+        return best;
     }
 
     /**
@@ -495,6 +747,21 @@ public class ChunkMinerBehavior implements BotBehavior {
             phase = Phase.CLEAR;
             dropWaitTicks = 0;
             return BehaviorStatus.RUNNING;
+        }
+        // Still up the staircase after building the way out: digging down from
+        // there would take the staircase with it.
+        if (exitFrom != null) {
+            BlockPos from = exitFrom;
+            exitFrom = null;
+            if (feet.getY() > fromY - 1) {
+                BlockPos way = wayBackDown(level, from);
+                if (way == null) {
+                    return fail("no way back down into the pit from " + shortPos(feet));
+                }
+                LOGGER.info("Chunk miner: back down into the pit by way of {}", shortPos(way));
+                plan(List.of(way));
+                return BehaviorStatus.RUNNING;
+            }
         }
         BlockPos under = feet.below();
         if (level.getBlockState(under).isAir() && player.onGround()) {
@@ -570,6 +837,25 @@ public class ChunkMinerBehavior implements BotBehavior {
      * block two columns ahead that the near column still hides.
      */
     private BehaviorStatus tickClear(LocalPlayer player, Level level) {
+        // A cell broken by mistake goes back only once its break is over on
+        // both sides. The client turns the block to air on its own prediction,
+        // and a placement sent into the cell then can find it still standing
+        // on the server, which lets a break that arrived a little early run on
+        // and finish later by itself: the placement fails, the block comes
+        // apart after all, and the slip leaves the hole it was to undo — a
+        // knocked-out step logged as client air against server stone the tick
+        // its rebuild was planned, and a gap in the stair at the end.
+        // Bounded, like the controller's own wait for an ack: a connection that
+        // never sends one must not hold the run for good.
+        if (putBack != null) {
+            boolean settled = ServerBlockSync.isSettled(ServerBlockSync.currentSequence((ClientLevel) level));
+            if (!plannedBlocks.isEmpty() || BotController.isActive()
+                    || !settled && ++putBackWaitTicks < PUT_BACK_WAIT_TICKS) {
+                return BehaviorStatus.RUNNING;
+            }
+            putBack = null;
+            putBackWaitTicks = 0;
+        }
         // Groundwork that had nowhere to be clicked from while the column
         // stood is done now, through the opening that column left: a liquid
         // that was walled in when the column was planned, and the floor cell
@@ -591,6 +877,19 @@ public class ChunkMinerBehavior implements BotBehavior {
         BehaviorStatus stair = repairStairs(player, level);
         if (stair != null) {
             return stair;
+        }
+        if (stairSlipOwed && plannedBlocks.isEmpty()) {
+            stairSlipOwed = false;
+            BlockPos slip = slipCandidate(player, level);
+            if (slip != null) {
+                // The repair puts it back once the hold above lets go; until
+                // then nothing else is planned, so no column can take the
+                // block it is rebuilt against.
+                LOGGER.info("Chunk miner: knocking out the step at {} — it goes back in", shortPos(slip));
+                plan(List.of(slip));
+                putBack = slip;
+                return BehaviorStatus.RUNNING;
+            }
         }
         BlockPos column = nextColumn(player, level);
         if (column == null) {
@@ -662,6 +961,14 @@ public class ChunkMinerBehavior implements BotBehavior {
         // be filled until the block above it is gone.
         if (isPassable(level.getBlockState(column.below()))) {
             groundworkAfterOpening = column;
+        } else if (HumanBehavior.blunder(config.chunkMinerOverdigChance) && canOverdig(player, level, column)) {
+            // One block too deep, the slip a person digging down a corridor
+            // makes, and the floor goes straight back in: the groundwork that
+            // fills a hole under a column fills this one too.
+            blocks.add(column.below());
+            groundworkAfterOpening = column;
+            putBack = column.below();
+            LOGGER.info("Chunk miner: digging {} one too deep — it goes back in", shortPos(column.below()));
         }
         // Keep the queue stocked past the end of this column. The controller
         // only skips the collect-and-replan round when another task is already
@@ -702,8 +1009,80 @@ public class ChunkMinerBehavior implements BotBehavior {
         }
         plan(blocks);
         breatherTicks = HumanBehavior.randomBreatherTicks(BotController.CONFIG);
+        stairSlipOwed |= HumanBehavior.blunder(config.chunkMinerStairSlipChance);
         return BehaviorStatus.RUNNING;
     }
+
+    /**
+     * Whether the floor block under {@code column} may be dug out by mistake:
+     * the bot is working the slab, the block is diggable slab work of the next
+     * layer down and no step, nothing liquid touches it, solid ground under it
+     * holds the block that goes back in, and there is filler to put back.
+     */
+    private boolean canOverdig(LocalPlayer player, Level level, BlockPos column) {
+        BlockPos cell = column.below();
+        if (player.blockPosition().getY() != slabFeetY || cell.getY() < toY
+                || !isDiggable(level.getBlockState(cell)) || SpiralStairs.isStairCell(chunk, cell)
+                || InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
+            return false;
+        }
+        BlockPos under = cell.below();
+        if (!level.getBlockState(under).isFaceSturdy(level, under, Direction.UP)) {
+            return false;
+        }
+        for (Direction side : Direction.Plane.HORIZONTAL) {
+            if (!level.getFluidState(cell.relative(side)).isEmpty()) {
+                return false;
+            }
+        }
+        return level.getFluidState(under).isEmpty();
+    }
+
+    /**
+     * A step of the staircase to knock out by mistake and rebuild: one of the
+     * current slab's two layers, low enough in the range that it is a step
+     * whether or not it is standing (so {@link #repairStairs} owes it back),
+     * standing and diggable, in reach and in sight, clear of the bot's body, with filler
+     * carried and a face to build it back against that faces the bot. Null if there is none.
+     */
+    private BlockPos slipCandidate(LocalPlayer player, Level level) {
+        if (player.blockPosition().getY() != slabFeetY
+                || InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
+            return null;
+        }
+        Vec3 eye = player.getEyePosition();
+        for (int y = slabFeetY; y <= slabFeetY + 1; y++) {
+            if (y > fromY - 2 || y < toY) {
+                continue;
+            }
+            BlockPos step = SpiralStairs.stepAt(chunk, y);
+            // In sight from where the bot stands, too: a slip it has to walk
+            // for is no slip, and one that fails to break fails the run.
+            if (!isDiggable(level.getBlockState(step))
+                    || eye.distanceTo(Vec3.atCenterOf(step)) > BotController.CONFIG.reachDistance - 0.5
+                    || player.getBoundingBox().inflate(0.3).intersects(new AABB(step))
+                    || columnInTheWay(player, level, step) != null) {
+                continue;
+            }
+            // And put back from here: the face it goes back against has to face
+            // the eye. From the row beside the step the only support can be the
+            // block next to it, whose face toward the step then points away, and
+            // the rebuild stared at that block's side until its look timed out —
+            // twice, and the run ended on a step it could not put back.
+            BlockPos support = PlaceBlockTask.findSupport(level, step, eye);
+            if (support != null) {
+                Vec3 normal = Vec3.atLowerCornerOf(step.subtract(support));
+                Vec3 face = Vec3.atCenterOf(support).add(normal.scale(0.5));
+                if (eye.subtract(face).dot(normal) >= SLIP_FACE_CLEARANCE) {
+                    return step;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** How far in front of the face a step goes back against the eye has to be. */
+    private static final double SLIP_FACE_CLEARANCE = 0.2;
 
     /**
      * How far a column may sit from the bot to join the same plan. Vanilla's
@@ -1792,7 +2171,8 @@ public class ChunkMinerBehavior implements BotBehavior {
      * layers deep in ground the previous run already cleared, and what is left
      * standing in those two layers is that run's staircase. Reading the world is
      * how the miner finds its place again everywhere else; this is the same
-     * question, asked of the ramp.
+     * question, asked of the ramp. The same clause keeps the steps the way out
+     * puts there ({@link #tickExit}).
      */
     private boolean isStep(Level level, BlockPos pos) {
         return SpiralStairs.isStairCell(chunk, pos)

@@ -286,9 +286,8 @@ public class BlockInteractor {
     }
 
     /**
-     * The block currently under the pick, or {@code null}. TEMPORARY
-     * (multiplayer break investigation, remove with the fix): the packet trace
-     * logs only the traffic that concerns this block.
+     * The block currently under the pick, or {@code null} — so a caller can
+     * tell whether an interaction it started is still the one running.
      */
     public static BlockPos currentTarget() {
         return interacting ? targetPos : null;

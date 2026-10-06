@@ -192,4 +192,26 @@ class SpiralStairsTest {
         assertFalse(SpiralStairs.isStairCell(-1, 0, SCAN_TOP));
         assertFalse(SpiralStairs.isStairCell(SpiralStairs.CHUNK_SIZE, 0, SCAN_TOP));
     }
+
+    /**
+     * The way out looks past a step at the ground outside the chunk, so every
+     * direction it is given has to land there — one block over and outside —
+     * and a corner, which has two outsides, has to get both.
+     */
+    @Test
+    void outwardLeadsOutOfTheChunk() {
+        for (int index = 0; index < SpiralStairs.RING_LENGTH; index++) {
+            int[] at = SpiralStairs.ringOffset(index);
+            boolean corner = (at[0] == 0 || at[0] == LAST) && (at[1] == 0 || at[1] == LAST);
+            int[][] out = SpiralStairs.outward(index);
+            assertEquals(corner ? 2 : 1, out.length, "directions at index " + index);
+            for (int[] d : out) {
+                assertEquals(1, Math.abs(d[0]) + Math.abs(d[1]), "not a unit step at index " + index);
+                int x = at[0] + d[0];
+                int z = at[1] + d[1];
+                assertTrue(x < 0 || x > LAST || z < 0 || z > LAST,
+                        "index " + index + " points at " + x + "," + z + ", inside the chunk");
+            }
+        }
+    }
 }

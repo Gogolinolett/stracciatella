@@ -15,6 +15,9 @@ import net.stracciatella.bot.behavior.BehaviorRunner;
 import net.stracciatella.bot.behavior.BehaviorStatus;
 import net.stracciatella.bot.behavior.BotBehavior;
 import net.stracciatella.bot.behavior.RestockBehavior;
+import net.stracciatella.bot.humanize.HumanBehavior;
+import net.stracciatella.bot.humanize.TravelClicks;
+import net.stracciatella.bot.interaction.BlockInteractor;
 import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.scan.TreeDetector;
 import net.stracciatella.bot.scan.TreeInfo;
@@ -2429,6 +2432,232 @@ public class BotTests {
         LOGGER.info("Took the lower block from the top ({} of {} ticks on UP)", up, footFaces.size());
     }
 
+    /**
+     * One aim for a whole column. The head block stands on the foot block, so
+     * the foot's top is where the crosshair can already be while the head is
+     * still there: a ray to it hits the head first, and once the head is gone
+     * the same ray hits the foot. A person digging a corridor aims there once
+     * and holds the button; the bot aimed at the head, turned to the foot while
+     * the break was being confirmed, and turned again when the foot's own aim
+     * was rolled.
+     *
+     * <p>Measured from the tick the head block disappears until the foot block
+     * does: how far the view direction moves away from where it pointed when the
+     * head broke. One aim leaves only the micro-saccades.
+     */
+    @MinecraftTest(name = "Bot mines a column with one aim", timeoutTicks = 300, order = -160, repeat = 3)
+    public void minesColumnWithOneAim(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1890, 30, 1860);
+        final BlockPos foot = origin.offset(0, 0, -2);
+        final BlockPos head = foot.above();
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("fill " + (origin.getX() - 1) + " " + (origin.getY() - 2) + " " + (origin.getZ() - 1)
+                + " " + (origin.getX() + 1) + " " + (origin.getY() - 1) + " " + (origin.getZ() - 1) + " air");
+        ctx.runCommand("setblock " + foot.getX() + " " + foot.getY() + " " + foot.getZ() + " stone");
+        ctx.runCommand("setblock " + head.getX() + " " + head.getY() + " " + head.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        final net.minecraft.world.phys.Vec3[] atHeadBreak = {null};
+        final double[] worst = {0.0};
+        startProbe(ctx, BotPolicy.none().withOrderedTasks(), List.of(head, foot));
+        ctx.waitFor(mc -> {
+            boolean headGone = mc.level.getBlockState(head).isAir();
+            boolean footGone = mc.level.getBlockState(foot).isAir();
+            net.minecraft.world.phys.Vec3 view = mc.player.getViewVector(1.0f);
+            if (headGone && !footGone) {
+                if (atHeadBreak[0] == null) {
+                    atHeadBreak[0] = view;
+                } else {
+                    double cos = Math.max(-1.0, Math.min(1.0, view.dot(atHeadBreak[0])));
+                    worst[0] = Math.max(worst[0], Math.toDegrees(Math.acos(cos)));
+                }
+            }
+            return !BehaviorRunner.isActive();
+        });
+        ctx.runOnClient(mc -> BotController.stop());
+
+        if (ctx.computeOnClient(mc -> !mc.level.getBlockState(foot).isAir())) {
+            throw new AssertionError("The foot block is still standing — the test measured nothing");
+        }
+        if (atHeadBreak[0] == null) {
+            throw new AssertionError("Never saw the head block gone with the foot still standing");
+        }
+        LOGGER.info("Column mined, the view moved at most {} degrees between the two blocks",
+                String.format(java.util.Locale.US, "%.1f", worst[0]));
+        if (worst[0] > ONE_AIM_DEG) {
+            throw new AssertionError("The view moved " + String.format(java.util.Locale.US, "%.1f", worst[0])
+                    + " degrees between the head and the foot block — the foot's top was in the"
+                    + " crosshair's line all along, one aim serves both");
+        }
+    }
+
+    /**
+     * How far the view may wander between two blocks one aim serves: the
+     * micro-saccades (about half a degree each way) and nothing more.
+     */
+    private static final double ONE_AIM_DEG = 2.0;
+
+    /**
+     * Two blocks equally near, one in front of the bot and one behind it, the
+     * one behind queued first. Nearest-first with ties in queue order takes
+     * the one behind and turns round for it; a person takes the one in front.
+     */
+    @MinecraftTest(name = "Bot takes the block in view first", timeoutTicks = 300, order = -159)
+    public void takesTheBlockInViewFirst(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1950, 30, 1860);
+        final BlockPos front = origin.offset(0, 0, 2);
+        final BlockPos behind = origin.offset(0, 0, -2);
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + front.getX() + " " + front.getY() + " " + front.getZ() + " stone");
+        ctx.runCommand("setblock " + behind.getX() + " " + behind.getY() + " " + behind.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        lookAtBlock(ctx, origin, front);
+
+        // Straight into the queue first, so the controller chooses between
+        // the two rather than starting on whichever arrives alone.
+        ctx.runOnClient(mc -> {
+            BotController.getTaskQueue().addLast(new MineBlockTask(behind));
+            BotController.enqueueTask(new MineBlockTask(front));
+        });
+        final BlockPos[] first = {null};
+        ctx.waitFor(mc -> {
+            if (first[0] == null) {
+                if (mc.level.getBlockState(front).isAir()) {
+                    first[0] = front;
+                } else if (mc.level.getBlockState(behind).isAir()) {
+                    first[0] = behind;
+                }
+            }
+            return first[0] != null;
+        });
+        waitForBotIdle(ctx);
+
+        if (!front.equals(first[0])) {
+            throw new AssertionError("The bot turned round for the block behind it ("
+                    + behind.toShortString() + ") before the one in front of it");
+        }
+        LOGGER.info("Took the block in view first");
+    }
+
+    /**
+     * The idle clicks of a journey, forced into one burst after another: on a
+     * stone block the crosshair rests on they press and let go without ever
+     * breaking it, a block that would break at once is not clicked at all,
+     * and with a pig in the crosshair nothing happens — not a hit, not a
+     * swing.
+     */
+    @MinecraftTest(name = "Bot clicks on its way without breaking or hitting anything",
+            timeoutTicks = 600, order = -158)
+    public void clicksOnItsWayHarmlessly(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1920, 30, 1860);
+        final BlockPos ahead = origin.offset(0, 0, 2);
+        final String at = ahead.getX() + " " + ahead.getY() + " " + ahead.getZ();
+
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + at + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        lookAtBlock(ctx, origin, ahead);
+
+        final BotConfig config = BotController.CONFIG;
+        final double chance = config.travelClickChance;
+        final int min = config.travelClickMin;
+        final int max = config.travelClickMax;
+        try {
+            ctx.runOnClient(mc -> {
+                config.travelClickChance = 1.0;
+                config.travelClickMin = 3;
+                config.travelClickMax = 3;
+                HumanBehavior.suppressBlunders(false);
+            });
+
+            int pressed = clickFor(ctx, CLICK_TICKS, ahead)[0];
+            if (pressed == 0) {
+                throw new AssertionError("Not one click landed on the stone in the crosshair");
+            }
+            if (ctx.computeOnClient(mc -> !mc.level.getBlockState(ahead).is(Blocks.STONE))) {
+                throw new AssertionError("The clicks broke the stone they were only meant to tap");
+            }
+
+            BlockPos ground = ahead.below();
+            ctx.runCommand("setblock " + ground.getX() + " " + ground.getY() + " " + ground.getZ()
+                    + " grass_block");
+            ctx.runCommand("setblock " + at + " short_grass");
+            ctx.waitFor(mc -> mc.level.getBlockState(ahead).is(Blocks.SHORT_GRASS));
+            lookAtBlock(ctx, origin, ahead);
+            pressed = clickFor(ctx, CLICK_TICKS, ahead)[0];
+            if (pressed > 0 || ctx.computeOnClient(mc -> !mc.level.getBlockState(ahead).is(Blocks.SHORT_GRASS))) {
+                throw new AssertionError("Clicked grass that breaks at the first touch ("
+                        + pressed + " ticks pressed)");
+            }
+
+            ctx.runCommand("setblock " + at + " air");
+            ctx.runCommand("summon pig " + (ahead.getX() + 0.5) + " " + ahead.getY() + " "
+                    + (ahead.getZ() + 0.5) + " {NoAI:1b,Silent:1b}");
+            double dx = 0.0;
+            double dy = ahead.getY() + 0.45 - (origin.getY() + 1.62);
+            double dz = ahead.getZ() + 0.5 - (origin.getZ() + 0.5);
+            double pitch = -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+            ctx.runCommand("tp @s " + (origin.getX() + 0.5) + " " + origin.getY() + " "
+                    + (origin.getZ() + 0.5) + " 0 " + pitch);
+            ctx.waitFor(mc -> mc.hitResult instanceof net.minecraft.world.phys.EntityHitResult hit
+                    && hit.getEntity() instanceof net.minecraft.world.entity.animal.pig.Pig
+                    && !mc.player.swinging);
+            int swings = clickFor(ctx, CLICK_TICKS, ahead)[1];
+            boolean hurt = ctx.computeOnClient(mc -> mc.level.getEntitiesOfClass(
+                    net.minecraft.world.entity.animal.pig.Pig.class,
+                    new net.minecraft.world.phys.AABB(ahead).inflate(2.0),
+                    pig -> pig.hurtTime > 0 || pig.getHealth() < pig.getMaxHealth()).size() > 0);
+            if (swings > 0 || hurt) {
+                throw new AssertionError("Clicked at the pig in the crosshair: " + swings
+                        + " swings, hurt=" + hurt);
+            }
+            LOGGER.info("Clicks on the way tapped the stone and left the grass and the pig alone");
+        } finally {
+            ctx.runOnClient(mc -> {
+                TravelClicks.stop();
+                config.travelClickChance = chance;
+                config.travelClickMin = min;
+                config.travelClickMax = max;
+                HumanBehavior.suppressBlunders(true);
+            });
+            ctx.runCommand("kill @e[type=pig]");
+        }
+    }
+
+    /** How long each part of the click test drives the clicks. */
+    private static final int CLICK_TICKS = 60;
+
+    /**
+     * Drive {@link TravelClicks} for {@code ticks} ticks; returns the ticks a
+     * press was held on {@code target} and the swings that began.
+     */
+    private int[] clickFor(TestContext ctx, int ticks, BlockPos target) {
+        final int[] counts = {0, 0};
+        final int[] elapsed = {0};
+        final boolean[] wasSwinging = {true};
+        ctx.waitFor(mc -> {
+            TravelClicks.tick(mc, BotController.CONFIG);
+            if (BlockInteractor.isMining() && target.equals(BlockInteractor.currentTarget())) {
+                counts[0]++;
+            }
+            if (mc.player.swinging && !wasSwinging[0]) {
+                counts[1]++;
+            }
+            wasSwinging[0] = mc.player.swinging;
+            return ++elapsed[0] >= ticks;
+        });
+        ctx.runOnClient(mc -> TravelClicks.stop());
+        return counts;
+    }
+
     /** Eye to block centre, the distance {@code BotController} positions by. */
     private static double distanceToBlock(net.minecraft.client.player.LocalPlayer player,
                                           BlockPos target) {
@@ -2757,7 +2986,12 @@ public class BotTests {
     }
 
     private void setupTest(TestContext ctx, BlockPos origin) {
-        ctx.runOnClient(mc -> BotController.stop());
+        // The rare deliberate slips are off for runs that assert an exact
+        // outcome or a timing; a zone-out would be five seconds of a budget.
+        ctx.runOnClient(mc -> {
+            BotController.stop();
+            net.stracciatella.bot.humanize.HumanBehavior.suppressBlunders(true);
+        });
         ctx.runCommand("clear @s");
         ctx.runCommand("kill @e[type=item]");
         ctx.runCommand("gamemode creative");

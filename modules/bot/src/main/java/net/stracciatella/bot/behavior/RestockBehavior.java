@@ -14,6 +14,7 @@ import net.stracciatella.bot.BotConfig;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.BotPolicy;
 import net.stracciatella.bot.humanize.HumanBehavior;
+import net.stracciatella.bot.humanize.TravelClicks;
 import net.stracciatella.bot.server.ServerSettings;
 import net.stracciatella.bot.server.ServerSettingsStore;
 import net.stracciatella.bot.server.StorageSite;
@@ -317,15 +318,21 @@ public class RestockBehavior implements BotBehavior {
         // instantly without a step being taken.
         if (!journeyStarted) {
             PathPlacement.setAllowed(ServerSettingsStore.current().allowPathPlacement);
-            Journey.start(target);
+            Journey.start(target, new Journey.Quirks(
+                    HumanBehavior.blunderChance(config.travelDetourChance),
+                    HumanBehavior.blunderChance(config.travelPauseChance),
+                    config.zoneOutMinTicks, config.zoneOutMaxTicks));
             journeyStarted = true;
             return BehaviorStatus.RUNNING;
         }
-        return switch (Journey.status()) {
-            case RUNNING -> BehaviorStatus.RUNNING;
-            case ARRIVED -> next == null ? BehaviorStatus.SUCCEEDED : enter(next);
-            case FAILED -> fail("could not walk " + what + ": " + Journey.failReason());
-        };
+        if (Journey.status() == Journey.Status.RUNNING) {
+            TravelClicks.tick(Minecraft.getInstance(), config);
+            return BehaviorStatus.RUNNING;
+        }
+        TravelClicks.stop();
+        return Journey.status() == Journey.Status.ARRIVED
+                ? next == null ? BehaviorStatus.SUCCEEDED : enter(next)
+                : fail("could not walk " + what + ": " + Journey.failReason());
     }
 
     private BehaviorStatus tickOpen(LocalPlayer player, Level level) {
@@ -502,6 +509,7 @@ public class RestockBehavior implements BotBehavior {
 
     @Override
     public void abort() {
+        TravelClicks.stop();
         Journey.stop();
         PathWalker.stop();
         BotController.stop();

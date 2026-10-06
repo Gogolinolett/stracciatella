@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import net.minecraft.ChatFormatting;
@@ -20,6 +21,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -29,6 +31,7 @@ import net.stracciatella.bot.interaction.InventoryHelper;
 import net.stracciatella.bot.interaction.ServerBlockSync;
 import net.stracciatella.bot.task.BotTask;
 import net.stracciatella.bot.task.InteractionType;
+import net.stracciatella.bot.task.PlaceBlockTask;
 import net.stracciatella.bot.task.TaskQueue;
 import net.stracciatella.camera.AngleUtil;
 import net.stracciatella.camera.CameraController;
@@ -171,6 +174,10 @@ public class BotController {
     // aimed at. A crouch buys about 0.3 blocks of overhang, so this stays
     // well inside what the step can actually reach.
     private static final double EDGE_STEP_CLEARANCE = 0.1;
+    // How far in front of a side face a placement is pinned to the eye has to
+    // be, where that face is at eye height or above: past the plane it is the
+    // back of the block, and at its edge too grazing to hit.
+    private static final double FACE_FRONT_CLEARANCE = 0.5;
     // How close to the rim the crouch comes on. The walk to a support four
     // blocks off is a walk; only its last stretch is the edge step, and
     // crouching for the whole of it creeps the bot across at a third speed
@@ -268,6 +275,10 @@ public class BotController {
     private static double lastAimY;
     private static double lastAimZ;
     private static boolean hasLastAim = false;
+
+    // Where the crosshair already rested on the target when its LOOKING began,
+    // held for as long as a ray to it still lands on the target — see workAim.
+    private static Vec3 heldAim;
 
     // The name of a block the bot was about to mine while carrying nothing that
     // would drop it. A latch rather than a query, because the fact is only
@@ -473,6 +484,7 @@ public class BotController {
         deferredActionDelay = 0;
         preAttackHesitationRemaining = -1;
         hasLastAim = false;
+        heldAim = null;
         lookRetryUsed = false;
         forceApproach = false;
         releaseMovementKeys();
@@ -724,6 +736,10 @@ public class BotController {
             // clip that ends on the support itself reads as clear however the
             // bot happens to be standing on it.
             arrived = false;
+        } else if (behindPinnedFace(player, currentTask)) {
+            // The face is there to click only from in front of it; how near
+            // the support the bot already is does not matter until it is.
+            arrived = false;
         } else if (forceApproach && policy.approachOccluded()) {
             arrived = hasLineOfSight(client, player, currentTask);
         } else if (forceApproach) {
@@ -822,6 +838,20 @@ public class BotController {
         double faceZ = pinned != null ? pinned.getStepZ() * 0.5 : 0.0;
         aimCameraAt(player, target.getX() + 0.5 + faceX, target.getY() + 0.5 + faceY,
                 target.getZ() + 0.5 + faceZ);
+        // Behind the face's plane, the walk goes out along it, not at it.
+        // Walked at from aslant, the face centre leads the body across the
+        // plane: the chunk miner, rebuilding a step against the block south of
+        // it, arrived two blocks off that block at z=3009.30 with the face at
+        // z=3009 and pointing north, and looked at the back of it until the
+        // run ended.
+        if (pinned != null && behindPinnedFace(player, currentTask)) {
+            if (!hasFloorToward(client, player, pinned.getStepX(), pinned.getStepZ())) {
+                releaseMovementKeys();
+                return;
+            }
+            walkToward(client, player, pinned.getStepX(), pinned.getStepZ());
+            return;
+        }
         // The same raw-key walk COLLECTING runs, and the same hazard: a target
         // below the bot's feet aims the camera down into a hole and the walk
         // follows it straight in. That is how the chunk miner walked into the
@@ -921,6 +951,16 @@ public class BotController {
             preAttackHesitationRemaining = -1;
             wrongHitStreak = 0;
             lastWrongHit = null;
+            // Already on it: the crosshair stays where it is rather than
+            // moving to a freshly rolled point on the same block. Pushed a
+            // little into the block, so a ray to it hits the face instead of
+            // grazing the surface it lies on.
+            heldAim = null;
+            if (currentTask.interactionType() == InteractionType.ATTACK
+                    && client.hitResult instanceof BlockHitResult onIt
+                    && onIt.getBlockPos().equals(target)) {
+                heldAim = onIt.getLocation().add(player.getViewVector(1.0f).scale(0.01));
+            }
             // Select the tool now so the carried-item (and any inventory-swap)
             // packets travel to the server *in parallel* with the smooth
             // camera turn. By the time the hit-result gate fires, the server
@@ -947,15 +987,7 @@ public class BotController {
             toolSelected = true;
             releaseMovementKeys();
         }
-        // Aim at the face that's most directly visible from the bot's eye, not
-        // the block center — see aimPoint for where on it. The center of a
-        // block in the middle of a stack (e.g. top log of a tree) sits behind
-        // the next block's face, so a raycast aimed at the center actually
-        // lands on the neighbor. Aiming at the exposed face guarantees the
-        // raycast clears intermediate blocks and lands on the target.
-        net.minecraft.core.Direction face = aimFace(client, currentTask);
-        double[] aim = visibleAimPoint(client, player, target, face,
-                aimPoint(player, target, face, peekNextTask(player)));
+        double[] aim = workAim(client, player, currentTask);
         aimCameraAt(player, aim[0], aim[1], aim[2]);
 
         // Single gate before transitioning to INTERACTING: the client's
@@ -1190,6 +1222,15 @@ public class BotController {
      * most directly visible face is taken, as before.
      */
     private static net.minecraft.core.Direction aimFace(Minecraft client, BotTask task) {
+        return aimFace(client, task, null);
+    }
+
+    /**
+     * {@link #aimFace(Minecraft, BotTask)} as it will be once {@code assumeAir}
+     * is gone — for aiming at the next block while the current one still
+     * covers it.
+     */
+    private static net.minecraft.core.Direction aimFace(Minecraft client, BotTask task, BlockPos assumeAir) {
         net.minecraft.core.Direction preferred = task.preferredFace();
         if (preferred != null) {
             return preferred;
@@ -1201,7 +1242,8 @@ public class BotController {
         net.minecraft.core.Direction best = null;
         double bestDot = -2.0;
         for (net.minecraft.core.Direction face : net.minecraft.core.Direction.values()) {
-            if (!client.level.getBlockState(target.relative(face)).isAir()) {
+            BlockPos neighbour = target.relative(face);
+            if (!neighbour.equals(assumeAir) && !client.level.getBlockState(neighbour).isAir()) {
                 continue;
             }
             Vec3 toFace = faceCentre(target, face).subtract(eye);
@@ -1220,6 +1262,77 @@ public class BotController {
             }
         }
         return best != null ? best : BlockInteractor.faceTowardPlayer(client, target);
+    }
+
+    /**
+     * Where to aim while working on {@code task}, in this order:
+     *
+     * <ol>
+     *   <li>where the crosshair already rested on it when its LOOKING began
+     *       ({@link #heldAim}), for as long as that still lands on it — a person
+     *       whose crosshair is on the block does not move it to another spot of
+     *       the same block first;</li>
+     *   <li>the next block's aim point, when this block covers it
+     *       ({@link #predictiveAim}) — one aim for both;</li>
+     *   <li>otherwise a visible point on the least-turn face, leaning toward
+     *       the next target.</li>
+     * </ol>
+     *
+     * The first two are for mining only: a placement's face is pinned and its
+     * point is not the crosshair's to keep.
+     */
+    private static double[] workAim(Minecraft client, LocalPlayer player, BotTask task) {
+        BlockPos target = task.targetPos();
+        BotTask next = peekNextTask(player);
+        if (task.interactionType() == InteractionType.ATTACK) {
+            if (heldAim != null && rayLandsOn(client, player, heldAim, target)) {
+                return new double[] {heldAim.x, heldAim.y, heldAim.z};
+            }
+            heldAim = null;
+            double[] ahead = predictiveAim(client, player, task, next);
+            if (ahead != null) {
+                return ahead;
+            }
+        }
+        net.minecraft.core.Direction face = aimFace(client, task);
+        return visibleAimPoint(client, player, target, face, aimPoint(player, target, face, next));
+    }
+
+    /**
+     * The next block's aim point when the current block covers it: the next
+     * block is a neighbour, the face it will show once the current one is gone
+     * is the face they share, and a ray to its aim point hits the current block
+     * first. The crosshair then works the current block and, the moment it
+     * breaks, already rests on the next one — the foot block's top seen through
+     * the head block of a two-high column. Null where that does not hold.
+     */
+    private static double[] predictiveAim(Minecraft client, LocalPlayer player, BotTask task, BotTask next) {
+        if (next == null || next.interactionType() != InteractionType.ATTACK) {
+            return null;
+        }
+        BlockPos covering = task.targetPos();
+        BlockPos covered = next.targetPos();
+        net.minecraft.core.Direction shared = null;
+        for (net.minecraft.core.Direction face : net.minecraft.core.Direction.values()) {
+            if (covered.relative(face).equals(covering)) {
+                shared = face;
+            }
+        }
+        if (shared == null || aimFace(client, next, covering) != shared) {
+            return null;
+        }
+        double[] point = aimPoint(player, covered, shared, null);
+        BlockHitResult clip = client.level.clip(new ClipContext(player.getEyePosition(),
+                new Vec3(point[0], point[1], point[2]), ClipContext.Block.OUTLINE,
+                ClipContext.Fluid.NONE, player));
+        return clip.getType() == HitResult.Type.BLOCK && clip.getBlockPos().equals(covering) ? point : null;
+    }
+
+    /** Whether a ray from the eye towards {@code point} hits {@code target} first. */
+    private static boolean rayLandsOn(Minecraft client, LocalPlayer player, Vec3 point, BlockPos target) {
+        BlockHitResult clip = client.level.clip(new ClipContext(player.getEyePosition(), point,
+                ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+        return clip.getType() == HitResult.Type.BLOCK && clip.getBlockPos().equals(target);
     }
 
     private static void tickInteracting(Minecraft client, LocalPlayer player) {
@@ -1299,6 +1412,10 @@ public class BotController {
         // a task with nothing left of its own: a tree's next log is a
         // sub-target, not a queue entry, and turning to a queued task there
         // would be a wrong turn rather than an early one.
+        //
+        // Unless the crosshair is already there: aimed at the next block through
+        // this one (workAim), the same line lands on it the moment this block
+        // is gone, and turning anywhere would be turning away.
         BotTask aimTask = currentTask;
         if (!placing && targetDone && currentTask.isFullyComplete() && !fallExpected) {
             BotTask ahead = peekNextTask(player);
@@ -1308,7 +1425,15 @@ public class BotController {
             }
         }
         if (camera != null) {
-            double[] aim = aimPoint(player, aimTask.targetPos(), aimFace(client, aimTask), null);
+            double[] aim;
+            if (aimTask == currentTask) {
+                aim = workAim(client, player, currentTask);
+            } else if (hasLastAim && rayLandsOn(client, player,
+                    new Vec3(lastAimX, lastAimY, lastAimZ), aimTask.targetPos())) {
+                aim = new double[] {lastAimX, lastAimY, lastAimZ};
+            } else {
+                aim = aimPoint(player, aimTask.targetPos(), aimFace(client, aimTask), null);
+            }
             aimCameraAt(player, aim[0], aim[1], aim[2]);
         }
 
@@ -1342,9 +1467,11 @@ public class BotController {
         //
         // Placement is excluded from both: there is nothing to collect, and a
         // placement's aim is pinned to one face with the body parked on a rim,
-        // which a step would spoil — see needsEdgeStep.
-        if (!placing
-                && !(policy.opportunisticCollection()
+        // which a step would spoil — see needsEdgeStep. Its one step is out of
+        // the cell it fills.
+        if (placing) {
+            stepOutOfPlacement(client, player);
+        } else if (!(policy.opportunisticCollection()
                         && tickOpportunisticCollection(client, player, target))
                 && !stepTowardWork(client, player, target)) {
             releaseMovementKeys();
@@ -1663,8 +1790,49 @@ public class BotController {
      * target produces no step at all, which is correct — there is nowhere closer
      * to stand — and the miner's own "standing in the way" retry handles it.
      */
+    /**
+     * Back the body out of the cell a placement is filling. No block goes
+     * where a body is, and the walk up to a support face at foot height ends
+     * in front of it — in the very cell it is about to fill: POSITIONING stops
+     * two blocks from the support and the walk's momentum carries the body on
+     * into it. Logged building a step against a wall, with the hitbox 0.29
+     * into the cell and every use until the place timeout refused. A person
+     * steps back. Away from the cell's centre, or along the face where the body
+     * is centred on it; the gaze stays on the face. Nothing while bridging,
+     * where the cell is under the feet, nor where the step back has no floor.
+     */
+    private static void stepOutOfPlacement(Minecraft client, LocalPlayer player) {
+        if (!(currentTask instanceof PlaceBlockTask place) || bridging
+                || !player.getBoundingBox().intersects(new AABB(place.placePos()))) {
+            releaseMovementKeys();
+            return;
+        }
+        BlockPos cell = place.placePos();
+        double awayX = player.getX() - (cell.getX() + 0.5);
+        double awayZ = player.getZ() - (cell.getZ() + 0.5);
+        net.minecraft.core.Direction face = place.preferredFace();
+        if (awayX * awayX + awayZ * awayZ < 1.0E-4 && face != null) {
+            awayX = face.getStepX();
+            awayZ = face.getStepZ();
+        }
+        if (awayX * awayX + awayZ * awayZ < 1.0E-4 || !hasFloorToward(client, player, awayX, awayZ)) {
+            releaseMovementKeys();
+            return;
+        }
+        walkToward(client, player, awayX, awayZ);
+    }
+
     private static boolean stepTowardWork(Minecraft client, LocalPlayer player, BlockPos target) {
         if (horizontalDistanceTo(player, target) <= CONTACT_DISTANCE) {
+            return false;
+        }
+        // A block over the head is reached by looking up, not by walking under
+        // it: closing in only steepens the angle, and followed through it puts
+        // the body beneath the column, where the block under the target hides
+        // it. Logged digging the chunk miner's way out — the walk toward one
+        // cell of the ramp's headroom parked the bot under the next one, and
+        // three look timeouts later the run was over.
+        if (target.getY() > player.getBlockY() + 1) {
             return false;
         }
         return stepToward(client, player, target, target.getX() + 0.5, target.getZ() + 0.5);
@@ -1828,6 +1996,12 @@ public class BotController {
         }
 
         BlockPos feet = BlockPos.containing(stepX, player.getY(), stepZ);
+        // Never onto the block being broken: standing on it, the bot drops
+        // into its cell the moment it goes. Digging out what the bot already
+        // stands on is a different thing and is not a step.
+        if (feet.below().equals(target)) {
+            return false;
+        }
         return isStandable(client.level, feet);
     }
 
@@ -2056,6 +2230,22 @@ public class BotController {
      * face's own axis and signed so positive always means "on the side the
      * new block goes", whichever way the face points.
      */
+    /**
+     * Whether the eye is not yet in front of the side face a placement is
+     * pinned to, for a face at eye height or above. With the eye over the
+     * support the edge step answers the same question its own way
+     * ({@link #needsEdgeStep}) and this one stays out of it.
+     */
+    private static boolean behindPinnedFace(LocalPlayer player, BotTask task) {
+        net.minecraft.core.Direction face = task.preferredFace();
+        if (face == null || face.getAxis().isVertical()) {
+            return false;
+        }
+        Vec3 eye = player.getEyePosition();
+        return eye.y <= task.targetPos().getY() + 1.0
+                && pastFacePlane(eye, task.targetPos(), face) < FACE_FRONT_CLEARANCE;
+    }
+
     private static double pastFacePlane(Vec3 eye, BlockPos support,
                                         net.minecraft.core.Direction face) {
         if (face.getAxis() == net.minecraft.core.Direction.Axis.X) {
@@ -2464,7 +2654,23 @@ public class BotController {
         // ceremony: POSITIONING walks straight at the target while looking
         // at it and hands over to LOOKING the moment it's in reach — which
         // is exactly what a player does for the last couple of blocks.
-        if (distanceToTarget(player, target) <= CONFIG.reachDistance + 2.5) {
+        //
+        // Not for a target the bot's own floor is no place to work from. A walk
+        // on the level closes no height, and POSITIONING arrives on horizontal
+        // distance: the chunk miner, digging its way out up a staircase, stood
+        // 1.8 off a block five over its eye, arrived without a step, and timed
+        // out its look three times on a ray that ended short. A block four
+        // over the eye went the same way by another road — walked in under, at
+        // an angle so steep that the step below hid the face. The line is the
+        // standoff search's own: a node more than three under its target is
+        // no standoff, so for a target more than two over the feet the floor
+        // is not one either. Up the stairs is a path, and the search finds the
+        // step to stand on; where it finds none — a treetop — the walk below
+        // is what is left, as before. Far below the eye the same holds for
+        // reach.
+        if (distanceToTarget(player, target) <= CONFIG.reachDistance + 2.5
+                && target.getY() <= player.getBlockY() + 2
+                && player.getEyeY() - (target.getY() + 0.5) <= CONFIG.reachDistance) {
             transitionTo(Phase.POSITIONING);
             return;
         }
@@ -2478,8 +2684,8 @@ public class BotController {
                 Math.min(player.getBlockY(), target.getY()) - NAV_BAND,
                 Math.max(player.getBlockY(), target.getY()) + NAV_BAND);
 
-        MeshNode standoff = findStandoffNode(player, target);
-        if (standoff == null) {
+        List<MeshNode> standoffs = findStandoffNodes(player, target);
+        if (standoffs.isEmpty()) {
             transitionTo(Phase.POSITIONING);
             return;
         }
@@ -2491,7 +2697,7 @@ public class BotController {
         }
 
         MeshPathfinder pathfinder = new MeshPathfinder();
-        List<MeshNode> path = pathfinder.findPath(startNode, standoff);
+        List<MeshNode> path = pathfinder.findPathToFirst(startNode, standoffs);
         if (path.isEmpty()) {
             transitionTo(Phase.POSITIONING);
             return;
@@ -2586,21 +2792,24 @@ public class BotController {
      * The task to work next, without taking it. Nearest to where the bot
      * stands by default — a human works an area closest-first from wherever
      * they are, and replaying the queue's fixed scan order produces visible
-     * zigzag routes. A behavior that has already decided the order says so
-     * with {@link BotPolicy#orderedTasks()} and gets the queue's order back;
-     * see that method for what nearest-first costs a sweep.
+     * zigzag routes — with a block in view counted nearer than one the bot
+     * would have to turn round for. A behavior that has already decided the
+     * order says so with {@link BotPolicy#orderedTasks()} and gets the queue's
+     * order back; see that method for what nearest-first costs a sweep.
      */
     private static BotTask peekNextTask(LocalPlayer player) {
         return policy.orderedTasks() || player == null
                 ? taskQueue.peek()
-                : taskQueue.peekNearest(player.blockPosition());
+                : taskQueue.peekNearest(player.blockPosition(), player.getEyePosition(),
+                        player.getViewVector(1.0f));
     }
 
     /** {@link #peekNextTask}, and take it. */
     private static BotTask pollNextTask(LocalPlayer player) {
         return policy.orderedTasks() || player == null
                 ? taskQueue.poll()
-                : taskQueue.pollNearest(player.blockPosition());
+                : taskQueue.pollNearest(player.blockPosition(), player.getEyePosition(),
+                        player.getViewVector(1.0f));
     }
 
     private static void startNextTask() {
@@ -2826,15 +3035,21 @@ public class BotController {
      * chose a node one block to the side, so the walk went straight at the
      * target and then visibly dog-legged sideways for the last two blocks.
      * A human walks the straight line and stops in front of the target.
+     *
+     * <p>All of them, best first, not just the best: the best can be cut off.
+     * Digging its way out of a pit, the chunk miner's block sat beside a pillar
+     * of the ground it was digging through, the pillar's top won on the score,
+     * no path led up there, and the walk fell through to POSITIONING's straight
+     * line at the foot of the stairs — three timeouts and a "cannot break",
+     * with the step to stand on two blocks up the stairs.
      */
-    private static MeshNode findStandoffNode(LocalPlayer player, BlockPos target) {
+    private static List<MeshNode> findStandoffNodes(LocalPlayer player, BlockPos target) {
         HashMap<ChunkCoordinate, Mesh> meshesForPlayer = MeshManager.meshes.get(player);
         if (meshesForPlayer == null) {
-            return null;
+            return List.of();
         }
 
-        MeshNode best = null;
-        double bestScore = Double.MAX_VALUE;
+        Map<MeshNode, Double> scores = new HashMap<>();
         double maxReach = CONFIG.reachDistance;
 
         // Search in chunks around the target
@@ -2870,16 +3085,14 @@ public class BotController {
                     // line nodes would be hash-order — with it, it's the
                     // first in-reach node on the line (a human stops as soon
                     // as they're close enough).
-                    double score = 1.05 * distToPlayer + horizToTarget;
-                    if (score < bestScore) {
-                        bestScore = score;
-                        best = node;
-                    }
+                    scores.put(node, 1.05 * distToPlayer + horizToTarget);
                 }
             }
         }
 
-        return best;
+        List<MeshNode> standoffs = new ArrayList<>(scores.keySet());
+        standoffs.sort(Comparator.comparingDouble(scores::get));
+        return standoffs;
     }
 
     // --- Eating ---

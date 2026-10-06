@@ -65,6 +65,24 @@ public class BotConfig {
     public int longPauseMinTicks = 12;
     public int longPauseMaxTicks = 25;
 
+    // Blunders: rare deliberate slips, because a worker that never wastes a
+    // second is not a person. Each is a chance per opportunity; 0 switches it
+    // off. A zone-out replaces a breather (per column of the chunk miner, per
+    // SCANNING→NAVIGATING) with a pause of a few seconds. On the bot's own
+    // journeys — the restock trip — a leg may be planned round an imaginary
+    // obstacle (a detour) and the walk may stop for a moment between two legs.
+    public double zoneOutChance = 0.005;
+    public int zoneOutMinTicks = 80;
+    public int zoneOutMaxTicks = 120;
+    public double travelDetourChance = 0.05;
+    public double travelPauseChance = 0.03;
+    // On the same journeys, a burst of idle left clicks now and then: chance
+    // per tick of starting one, and how many clicks it has. Into the air, or a
+    // block the crosshair rests on, held too short to break it; never anyone.
+    public double travelClickChance = 0.004;
+    public int travelClickMin = 2;
+    public int travelClickMax = 6;
+
     // Hard timeout for COLLECTING if drops never become reachable. Needs to
     // be large enough for the server→client item-entity sync under heavy load
     // (accelerated ticks amplify packet-queue backup).
@@ -172,6 +190,14 @@ public class BotConfig {
         this.longPauseChance = other.longPauseChance;
         this.longPauseMinTicks = other.longPauseMinTicks;
         this.longPauseMaxTicks = other.longPauseMaxTicks;
+        this.zoneOutChance = other.zoneOutChance;
+        this.zoneOutMinTicks = other.zoneOutMinTicks;
+        this.zoneOutMaxTicks = other.zoneOutMaxTicks;
+        this.travelDetourChance = other.travelDetourChance;
+        this.travelPauseChance = other.travelPauseChance;
+        this.travelClickChance = other.travelClickChance;
+        this.travelClickMin = other.travelClickMin;
+        this.travelClickMax = other.travelClickMax;
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;

@@ -148,6 +148,20 @@ public class PathWalker {
     private static int cruiseRefreshIn = 0;
     private static int cruiseJumpHoldoff = 0;
     private static boolean cruiseWasAirborne = false;
+    // The point the heading is taken at: the cruise node's centre moved
+    // sideways by the lane, so the walk is not a run down the block centres.
+    private static double cruiseAimX = 0.0;
+    private static double cruiseAimZ = 0.0;
+    // How far to the side of the node centres the walk keeps, across the whole
+    // walk; it wanders by at most CRUISE_LANE_STEP each time the heading is
+    // taken again.
+    private static double cruiseLane = 0.0;
+    private static final double CRUISE_LANE_MAX = 0.35;
+    private static final double CRUISE_LANE_STEP = 0.2;
+    // Never quite the middle: a lane that wanders back to the centre line
+    // would be the run down the block centres again.
+    private static final double CRUISE_LANE_MIN = 0.1;
+    private static final double CRUISE_HEADING_NOISE_DEG = 2.5;
     // How far along the path a cruise heading may look. Far, because a short
     // look only smooths the grid's corners: A* on open ground returns some
     // run of straight and diagonal steps, and aiming a dozen nodes down it
@@ -195,6 +209,8 @@ public class PathWalker {
         active = true;
         travelling = travel;
         cruiseIndex = -1;
+        cruiseLane = ThreadLocalRandom.current().nextDouble(CRUISE_LANE_MIN, CRUISE_LANE_MAX)
+                * (ThreadLocalRandom.current().nextBoolean() ? 1 : -1);
         cruiseRetryIn = 0;
         cruiseJumpHoldoff = 0;
         cruiseWasAirborne = false;
@@ -671,11 +687,20 @@ public class PathWalker {
         // edge. From a standstill the brake therefore held the bot short of a
         // node it could never arrive at — measured stepping off a barrel, the
         // first move of a leg: canMove=false, speed 0, for a hundred ticks.
-        if (distance <= BRAKE_RADIUS && shouldBrakeForNextTurn()
+        // With momentum it did not deadlock but still let go of the walk key at
+        // every ledge, and so did the moving-away check once the edge carried
+        // the bot past the node's centre: 0.15 b/t down to 0.05 at the rim,
+        // and on a three-block drop the whole fall without the key. Neither
+        // has anything to stop short of while the feet are above the node —
+        // walking off the edge is the only way there. A planned walk-off only:
+        // a jump down to a platform across a gap keeps both, it has a landing
+        // to hit.
+        boolean dropAhead = nodeGap == 1 && player.getY() > target.getY() + 1.5;
+        if (!dropAhead && distance <= BRAKE_RADIUS && shouldBrakeForNextTurn()
                 && (player.getDeltaMovement().x * dx + player.getDeltaMovement().z * dz) / distance > BRAKE_MIN_SPEED) {
             canMoveForward = false;
         }
-        if (isMovingAway(player, targetX, targetZ)) {
+        if (!dropAhead && isMovingAway(player, targetX, targetZ)) {
             canMoveForward = false;
         }
         // For gap=2 jumps, hold position to time the simulation precisely.
@@ -1106,15 +1131,26 @@ public class PathWalker {
      * and the straight walk from here to the next node is safe under the whole
      * body. A jump's take-off block never qualifies, because the step after it
      * is not a walk.
+     *
+     * <p>A node stepped down to is passed in the air as well, and from above
+     * its level: walking off a ledge carries the body over it before the feet
+     * get anywhere near its height, and its arrival box is missed in the fall.
+     * It then stayed the target behind the bot, and the camera turned back to it
+     * mid-fall and on round in a full circle after the landing.
      */
     private static boolean hasPassedNode(LocalPlayer player, MeshNode target) {
-        if (index + 1 >= currentPath.size() || !player.onGround()) {
+        if (index + 1 >= currentPath.size()) {
+            return false;
+        }
+        boolean steppedDown = computeNodeGap() == 1 && currentPath.get(index - 1).getY() > target.getY();
+        double feetAbove = player.getY() - (target.getY() + 1.0);
+        if (!steppedDown && (!player.onGround() || feetAbove > 0.5)) {
             return false;
         }
         MeshNode next = currentPath.get(index + 1);
         if (next.getY() != target.getY()
                 || Math.max(Math.abs(next.getX() - target.getX()), Math.abs(next.getZ() - target.getZ())) > 1
-                || Math.abs(player.getY() - (target.getY() + 1.0)) > 0.5) {
+                || feetAbove < -0.5) {
             return false;
         }
         double px = player.getX() - (target.getX() + 0.5);
@@ -1144,6 +1180,10 @@ public class PathWalker {
                 return false;
             }
             cruiseWasAirborne = true;
+            // Time to the next look runs in the air as well — most of a
+            // sprint-jumping walk is spent there — and the look itself waits
+            // for the ground.
+            cruiseRefreshIn--;
             passCruiseNodes(player);
             steerCruise(client, player, false);
             return true;
@@ -1164,9 +1204,13 @@ public class PathWalker {
                 cruiseRetryIn = CRUISE_RETRY_TICKS;
                 return false;
             }
-            MeshNode aim = currentPath.get(cruiseIndex);
-            cruiseYaw = (float) Math.toDegrees(Math.atan2(
-                    -(aim.getX() + 0.5 - player.getX()), aim.getZ() + 0.5 - player.getZ()));
+            takeCruiseAim(player, currentPath.get(cruiseIndex));
+            // Nobody takes a heading to the degree: it is a little off, the
+            // walk drifts from the line, and CRUISE_LINE_TOLERANCE has it
+            // looked at again — not the dead-straight run along the grid.
+            cruiseYaw = (float) (Math.toDegrees(Math.atan2(
+                    -(cruiseAimX - player.getX()), cruiseAimZ - player.getZ()))
+                    + ThreadLocalRandom.current().nextDouble(-CRUISE_HEADING_NOISE_DEG, CRUISE_HEADING_NOISE_DEG));
             cruiseFromX = player.getX();
             cruiseFromZ = player.getZ();
             cruiseRefreshIn = randomInt(CRUISE_REFRESH_MIN, CRUISE_REFRESH_MAX);
@@ -1217,11 +1261,44 @@ public class PathWalker {
         return -1;
     }
 
+    /**
+     * Take the point the heading aims at: the cruise node's centre, moved
+     * sideways by the lane. A person crossing open ground walks wherever they
+     * happen to be, not down the middle of the blocks, and keeps roughly that
+     * line: the lane wanders by at most {@link #CRUISE_LANE_STEP} each time the
+     * heading is taken. A lane the whole body cannot walk straight to falls
+     * back to the centre.
+     */
+    private static void takeCruiseAim(LocalPlayer player, MeshNode aim) {
+        double cx = aim.getX() + 0.5;
+        double cz = aim.getZ() + 0.5;
+        cruiseAimX = cx;
+        cruiseAimZ = cz;
+        double hx = cx - player.getX();
+        double hz = cz - player.getZ();
+        double length = Math.sqrt(hx * hx + hz * hz);
+        if (length < 1.0e-6) {
+            return;
+        }
+        double lane = Math.max(-CRUISE_LANE_MAX, Math.min(CRUISE_LANE_MAX,
+                cruiseLane + ThreadLocalRandom.current().nextDouble(-CRUISE_LANE_STEP, CRUISE_LANE_STEP)));
+        if (Math.abs(lane) < CRUISE_LANE_MIN) {
+            lane = Math.copySign(CRUISE_LANE_MIN, lane == 0.0 ? cruiseLane : lane);
+        }
+        double laneX = cx - hz / length * lane;
+        double laneZ = cz + hx / length * lane;
+        if (Terrain.isStraightWalk(player.level(), player, player.getX(), player.getZ(),
+                laneX, laneZ, aim.getY(), 2)) {
+            cruiseAimX = laneX;
+            cruiseAimZ = laneZ;
+            cruiseLane = lane;
+        }
+    }
+
     /** Tick off the nodes of the run the player has already drawn level with. */
     private static void passCruiseNodes(LocalPlayer player) {
-        MeshNode aim = currentPath.get(cruiseIndex);
-        double ax = aim.getX() + 0.5;
-        double az = aim.getZ() + 0.5;
+        double ax = cruiseAimX;
+        double az = cruiseAimZ;
         double playerToAim = (ax - player.getX()) * (ax - player.getX()) + (az - player.getZ()) * (az - player.getZ());
         while (index < cruiseIndex) {
             MeshNode node = currentPath.get(index);
@@ -1238,8 +1315,8 @@ public class PathWalker {
     /** Hold the cruise heading: turn onto it, then walk and sprint along it. */
     private static void steerCruise(Minecraft client, LocalPlayer player, boolean jump) {
         MeshNode aim = currentPath.get(cruiseIndex);
-        double ax = aim.getX() + 0.5 - player.getX();
-        double az = aim.getZ() + 0.5 - player.getZ();
+        double ax = cruiseAimX - player.getX();
+        double az = cruiseAimZ - player.getZ();
         float newYaw = camera.updateYaw(cruiseYaw);
         float newPitch = camera.updatePitch(AngleUtil.computeDesiredPitch(
                 aim.getY() + 1.0 - player.getEyeY(), Math.sqrt(ax * ax + az * az)));
@@ -1256,9 +1333,8 @@ public class PathWalker {
 
     /** Whether the player has drifted off the line its heading was taken along. */
     private static boolean offCruiseLine(LocalPlayer player) {
-        MeshNode aim = currentPath.get(cruiseIndex);
-        double lx = aim.getX() + 0.5 - cruiseFromX;
-        double lz = aim.getZ() + 0.5 - cruiseFromZ;
+        double lx = cruiseAimX - cruiseFromX;
+        double lz = cruiseAimZ - cruiseFromZ;
         double length = Math.sqrt(lx * lx + lz * lz);
         if (length < 1.0e-6) {
             return false;
@@ -1283,15 +1359,16 @@ public class PathWalker {
             return false;
         }
         MeshNode aim = currentPath.get(cruiseIndex);
-        double ax = aim.getX() + 0.5 - player.getX();
-        double az = aim.getZ() + 0.5 - player.getZ();
-        double distance = Math.sqrt(ax * ax + az * az);
-        if (distance < CRUISE_JUMP_LENGTH) {
+        double ax = cruiseAimX - player.getX();
+        double az = cruiseAimZ - player.getZ();
+        if (Math.sqrt(ax * ax + az * az) < CRUISE_JUMP_LENGTH) {
             return false;
         }
-        double reach = CRUISE_JUMP_LENGTH / distance;
+        // Along the heading actually held, which is a little off the aim.
+        double yawRad = Math.toRadians(cruiseYaw);
         return Terrain.isStraightWalk(player.level(), player, player.getX(), player.getZ(),
-                player.getX() + ax * reach, player.getZ() + az * reach, aim.getY(), 3);
+                player.getX() - Math.sin(yawRad) * CRUISE_JUMP_LENGTH,
+                player.getZ() + Math.cos(yawRad) * CRUISE_JUMP_LENGTH, aim.getY(), 3);
     }
 
     private static boolean shouldCancelOffCourse(double distance, LocalPlayer player, MeshNode target, boolean canMoveForward, boolean shouldBrake) {
@@ -1470,7 +1547,13 @@ public class PathWalker {
                     gap, feetToTargetDy, player.getY(), target.getY(), distance));
             }
 
-            if (feetToTargetDy < -0.5 && gap <= 1) {
+            // Walking off a ledge is not a jump. The planned step decides, not
+            // the block the player stands in: the node before the edge counts as
+            // reached up to 0.65 short of its centre, the edge then reads as
+            // gap=2, forwardAir finds the drop, and the bot hopped off every
+            // ledge — let go of the walk key in the air past the node, and
+            // turned back to it on landing.
+            if (feetToTargetDy < -0.5 && (gap <= 1 || nodeGap == 1)) {
                 reason = "drop-no-jump";
                 break decide;
             }

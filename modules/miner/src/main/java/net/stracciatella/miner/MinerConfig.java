@@ -79,6 +79,13 @@ public class MinerConfig {
     // being the safety net they are here for.
     public boolean chunkMinerRestock = true;
 
+    // Blunders, chance per column; 0 switches one off. Digging the floor block
+    // under a finished column too and putting it back, and knocking out a step
+    // of the staircase in reach and rebuilding it — the slips a person makes,
+    // only ever where they can be undone.
+    public double chunkMinerOverdigChance = 0.01;
+    public double chunkMinerStairSlipChance = 0.005;
+
     public void applyFrom(MinerConfig other) {
         this.floorOffsetAboveBedrock = other.floorOffsetAboveBedrock;
         this.defaultTunnelLength = other.defaultTunnelLength;
@@ -89,6 +96,8 @@ public class MinerConfig {
         this.chunkMinerBottomY = other.chunkMinerBottomY;
         this.chunkMinerMinFreeSlots = other.chunkMinerMinFreeSlots;
         this.chunkMinerRestock = other.chunkMinerRestock;
+        this.chunkMinerOverdigChance = other.chunkMinerOverdigChance;
+        this.chunkMinerStairSlipChance = other.chunkMinerStairSlipChance;
     }
 
     public static MinerConfig load() {

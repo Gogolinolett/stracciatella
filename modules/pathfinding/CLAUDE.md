@@ -38,7 +38,7 @@ net.stracciatella.pathfinding
 │   └── LevelChunkMixin.java          # Triggers mesh generation on chunk load
 └── test/
     ├── PathWalkerTests.java          # In-game tests: straight-line + L-shaped path walking
-    ├── JourneyTests.java             # In-game tests: a 400-block bridge, an unloaded target, a way walled off mid-journey, a straight line across open ground
+    ├── JourneyTests.java             # In-game tests: a 400-block bridge, an unloaded target, a way walled off mid-journey, a straight line across open ground, terraces and rough ground walked down without a hop or a stop, a narrow gap bridged and a pit not, a walk off the block centres, a detour
     ├── MeshTests.java                # In-game tests: grass, a two-high corridor, an open diagonal, a chunk corner, a staircase journey
     └── EnderPearlTests.java          # In-game tests: ender pearl throwing at various distances/elevations
 ```
@@ -62,14 +62,15 @@ PathWalker is entirely **static**. It simulates keyboard input (forward, sprint,
 - **Final-node settling**: while standing inside the final arrival disc but still above the 0.12 speed gate, target steering is skipped entirely — the camera yaw is held (spring settles, no turn) and the 8-way counter-brake kills the momentum until arrival fires. Without this, the desired yaw orbits the walk target during the brake-out ticks and the camera follows (the post-landing pirouette)
 - **Desired-yaw freeze near nodes**: below 0.5 blocks horizontal distance the atan2 yaw target flips ~180° when stepping past the point — `stableDesiredYaw` freezes the target at its last stable value through that zone (movement aim + landing-brake retarget). Combined with the camera module's 35°/tick angular-velocity cap, this removes the remaining one-tick gaze snaps
 - **Target offset**: random X/Z offset (0.05–0.25) added for natural-looking movement, suppressed for long jumps
-- **A passed node counts as reached** (`hasPassedNode`): a node the player has gone beyond — past it toward the next node, or past it along the incoming direction — is ticked off without being touched, so a jump that carries past its landing block walks on instead of turning back to it first. Only where nothing depends on touching it: not the final node, on the ground on the node's level, the next step a plain walk on the same Y (gap ≤ 1), and `Terrain.isStraightWalk` clear from the player to the next node. A jump's take-off node never qualifies, because the step after it is not a walk
+- **A passed node counts as reached** (`hasPassedNode`): a node the player has gone beyond — past it toward the next node, or past it along the incoming direction — is ticked off without being touched, so a jump that carries past its landing block walks on instead of turning back to it first. Only where nothing depends on touching it: not the final node, on the ground on the node's level, the next step a plain walk on the same Y (gap ≤ 1), and `Terrain.isStraightWalk` clear from the player to the next node. A jump's take-off node never qualifies, because the step after it is not a walk. A node stepped down to is passed in the air and from above its level too (see *Walking off a ledge*)
 
 ### Travel mode (`startTravel`, Journey only)
 
 The node-by-node walk follows the A* grid: straight and diagonal steps, one node at a time, a gaze that turns with every node. Across open ground a person picks a point far ahead, walks a roughly straight line at it, sprint-jumps on level ground and corrects the heading now and then. `Journey` starts its legs with `startTravel`, and on a level, walkable run of the path `tickCruise` takes the tick instead of the node walk:
 
 - **Aim far, hold the heading.** `chooseCruiseTarget` takes the farthest node up to `CRUISE_LOOKAHEAD` (32) ahead that the path reaches on one Y in gap-1 steps and that `Terrain.isStraightWalk` (headroom 2) reaches in a straight line from the player — at least two nodes beyond the current one, never the path's last node (the last stretch is the node walk's, with its precise arrival). The yaw towards it is fixed (`cruiseYaw`) and fed through the camera spring; the walk key goes down once the camera is aligned, sprint always.
-- **Correct now and then.** The heading is re-taken every `CRUISE_REFRESH_MIN`–`MAX` (15–40) ticks, when the target node has been passed, or when the player has drifted more than `CRUISE_LINE_TOLERANCE` (0.35) off the line it was taken along. Nodes the player has drawn level with are ticked off as it goes (`passCruiseNodes`). No run found → the node walk takes over, and the search is retried only after `CRUISE_RETRY_TICKS` (10).
+- **Correct now and then.** The heading is re-taken every `CRUISE_REFRESH_MIN`–`MAX` (15–40) ticks — counted in the air too, most of a sprint-jumping walk is spent there, and taken on the next ground tick — when the target node has been passed, or when the player has drifted more than `CRUISE_LINE_TOLERANCE` (0.35) off the line it was taken along. Nodes the player has drawn level with are ticked off as it goes (`passCruiseNodes`). No run found → the node walk takes over, and the search is retried only after `CRUISE_RETRY_TICKS` (10).
+- **Not down the middle of the blocks** (`takeCruiseAim`). The heading is not taken at the node's centre but at a point moved sideways by a **lane**: drawn at the walk's start between `CRUISE_LANE_MIN` and `CRUISE_LANE_MAX` (0.1–0.35) to a random side, wandering by at most `CRUISE_LANE_STEP` (0.2) per heading and never back inside the minimum; a lane the whole body cannot walk straight to falls back to the centre. And the heading itself is off by up to `CRUISE_HEADING_NOISE_DEG` (2.5°), so the walk drifts from its line until the line tolerance has it corrected. Aimed at centres, a walk along an axis ran forty blocks at z = n.50 exactly, dead straight on the grid — reported as walking exactly in the middle of the blocks. The jump check looks along the heading actually held. Measured by *Journey does not walk down the middle of the blocks*: share of walking ticks within 0.05 of a block centre, 100 % before, 0 % after; the lane alone (aimed at the far node, no heading noise) only got it to 58 %, a lane at a point 30 blocks out being next to no slant at all.
 - **Sprint-jump on level ground** (`shouldCruiseJump`): sprinting at ≥ `CRUISE_JUMP_MIN_SPEED` (0.12), facing within `CRUISE_JUMP_FACING_DEG` (10°) of the heading, at least `CRUISE_JUMP_LENGTH` (4) from the aim, and those 4 blocks ahead a straight walk with headroom **3** for the arc. After each landing a 0–3 tick holdoff, so the jumps are not metronomic.
 - Choosing a cruise target clears an armed landing brake: it exists for narrow platforms, and a run that passes the straight-walk test is not one.
 - A travel walk's final node uses the ordinary arrival box, not the final-node settle: the end of a leg is where the next leg starts, not a place to stand, and `Journey` judges arrival at the destination itself.
@@ -84,7 +85,7 @@ Decision paths in priority order:
 1. **Same block** (gap=0): jump if target ≥0.5 blocks higher
 2. **No direction**: skip if stepX==0 && stepZ==0
 3. **Landing validation**: check forward air and landing block solidity
-4. **Drop check**: no jump for small drops (gap ≤ 1, target lower)
+4. **Drop check**: no jump when the target is lower and either the player is within one block of it (gap ≤ 1) or the planned step is a plain walk-off (nodeGap == 1) — see *Walking off a ledge* below
 5. **Step-up** (gap ≤ 1): jump if target higher or block in front, only when close
 6. **Long-range** (effectiveGap ≥ 5): collision-based edge detection with direction-aware AABB shrinking, preserves sprint
 7. **Simulation** (short-range, effectiveGap < 5): physics simulation to predict landing
@@ -118,6 +119,48 @@ Note the position-based `gap` is still what the *caller* reads out of the
 returned `JumpDecision` to decide `stabilizeForJump`, and still what classifies
 a jump once one is owed (`effectiveGap = max(gap, nodeGap)`, so a gap that has
 shrunk on the approach cannot demote a long jump).
+
+### Walking off a ledge
+
+The same mismatch hid at every ledge, and the travel mode made it show at every
+one of them: the cruise arrives at the edge at sprint speed and the edge node is
+ticked off from the near edge of its box, so the drop node reads as gap=2,
+`forwardAir` finds the drop, and the old drop check (gap ≤ 1 only) let a jump
+through. The bot hopped off the ledge, let go of the walk key in the air (and
+after a landing brake `postBrakeAirRelease` did the same), flew past the node,
+swung the camera back to it and nearly stopped — reported as a bot that stops
+walking at every ledge on its way back from a restock. The drop check now also
+asks the planned step: a lower target one node on (nodeGap == 1) is walked off,
+never jumped.
+
+Two rules then still held the bot at the rim: the coast-into-a-turn brake
+(`BRAKE_RADIUS`) and the moving-away check both released the walk key above the
+drop node, whose height can only be reached by walking off — 0.15 b/t down to
+0.05 at the rim, and on a three-block drop the whole fall without the key. While
+the planned step is a walk-off and the feet are still more than 1.5 above the
+node (`dropAhead`), neither applies. A jump down to a platform across a gap
+(nodeGap ≥ 2) keeps both: it has a landing to hit.
+
+And the node below the edge has to count as passed in the air. Walked off at
+speed, the body crosses it long before the feet reach its height, the arrival
+box is missed in the fall, and it stayed the target behind the bot: one walk in
+eight turned the camera back to it mid-fall and on round a full circle after the
+landing, at 0.011 b/t. `hasPassedNode` therefore accepts a node stepped down to
+(nodeGap == 1 from a higher one) while airborne and from above its level; every
+other node still has to be passed on the ground at its height.
+
+Pinned by *Journey walks down ledges without stopping* (repeated five times,
+terraces stepping down one and then three blocks: no take-off that lands lower than it left, and never
+slower than `MIN_WALK_SPEED`, 0.08 b/t, on the ground before the last three
+blocks) and *Journey walks down rough ground without stopping* (three-by-three
+cells at seeded heights stepping down one to three blocks at straight and
+diagonal edges: no ledge jump, no standstill over ten ticks). Falsified both
+ways: without the drop check both fail on ledge jumps (the terrace from
+2029, 43 down to 41, the rough ground four times); without `dropAhead` the
+terraces fail at 0.046 b/t on the first rim; without the airborne pass one
+repetition in eight fails at 0.011 b/t below the deep drop. The rough ground's slowest moments
+are its step-ups — the walk runs into the riser before the jump — a separate,
+upward matter the test deliberately does not bar.
 
 ### Key mechanics
 
@@ -316,6 +359,15 @@ the bot ever left. Pinned by *Journey gives up quickly when the way is walled of
 which walls off a 48-block walkway in front of a journey already under way and
 asserts it gives up within 400 ticks — 520 with the watchdog disabled, 70 with it.
 
+### Quirks: a detour and a pause, when the caller asks
+
+`Journey.start(destination, quirks)` takes two chances per leg; `start(destination)` passes `Quirks.NONE`, so every journey but the bot's own restock trip walks without them, and the bot passes its config through its blunder gate, so its test runs do too.
+
+- **Detour.** The leg heads for a node beside the way instead of the target (`detourPoint`): `DETOUR_REACH` (10) ahead, `DETOUR_SIDE_MIN`–`MAX` (3–6) to a random side, the nearest node to that point if it lies within `DETOUR_NODE_SLACK` (2) of it, sideways and in height — the nearest node to a point over a ravine is down in it. Only with at least twice the reach still to go, so the leg still ends closer and the stall counter never sees it. The next leg plans to the target as usual. **A detour in the search does not survive the walk**, and that was built first: a penalty circle in `MeshPathfinder` bent the path round it, and the travel cruise straightened it again — it aims at the farthest node it can walk to in a straight line, and on open ground that line runs straight across the circle. Measured 0.30 blocks off the line at the widest, inside the lane. A leg that *ends* beside the way is one the cruise cannot straighten.
+- **Pause.** After a leg that got closer — never after a stall, which has stood still already — the journey stands for `pauseMinTicks`–`pauseMaxTicks` (`PAUSED`) before it meshes and plans again.
+
+Pinned by *Journey takes a detour when it slips* (detour chance 1 across open ground: arrives, and leaves the straight line by at least `MIN_DETOUR_WIDTH`, 2 blocks — 8.1 measured, against 0.30 for the penalty circle).
+
 ### Placement: the pathfinder may build, if it is allowed to
 
 `BlockPlacer` is declared *here* and implemented in the bot module (`RoutePlacer`),
@@ -333,6 +385,21 @@ depends on placement is planned, so a forbidden placement shows up as "no path"
 rather than as a half-built bridge. `MAX_BRIDGE_CELLS` is 2, deliberately tiny:
 the equivalent logic in the chunk miner took five rounds to get right and every
 wrong version walked the bot somewhere it should not have gone.
+
+**A bridge needs a far rim.** `tryBridge` mends only a gap of at most
+`MAX_BRIDGE_CELLS` missing floor cells on the line towards the target with floor
+again on the same level behind them. The bound used to cap only the scan of one
+call, and the planner calls it again on every round that finds no path — so on a
+restock's way back to a chunk-miner shaft ten blocks below the ground it laid a
+walkway out over the shaft at ground level, one cell per round, seven in all,
+until the bot stood above its target and failed anyway. A pit is not a gap:
+there it now fails at once with "no way towards …". Getting *into* such a shaft
+is the miner's business: its staircase now climbs on up to the ground around the
+chunk (the miner module's *The way out reaches the ground*), and the journey
+walks down it like any other stairs.
+Pinned by *Journey bridges a narrow gap it cannot jump* (a two-cell hole in a
+two-high corridor, mended and crossed) and *Journey does not bridge out over a
+pit* (falsified against the old scan: four cells laid over the pit).
 
 This governs the **pathfinder** placing blocks to open a route and nothing else.
 The chunk miner's own placements — damming water, bridging a gap in its slab,

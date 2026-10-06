@@ -5,6 +5,7 @@ import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -64,8 +65,28 @@ public final class Journey {
         /** The walker has the legs; poll it. */
         WALKING,
         /** A block was asked for; wait for it before planning again. */
-        PLACING
+        PLACING,
+        /** Standing a moment between two legs; see {@link Quirks}. */
+        PAUSED
     }
+
+    /**
+     * The traveller's rare slips, chance per leg: heading off to a point beside
+     * the way first (a detour — another way than the best one, still a walkable
+     * one), and standing still for a moment between two legs. Off for every
+     * journey but those whose caller asks — the bot's own trips.
+     */
+    public record Quirks(double detourChance, double pauseChance, int pauseMinTicks, int pauseMaxTicks) {
+        public static final Quirks NONE = new Quirks(0.0, 0.0, 0, 0);
+    }
+
+    /** How far ahead on the way a detour's point lies; only taken with twice that still to go. */
+    private static final double DETOUR_REACH = 10.0;
+    /** How far to the side of the way it lies. */
+    private static final double DETOUR_SIDE_MIN = 3.0;
+    private static final double DETOUR_SIDE_MAX = 6.0;
+    /** How far the nearest node may be from the point, either way, and still stand for it. */
+    private static final double DETOUR_NODE_SLACK = 2.0;
 
     /** Close enough to count as arrived — the same 2 blocks WalkTravelMethod used. */
     private static final double ARRIVAL_RADIUS_SQ = 4.0;
@@ -148,6 +169,8 @@ public final class Journey {
     /** What the current leg was asked to walk, for the diagnostics when it fails. */
     private static BlockPos legTarget;
     private static int legLength;
+    private static Quirks quirks = Quirks.NONE;
+    private static int pauseTicks;
 
     private Journey() {
     }
@@ -156,7 +179,13 @@ public final class Journey {
      * Head for {@code destination}. Replaces any journey already running.
      */
     public static void start(BlockPos destination) {
+        start(destination, Quirks.NONE);
+    }
+
+    /** The same, with the traveller's slips — see {@link Quirks}. */
+    public static void start(BlockPos destination, Quirks slips) {
         stop();
+        quirks = slips;
         LocalPlayer player = Minecraft.getInstance().player;
         if (player == null) {
             status = Status.FAILED;
@@ -232,6 +261,11 @@ public final class Journey {
             case PLANNING -> tickPlanning(player, level);
             case WALKING -> tickWalking(player, level);
             case PLACING -> tickPlacing(player);
+            case PAUSED -> {
+                if (--pauseTicks <= 0) {
+                    phase = Phase.MESHING;
+                }
+            }
             default -> { }
         }
         return status;
@@ -275,6 +309,12 @@ public final class Journey {
             goal = new MeshNode(target.getX(), target.getY(), target.getZ());
         }
 
+        if (roll(quirks.detourChance())) {
+            MeshNode aside = detourPoint(player, level);
+            if (aside != null) {
+                goal = aside;
+            }
+        }
         List<MeshNode> path = new MeshPathfinder().findPathTowards(start, goal);
         if (path.isEmpty()) {
             // Nowhere reachable is closer than where we stand — inside the
@@ -406,6 +446,14 @@ public final class Journey {
                 player.blockPosition().getX() >> 4, player.blockPosition().getZ() >> 4), KEEP_RADIUS);
         queueCorridor(player);
         phase = Phase.MESHING;
+        // A moment's standstill between two legs that got somewhere — never
+        // on top of a stall, which has spent its time standing already.
+        if (stalledLegs == 0 && roll(quirks.pauseChance())) {
+            pauseTicks = quirks.pauseMinTicks() >= quirks.pauseMaxTicks() ? quirks.pauseMinTicks()
+                    : ThreadLocalRandom.current().nextInt(quirks.pauseMinTicks(), quirks.pauseMaxTicks() + 1);
+            phase = Phase.PAUSED;
+            LOGGER.info("Journey pausing for {} ticks", pauseTicks);
+        }
     }
 
     /** Re-mesh with the corridor widened to the whole window, then plan again. */
@@ -478,6 +526,13 @@ public final class Journey {
      * gap, ranking faces by how squarely they face the eye picks the far rim and
      * walks the bot into the hole.
      *
+     * <p>Only a gap with a far rim: at most {@link #MAX_BRIDGE_CELLS} missing
+     * cells, then floor again on the same level. Without that the bridge led
+     * nowhere and nothing bounded it either — each planning round that found no
+     * path laid one more cell, and a return trip to a pit ten blocks below the
+     * ground built seven of them straight out over it at ground level, stood
+     * above its target and failed there.
+     *
      * @return true when a placement is in flight
      */
     private static boolean tryBridge(LocalPlayer player, Level level) {
@@ -495,7 +550,9 @@ public final class Journey {
         int x = feet.getX();
         int z = feet.getZ();
         BlockPos support = floor;
-        for (int step = 0; step < MAX_BRIDGE_CELLS; step++) {
+        BlockPos gap = null;
+        int gapCells = 0;
+        for (int step = 0; step <= 2 * MAX_BRIDGE_CELLS; step++) {
             int dx = target.getX() - x;
             int dz = target.getZ() - z;
             if (dx == 0 && dz == 0) {
@@ -508,13 +565,62 @@ public final class Journey {
             }
             BlockPos candidate = new BlockPos(x, floor.getY(), z);
             if (isSolidFloor(level, player, candidate)) {
+                if (gap != null) {
+                    LOGGER.info("Journey bridging {} against {}", shortPos(gap), shortPos(support));
+                    return PathPlacement.place(gap, support);
+                }
+                if (step + 1 >= MAX_BRIDGE_CELLS) {
+                    // Floor all the way in front of the feet: nothing to mend.
+                    return false;
+                }
                 support = candidate;
                 continue;
             }
-            LOGGER.info("Journey bridging {} against {}", shortPos(candidate), shortPos(support));
-            return PathPlacement.place(candidate, support);
+            if (gap == null) {
+                gap = candidate;
+            }
+            if (++gapCells > MAX_BRIDGE_CELLS) {
+                // Wider than a step: a pit, not a gap.
+                return false;
+            }
         }
         return false;
+    }
+
+    /**
+     * A node beside the way ahead for a detour leg to head for, or null where
+     * there is none to be had: too close to the target for a detour to still be
+     * progress, or no ground near the point. Asked of the planner rather than
+     * of the walk — a leg bent round an obstacle that is not there is walked
+     * straight again by the travel cruise wherever the straight line is free,
+     * which on open ground is everywhere; a leg that ends beside the way is
+     * not.
+     */
+    private static MeshNode detourPoint(LocalPlayer player, Level level) {
+        double dx = target.getX() - player.getX();
+        double dz = target.getZ() - player.getZ();
+        double length = Math.sqrt(dx * dx + dz * dz);
+        if (length < 2 * DETOUR_REACH) {
+            return null;
+        }
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        double side = random.nextDouble(DETOUR_SIDE_MIN, DETOUR_SIDE_MAX) * (random.nextBoolean() ? 1 : -1);
+        double x = player.getX() + (dx * DETOUR_REACH - dz * side) / length;
+        double z = player.getZ() + (dz * DETOUR_REACH + dx * side) / length;
+        MeshNode node = MeshManager.findOrBuildNearestNode(level, player,
+                BlockPos.containing(x, player.getY(), z));
+        // On about the level the bot walks on, too: the nearest node to a point
+        // over a ravine is down in it, and that is no detour.
+        if (node == null || Math.hypot(node.getX() + 0.5 - x, node.getZ() + 0.5 - z) > DETOUR_NODE_SLACK
+                || Math.abs(node.getY() + 1 - player.getY()) > DETOUR_NODE_SLACK) {
+            return null;
+        }
+        LOGGER.info("Journey taking a detour by {}", shortPos(node.getBlockPos()));
+        return node;
+    }
+
+    private static boolean roll(double chance) {
+        return chance > 0 && ThreadLocalRandom.current().nextDouble() < chance;
     }
 
     /**

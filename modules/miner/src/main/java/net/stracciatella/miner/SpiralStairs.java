@@ -90,10 +90,11 @@ public final class SpiralStairs {
      * index equals this one — and {@code theTwoDirectionsAgree} pins that.
      *
      * <p>Every layer has one, including layers no run will ever reach. Capping
-     * the ramp is the caller's business and the miner already does it, by only
-     * ever asking about layers inside the range it is clearing; a cap in here
-     * would have to be told where the range ends, and being told that is what
-     * made the staircase move between runs.
+     * the ramp is the caller's business: the miner asks about the layers of the
+     * range it is clearing, and above it only as far as the way out has to
+     * climb to reach daylight. A cap in here would have to be told where the
+     * range ends, and being told that is what made the staircase move between
+     * runs.
      */
     public static int ringIndexAt(int y) {
         return Math.floorMod(-y, RING_LENGTH);
@@ -139,6 +140,30 @@ public final class SpiralStairs {
             return new int[] {last - (index - 2 * last), last};
         }
         return new int[] {0, last - (index - 3 * last)};
+    }
+
+    /**
+     * The directions out of the chunk from ring position {@code index}, as
+     * {@code {dx, dz}}: one along an edge, two at a corner. What lies that way
+     * is the ground outside the chunk, which is where the way out of the pit
+     * has to lead.
+     */
+    public static int[][] outward(int index) {
+        int[] at = ringOffset(index);
+        int last = CHUNK_SIZE - 1;
+        int[][] all = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
+        boolean[] facing = {at[1] == 0, at[0] == last, at[1] == last, at[0] == 0};
+        int count = 0;
+        for (boolean f : facing) {
+            count += f ? 1 : 0;
+        }
+        int[][] out = new int[count][];
+        for (int i = 0, n = 0; i < all.length; i++) {
+            if (facing[i]) {
+                out[n++] = all[i];
+            }
+        }
+        return out;
     }
 
     // --- World-coordinate conveniences ---

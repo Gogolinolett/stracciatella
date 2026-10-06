@@ -37,6 +37,31 @@ public class HumanBehavior {
         return sessionSkill;
     }
 
+    // Blunders — the rare deliberate slips (a long zone-out, a detour, a block
+    // too many dug out and put back, a stair step knocked out and rebuilt, idle
+    // clicks on the way) —
+    // switched off for the length of a run that asserts an exact outcome. A
+    // runtime flag rather than the config chances, so nothing a test does here
+    // can be written back to the player's files.
+    private static boolean blundersSuppressed = false;
+
+    public static void suppressBlunders(boolean suppressed) {
+        blundersSuppressed = suppressed;
+    }
+
+    /**
+     * Whether a blunder that happens with probability {@code chance} happens
+     * now. Never while blunders are suppressed.
+     */
+    public static boolean blunder(double chance) {
+        return !blundersSuppressed && chance > 0 && ThreadLocalRandom.current().nextDouble() < chance;
+    }
+
+    /** {@code chance}, or 0 while blunders are suppressed — for a caller that rolls it itself. */
+    public static double blunderChance(double chance) {
+        return blundersSuppressed ? 0.0 : chance;
+    }
+
     /**
      * Generate a random aim offset within the configured range, distributed as
      * a clamped Gaussian centred at 0 with σ = aimOffsetMax/2. Most samples
@@ -143,6 +168,11 @@ public class HumanBehavior {
      * break, and it lands in the critical path of every single one.
      */
     public static int randomBreatherTicks(BotConfig config) {
+        // Far rarer and far longer: the bot zoning out for a few seconds, the
+        // way a person's attention wanders off the work now and then.
+        if (blunder(config.zoneOutChance)) {
+            return randomIntInRange(config.zoneOutMinTicks, config.zoneOutMaxTicks);
+        }
         ThreadLocalRandom r = ThreadLocalRandom.current();
         if (config.longPauseChance > 0 && r.nextDouble() < config.longPauseChance) {
             return randomIntInRange(config.longPauseMinTicks, config.longPauseMaxTicks);
@@ -157,7 +187,7 @@ public class HumanBehavior {
         return ThreadLocalRandom.current().nextDouble(min, max);
     }
 
-    private static int randomIntInRange(int min, int max) {
+    static int randomIntInRange(int min, int max) {
         if (min >= max) {
             return min;
         }

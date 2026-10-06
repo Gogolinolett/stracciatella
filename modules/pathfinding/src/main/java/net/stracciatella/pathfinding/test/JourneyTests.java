@@ -1,5 +1,7 @@
 package net.stracciatella.pathfinding.test;
 
+import java.util.ArrayList;
+import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.stracciatella.pathfinding.ChunkCoordinate;
@@ -401,6 +403,488 @@ public class JourneyTests {
                 Journey.stop();
                 PathWalker.stop();
             });
+        }
+    }
+
+    /**
+     * Terraces stepping down a block and then three, and a journey across them.
+     * A person walks off a ledge without breaking stride; the bot, on the way
+     * back from a restock, stopped at the edge. Measured as the longest stretch
+     * on the ground at a standstill between the first step and the arrival.
+     *
+     * <p>Repeated, because whether the walk ticks the node below the edge off
+     * before the fall depends on where the ticks happen to fall at the rim: one
+     * run in eight turned round in the air for it before that was fixed.
+     */
+    @MinecraftTest(name = "Journey walks down ledges without stopping", timeoutTicks = 2000, order = 54, repeat = 5)
+    public void journeyWalksDownLedges(TestContext ctx) {
+        final int z0 = ORIGIN_Z + 120;
+        final BlockPos start = new BlockPos(ORIGIN_X + 2, ORIGIN_Y + 5, z0 + 3);
+        final BlockPos target = new BlockPos(ORIGIN_X + 42, ORIGIN_Y + 1, z0 + 7);
+        try {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+            ctx.runCommand("gamemode creative");
+            ctx.runCommand("tp @s " + (ORIGIN_X + 22.5) + " " + (ORIGIN_Y + 12) + " " + (z0 + 5.5));
+            ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level, new ChunkCoordinate(ORIGIN_X >> 4, z0 >> 4))
+                    && MeshManager.isChunkLoaded(mc.level,
+                            new ChunkCoordinate((ORIGIN_X + 44) >> 4, (z0 + 10) >> 4)));
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y - 2) + " " + z0 + " "
+                    + (ORIGIN_X + 44) + " " + (ORIGIN_Y + 10) + " " + (z0 + 10) + " air");
+            // Floors at Y+4, Y+3 and Y: a step down of one, then the deepest
+            // drop the mesh plans, three — the fall that carries a walk off the
+            // edge furthest past the node below it.
+            int[][] terraces = {{0, 14, ORIGIN_Y + 4}, {15, 29, ORIGIN_Y + 3}, {30, 44, ORIGIN_Y}};
+            for (int[] terrace : terraces) {
+                ctx.runCommand("fill " + (ORIGIN_X + terrace[0]) + " " + (ORIGIN_Y - 2) + " " + z0 + " "
+                        + (ORIGIN_X + terrace[1]) + " " + terrace[2] + " " + (z0 + 10) + " stone");
+            }
+            ctx.waitFor(mc -> !mc.level.getBlockState(target.below()).isAir()
+                    && !mc.level.getBlockState(start.below()).isAir());
+            standAt(ctx, start);
+
+            final boolean[] moving = {false};
+            final int[] still = {0};
+            final int[] longestStill = {0};
+            final BlockPos[] stillAt = {null};
+            final double[] slowest = {Double.MAX_VALUE};
+            final BlockPos[] slowestAt = {null};
+            final LedgeJumps ledgeJumps = new LedgeJumps();
+            ctx.runOnClient(mc -> Journey.start(target));
+            ctx.waitFor(mc -> {
+                if (Journey.status() == Journey.Status.FAILED) {
+                    throw new AssertionError("journey failed: " + Journey.failReason());
+                }
+                if (mc.player.position().y < ORIGIN_Y - 0.5) {
+                    throw new AssertionError("fell off the terraces at " + mc.player.blockPosition());
+                }
+                ledgeJumps.sample(mc.player);
+                var velocity = mc.player.getDeltaMovement();
+                double speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+                moving[0] |= speed > 0.1;
+                if (moving[0] && mc.player.onGround() && speed < STANDSTILL_SPEED) {
+                    if (++still[0] > longestStill[0]) {
+                        longestStill[0] = still[0];
+                        stillAt[0] = mc.player.blockPosition();
+                    }
+                } else {
+                    still[0] = 0;
+                }
+                // The last few blocks are the arrival, where slowing down is right.
+                if (moving[0] && mc.player.onGround() && speed < slowest[0]
+                        && mc.player.blockPosition().distSqr(target) > 9.0) {
+                    slowest[0] = speed;
+                    slowestAt[0] = mc.player.blockPosition();
+                }
+                return Journey.status() == Journey.Status.ARRIVED;
+            });
+
+            double distance = ctx.computeOnClient(mc -> Math.sqrt(mc.player.blockPosition().distSqr(target)));
+            if (distance > 2.5) {
+                ctx.fail("journey reported arrival " + String.format("%.2f", distance) + " blocks from " + target);
+                return;
+            }
+            if (!ledgeJumps.found.isEmpty()) {
+                ctx.fail("the walk jumped down a ledge instead of walking off it: " + String.join("; ", ledgeJumps.found));
+                return;
+            }
+            if (longestStill[0] > MAX_STANDSTILL_TICKS) {
+                ctx.fail("the walk stood still for " + longestStill[0] + " ticks at " + stillAt[0]
+                        + " on its way down the terraces");
+                return;
+            }
+            if (slowest[0] < MIN_WALK_SPEED) {
+                ctx.fail("the walk slowed to " + String.format("%.3f", slowest[0]) + " b/t at " + slowestAt[0]
+                        + " on its way down the terraces — a person walks off a ledge at walking pace");
+                return;
+            }
+            LOGGER.info("Journey walked down the ledges, slowest {} b/t", String.format("%.3f", slowest[0]));
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+        }
+    }
+
+    /**
+     * Rough ground falling away: three-by-three cells at heights drawn from a
+     * fixed seed, stepping down one, two or three blocks at straight and
+     * diagonal edges, the way a hillside does. A journey down it, measured the
+     * same way as the terraces — every standstill on the ground is recorded.
+     */
+    @MinecraftTest(name = "Journey walks down rough ground without stopping", timeoutTicks = 3000, order = 55)
+    public void journeyWalksDownRoughGround(TestContext ctx) {
+        final int z0 = ORIGIN_Z + 160;
+        final int cellsX = 16;
+        final int cellsZ = 8;
+        final int cell = 3;
+        final int[][] height = new int[cellsX][cellsZ];
+        java.util.Random random = new java.util.Random(20261005L);
+        for (int cx = 0; cx < cellsX; cx++) {
+            for (int cz = 0; cz < cellsZ; cz++) {
+                int h = (int) Math.round(10 - cx * 0.65) + random.nextInt(3) - 1;
+                height[cx][cz] = Math.max(0, Math.min(11, h));
+            }
+        }
+        final BlockPos start = new BlockPos(ORIGIN_X + 1, ORIGIN_Y + height[0][1] + 1, z0 + 4);
+        final BlockPos target = new BlockPos(ORIGIN_X + cellsX * cell - 2, ORIGIN_Y + height[cellsX - 1][6] + 1,
+                z0 + 19);
+        try {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+            ctx.runCommand("gamemode creative");
+            ctx.runCommand("tp @s " + (ORIGIN_X + 24.5) + " " + (ORIGIN_Y + 20) + " " + (z0 + 12.5));
+            ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level, new ChunkCoordinate(ORIGIN_X >> 4, z0 >> 4))
+                    && MeshManager.isChunkLoaded(mc.level,
+                            new ChunkCoordinate((ORIGIN_X + cellsX * cell) >> 4, (z0 + cellsZ * cell) >> 4)));
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y - 2) + " " + z0 + " "
+                    + (ORIGIN_X + cellsX * cell - 1) + " " + (ORIGIN_Y + 15) + " " + (z0 + cellsZ * cell - 1) + " air");
+            for (int cx = 0; cx < cellsX; cx++) {
+                for (int cz = 0; cz < cellsZ; cz++) {
+                    int x = ORIGIN_X + cx * cell;
+                    int z = z0 + cz * cell;
+                    ctx.runCommand("fill " + x + " " + (ORIGIN_Y - 2) + " " + z + " " + (x + cell - 1) + " "
+                            + (ORIGIN_Y + height[cx][cz]) + " " + (z + cell - 1) + " stone");
+                }
+            }
+            ctx.waitFor(mc -> !mc.level.getBlockState(target.below()).isAir()
+                    && !mc.level.getBlockState(start.below()).isAir());
+            standAt(ctx, start);
+
+            final boolean[] moving = {false};
+            final int[] still = {0};
+            final BlockPos[] stillFrom = {null};
+            final List<String> standstills = new ArrayList<>();
+            final LedgeJumps ledgeJumps = new LedgeJumps();
+            ctx.runOnClient(mc -> Journey.start(target));
+            ctx.waitFor(mc -> {
+                if (Journey.status() == Journey.Status.FAILED) {
+                    throw new AssertionError("journey failed: " + Journey.failReason());
+                }
+                ledgeJumps.sample(mc.player);
+                var velocity = mc.player.getDeltaMovement();
+                double speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+                moving[0] |= speed > 0.1;
+                if (moving[0] && mc.player.onGround() && speed < STANDSTILL_SPEED) {
+                    if (still[0]++ == 0) {
+                        stillFrom[0] = mc.player.blockPosition();
+                    }
+                } else {
+                    if (still[0] > MAX_STANDSTILL_TICKS) {
+                        standstills.add(still[0] + " ticks at " + stillFrom[0].toShortString());
+                    }
+                    still[0] = 0;
+                }
+                return Journey.status() == Journey.Status.ARRIVED;
+            });
+
+            double distance = ctx.computeOnClient(mc -> Math.sqrt(mc.player.blockPosition().distSqr(target)));
+            if (distance > 2.5) {
+                ctx.fail("journey reported arrival " + String.format("%.2f", distance) + " blocks from " + target);
+                return;
+            }
+            if (!ledgeJumps.found.isEmpty()) {
+                ctx.fail("the walk jumped down a ledge instead of walking off it: " + String.join("; ", ledgeJumps.found));
+                return;
+            }
+            if (!standstills.isEmpty()) {
+                ctx.fail("the walk stood still on its way down: " + String.join("; ", standstills));
+                return;
+            }
+            LOGGER.info("Journey walked down the rough ground without a standstill");
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+        }
+    }
+
+    /**
+     * A two-cell hole in the floor of a two-high corridor: too low to jump
+     * across, narrow enough to mend. The journey bridges it and arrives.
+     */
+    @MinecraftTest(name = "Journey bridges a narrow gap it cannot jump", timeoutTicks = 3000, order = 56)
+    public void journeyBridgesNarrowGap(TestContext ctx) {
+        final int z = ORIGIN_Z + 200;
+        final int length = 24;
+        final int gapX = ORIGIN_X + 10;
+        final BlockPos start = new BlockPos(ORIGIN_X + 2, ORIGIN_Y + 1, z);
+        final BlockPos target = new BlockPos(ORIGIN_X + length - 2, ORIGIN_Y + 1, z);
+        final boolean placementWasAllowed = PathPlacement.isAvailable();
+        try {
+            if (!buildWalkway(ctx, z, length, target)) {
+                return;
+            }
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y + 3) + " " + (z - BRIDGE_HALF_WIDTH) + " "
+                    + (ORIGIN_X + length) + " " + (ORIGIN_Y + 3) + " " + (z + BRIDGE_HALF_WIDTH) + " stone");
+            ctx.runCommand("fill " + gapX + " " + ORIGIN_Y + " " + (z - BRIDGE_HALF_WIDTH) + " "
+                    + (gapX + 1) + " " + ORIGIN_Y + " " + (z + BRIDGE_HALF_WIDTH) + " air");
+            ctx.waitFor(mc -> mc.level.getBlockState(new BlockPos(gapX, ORIGIN_Y, z)).isAir()
+                    && !mc.level.getBlockState(new BlockPos(gapX, ORIGIN_Y + 3, z)).isAir());
+            ctx.runCommand("clear @s");
+            ctx.runCommand("give @s cobblestone 64");
+            ctx.runOnClient(mc -> PathPlacement.setAllowed(true));
+            standAt(ctx, start);
+
+            ctx.runOnClient(mc -> Journey.start(target));
+            ctx.waitFor(mc -> {
+                if (mc.player.position().y < ORIGIN_Y - 3) {
+                    throw new AssertionError("fell into the gap at " + mc.player.blockPosition());
+                }
+                return Journey.status() != Journey.Status.RUNNING;
+            });
+            if (Journey.status() != Journey.Status.ARRIVED) {
+                ctx.fail("the journey did not get across a two-cell gap it may bridge: " + Journey.failReason());
+                return;
+            }
+            LOGGER.info("Journey bridged the gap and arrived");
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+                PathPlacement.setAllowed(placementWasAllowed);
+            });
+        }
+    }
+
+    /**
+     * A target at the bottom of a pit eight blocks deep, with no way down —
+     * what a chunk miner's shaft is to a bot coming back from a restock. There
+     * is nothing a bridge can do there, and the journey must say so rather than
+     * build one: it laid a walkway out over the pit at ground level, cell by
+     * cell, until it stood above the target and failed anyway.
+     */
+    @MinecraftTest(name = "Journey does not bridge out over a pit", timeoutTicks = 3000, order = 57)
+    public void journeyDoesNotBridgeOverPit(TestContext ctx) {
+        final int z0 = ORIGIN_Z + 240;
+        final int size = 24;
+        final int pitFrom = 8;
+        final int pitTo = 15;
+        final BlockPos start = new BlockPos(ORIGIN_X + 2, ORIGIN_Y + 1, z0 + 11);
+        final BlockPos target = new BlockPos(ORIGIN_X + 12, ORIGIN_Y - 7, z0 + 11);
+        final boolean placementWasAllowed = PathPlacement.isAvailable();
+        try {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+            ctx.runCommand("gamemode creative");
+            ctx.runCommand("tp @s " + (ORIGIN_X + 12.5) + " " + (ORIGIN_Y + 10) + " " + (z0 + 12.5));
+            ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level, new ChunkCoordinate(ORIGIN_X >> 4, z0 >> 4))
+                    && MeshManager.isChunkLoaded(mc.level,
+                            new ChunkCoordinate((ORIGIN_X + size) >> 4, (z0 + size) >> 4)));
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y - 8) + " " + z0 + " " + (ORIGIN_X + size - 1) + " "
+                    + ORIGIN_Y + " " + (z0 + size - 1) + " stone");
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y + 1) + " " + z0 + " " + (ORIGIN_X + size - 1) + " "
+                    + (ORIGIN_Y + 6) + " " + (z0 + size - 1) + " air");
+            ctx.runCommand("fill " + (ORIGIN_X + pitFrom) + " " + (ORIGIN_Y - 7) + " " + (z0 + pitFrom) + " "
+                    + (ORIGIN_X + pitTo) + " " + ORIGIN_Y + " " + (z0 + pitTo) + " air");
+            ctx.waitFor(mc -> mc.level.getBlockState(target).isAir()
+                    && mc.level.getBlockState(new BlockPos(ORIGIN_X + pitFrom, ORIGIN_Y, z0 + pitFrom)).isAir()
+                    && !mc.level.getBlockState(start.below()).isAir());
+            ctx.runCommand("clear @s");
+            ctx.runCommand("give @s cobblestone 64");
+            ctx.runOnClient(mc -> PathPlacement.setAllowed(true));
+            standAt(ctx, start);
+
+            ctx.runOnClient(mc -> Journey.start(target));
+            ctx.waitFor(mc -> Journey.status() != Journey.Status.RUNNING
+                    && !PathPlacement.isBusy());
+
+            List<String> bridged = ctx.computeOnClient(mc -> {
+                List<String> found = new ArrayList<>();
+                for (int x = pitFrom; x <= pitTo; x++) {
+                    for (int dz = pitFrom; dz <= pitTo; dz++) {
+                        BlockPos cell = new BlockPos(ORIGIN_X + x, ORIGIN_Y, z0 + dz);
+                        if (!mc.level.getBlockState(cell).isAir()) {
+                            found.add(cell.toShortString());
+                        }
+                    }
+                }
+                return found;
+            });
+            if (!bridged.isEmpty()) {
+                ctx.fail("the journey bridged out over the pit: " + String.join("; ", bridged));
+                return;
+            }
+            if (Journey.status() != Journey.Status.FAILED) {
+                ctx.fail("the journey reported " + Journey.status() + " for a target with no way down to it");
+                return;
+            }
+            LOGGER.info("Journey gave up on the pit without bridging it: {}", Journey.failReason());
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+                PathPlacement.setAllowed(placementWasAllowed);
+            });
+        }
+    }
+
+    /**
+     * A straight walk along an axis across open ground, started on a block
+     * centre. A person walks wherever they happen to be; the cruise aimed at
+     * node centres and walked forty blocks without leaving the middle of the
+     * row. Measured as the share of walking ticks whose sideways position is
+     * within {@link #CENTRE_BAND} of a block centre.
+     */
+    @MinecraftTest(name = "Journey does not walk down the middle of the blocks", timeoutTicks = 2000, order = 58)
+    public void journeyLeavesTheBlockCentres(TestContext ctx) {
+        final int z0 = ORIGIN_Z + 280;
+        final int length = 48;
+        final BlockPos start = new BlockPos(ORIGIN_X + 2, ORIGIN_Y + 1, z0 + 4);
+        final BlockPos target = new BlockPos(ORIGIN_X + length - 2, ORIGIN_Y + 1, z0 + 4);
+        try {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+            ctx.runCommand("gamemode creative");
+            ctx.runCommand("tp @s " + (ORIGIN_X + length / 2 + 0.5) + " " + (ORIGIN_Y + 8) + " " + (z0 + 4.5));
+            ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level, new ChunkCoordinate(ORIGIN_X >> 4, z0 >> 4))
+                    && MeshManager.isChunkLoaded(mc.level,
+                            new ChunkCoordinate((ORIGIN_X + length) >> 4, (z0 + 8) >> 4)));
+            ctx.runCommand("fill " + ORIGIN_X + " " + ORIGIN_Y + " " + z0 + " "
+                    + (ORIGIN_X + length) + " " + ORIGIN_Y + " " + (z0 + 8) + " stone");
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y + 1) + " " + z0 + " "
+                    + (ORIGIN_X + length) + " " + (ORIGIN_Y + 4) + " " + (z0 + 8) + " air");
+            ctx.waitFor(mc -> !mc.level.getBlockState(target.below()).isAir());
+            standAt(ctx, start);
+
+            final int[] walking = {0};
+            final int[] centred = {0};
+            ctx.runOnClient(mc -> Journey.start(target));
+            ctx.waitFor(mc -> {
+                if (Journey.status() == Journey.Status.FAILED) {
+                    throw new AssertionError("journey failed: " + Journey.failReason());
+                }
+                double along = mc.player.getX() - (start.getX() + 0.5);
+                if (mc.player.onGround() && along > 3.0 && along < length - 8.0) {
+                    walking[0]++;
+                    double sideways = mc.player.getZ() - Math.floor(mc.player.getZ()) - 0.5;
+                    if (Math.abs(sideways) < CENTRE_BAND) {
+                        centred[0]++;
+                    }
+                }
+                return Journey.status() == Journey.Status.ARRIVED;
+            });
+            double share = walking[0] == 0 ? 1.0 : (double) centred[0] / walking[0];
+            String summary = String.format("%.0f%% of %d walking ticks within %.2f of a block centre",
+                    share * 100, walking[0], CENTRE_BAND);
+            if (share > MAX_CENTRED_SHARE) {
+                ctx.fail("the walk kept to the middle of the blocks: " + summary);
+                return;
+            }
+            LOGGER.info("Journey walked its own line: {}", summary);
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+        }
+    }
+
+    /**
+     * The detour slip, forced on every leg, across open ground where the
+     * straight line is free: the walk has to leave that line by more than its
+     * lane and heading noise ever take it, and still arrive.
+     */
+    @MinecraftTest(name = "Journey takes a detour when it slips", timeoutTicks = 2000, order = 59)
+    public void journeyTakesADetour(TestContext ctx) {
+        final int z0 = ORIGIN_Z + 320;
+        final int length = 48;
+        final int width = 16;
+        final BlockPos start = new BlockPos(ORIGIN_X + 2, ORIGIN_Y + 1, z0 + width / 2);
+        final BlockPos target = new BlockPos(ORIGIN_X + length - 6, ORIGIN_Y + 1, z0 + width / 2);
+        try {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+            ctx.runCommand("gamemode creative");
+            ctx.runCommand("tp @s " + (ORIGIN_X + length / 2 + 0.5) + " " + (ORIGIN_Y + 8) + " "
+                    + (z0 + width / 2 + 0.5));
+            ctx.waitFor(mc -> MeshManager.isChunkLoaded(mc.level, new ChunkCoordinate(ORIGIN_X >> 4, z0 >> 4))
+                    && MeshManager.isChunkLoaded(mc.level,
+                            new ChunkCoordinate((ORIGIN_X + length) >> 4, (z0 + width) >> 4)));
+            ctx.runCommand("fill " + ORIGIN_X + " " + ORIGIN_Y + " " + z0 + " "
+                    + (ORIGIN_X + length) + " " + ORIGIN_Y + " " + (z0 + width) + " stone");
+            ctx.runCommand("fill " + ORIGIN_X + " " + (ORIGIN_Y + 1) + " " + z0 + " "
+                    + (ORIGIN_X + length) + " " + (ORIGIN_Y + 4) + " " + (z0 + width) + " air");
+            ctx.waitFor(mc -> !mc.level.getBlockState(target.below()).isAir());
+            standAt(ctx, start);
+
+            final double[] widest = {0.0};
+            ctx.runOnClient(mc -> Journey.start(target, new Journey.Quirks(1.0, 0.0, 0, 0)));
+            ctx.waitFor(mc -> {
+                if (Journey.status() == Journey.Status.FAILED) {
+                    throw new AssertionError("journey failed: " + Journey.failReason());
+                }
+                widest[0] = Math.max(widest[0], Math.abs(mc.player.getZ() - (start.getZ() + 0.5)));
+                return Journey.status() == Journey.Status.ARRIVED;
+            });
+            if (widest[0] < MIN_DETOUR_WIDTH) {
+                ctx.fail(String.format("the walk never left its line: %.2f blocks at the widest, at least %.1f"
+                        + " expected", widest[0], MIN_DETOUR_WIDTH));
+                return;
+            }
+            LOGGER.info("Journey went round: {} blocks off the line at the widest",
+                    String.format("%.2f", widest[0]));
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathWalker.stop();
+            });
+        }
+    }
+
+    /**
+     * How far off the straight line a detour has to take the walk: well past
+     * the lane (0.35) plus the drift the heading noise is allowed (0.35).
+     */
+    private static final double MIN_DETOUR_WIDTH = 2.0;
+
+    /** Sideways distance from a block centre that counts as walking down the middle. */
+    private static final double CENTRE_BAND = 0.05;
+    /** Share of a walk that may be spent down the middle of the blocks. */
+    private static final double MAX_CENTRED_SHARE = 0.6;
+
+    /** Horizontal speed under which a tick on the ground counts as standing still. */
+    private static final double STANDSTILL_SPEED = 0.03;
+    /** Longest standstill a walk down the terraces may have — a brief settle, not a stop. */
+    private static final int MAX_STANDSTILL_TICKS = 10;
+    /** Slowest a walk down the terraces may get on the ground before its arrival: about walking pace. */
+    private static final double MIN_WALK_SPEED = 0.08;
+
+    /**
+     * Take-offs that landed lower than they left: a jump down a ledge, where a
+     * person walks off it. A sprint-jump on level ground lands where it left,
+     * a step up lands higher, and walking off an edge is no take-off at all.
+     */
+    private static final class LedgeJumps {
+        final List<String> found = new ArrayList<>();
+        private boolean wasOnGround = true;
+        private double takeOffY = Double.NaN;
+        private BlockPos takeOffAt;
+
+        void sample(net.minecraft.client.player.LocalPlayer player) {
+            boolean onGround = player.onGround();
+            if (wasOnGround && !onGround && player.getDeltaMovement().y > 0.0) {
+                takeOffY = player.getY();
+                takeOffAt = player.blockPosition();
+            } else if (!wasOnGround && onGround) {
+                if (!Double.isNaN(takeOffY) && player.getY() < takeOffY - 0.5) {
+                    found.add("from " + takeOffAt.toShortString() + " down to y=" + player.blockPosition().getY());
+                }
+                takeOffY = Double.NaN;
+            }
+            wasOnGround = onGround;
         }
     }
 

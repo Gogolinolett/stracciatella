@@ -12,10 +12,13 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.Blocks;
 import net.stracciatella.bot.BotController;
 import net.stracciatella.bot.behavior.BehaviorRunner;
+import net.stracciatella.bot.humanize.HumanBehavior;
 import net.stracciatella.bot.task.MineBlockTask;
 import net.stracciatella.miner.MinerConfig;
 import net.stracciatella.miner.MinerSetup;
 import net.stracciatella.miner.SpiralStairs;
+import net.stracciatella.pathfinding.place.PathPlacement;
+import net.stracciatella.pathfinding.travel.Journey;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
 import net.stracciatella.testing.api.TestSuite;
@@ -2616,6 +2619,204 @@ public class ChunkMinerTests {
         LOGGER.info("Chunk miner retried the obsidian without queuing the stone again ({})", status);
     }
 
+    // ================================================================
+    // Test 45: a floor block dug by mistake goes back in
+    // ================================================================
+
+    /**
+     * The overdig slip, forced: one column, the floor under it diggable slab
+     * work of the next layer down, ground under that, and cobblestone carried.
+     * The floor block has to come out with the column and go back in as
+     * cobblestone, and the bot must never stand in the hole meanwhile.
+     *
+     * <p>Stopped once the floor is back: the range has to reach the floor layer
+     * for the floor to be slab work at all, and the second slab would then dig
+     * the whole fixture floor out for real.
+     */
+    @MinecraftTest(name = "Chunk miner digs one too deep and puts the floor back",
+            timeoutTicks = 3000, order = 45, repeat = 3)
+    public void putsAnOverdugFloorBack(TestContext ctx) {
+        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
+                STAND_DX - 3, STAND_DX + 6, STAND_DZ - 3, STAND_DZ + 3);
+        // Ground under the floor, for the block dug by mistake to go back on.
+        fill(ctx, STAND_DX - 3, Y - 2, STAND_DZ - 3, STAND_DX + 6, Y - 2, STAND_DZ + 3, "stone");
+        final BlockPos feet = stand.offset(1, 0, 0);
+        final BlockPos head = stand.offset(1, 1, 0);
+        final BlockPos under = stand.offset(1, -1, 0);
+        setBlock(ctx, feet, "stone");
+        setBlock(ctx, head, "stone");
+        ctx.runCommand("give @s cobblestone 16");
+        ctx.waitFor(mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE) >= 16);
+
+        final boolean[] dug = {false};
+        final double[] lowestFeet = {Double.MAX_VALUE};
+        withSlips(ctx, 1.0, 0.0, () -> {
+            startChunkMiner(ctx, true, Y + 1, Y - 1);
+            ctx.waitFor(mc -> {
+                dug[0] |= mc.level.getBlockState(under).isAir();
+                lowestFeet[0] = Math.min(lowestFeet[0], mc.player.getY());
+                return !BehaviorRunner.isActive()
+                        || dug[0] && mc.level.getBlockState(under).is(Blocks.COBBLESTONE);
+            });
+        });
+
+        final String status = ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine());
+        if (!dug[0]) {
+            throw new AssertionError("The floor under the column was never dug out — run: " + status);
+        }
+        boolean refilled = ctx.computeOnClient(mc -> mc.level.getBlockState(under).is(Blocks.COBBLESTONE));
+        if (!refilled) {
+            throw new AssertionError("The floor dug out at " + under.toShortString()
+                    + " was not put back — run: " + status);
+        }
+        assertAir(ctx, feet, "column foot block");
+        assertAir(ctx, head, "column head block");
+        if (lowestFeet[0] < Y - 0.01) {
+            throw new AssertionError("The bot went down into the hole: feet at " + lowestFeet[0]
+                    + " against a floor at " + Y);
+        }
+        LOGGER.info("Chunk miner put the overdug floor back ({})", status);
+    }
+
+    // ================================================================
+    // Test 46: a step knocked out by mistake goes back in
+    // ================================================================
+
+    /**
+     * The stair slip, forced, on the staircase fixture of
+     * {@link #leavesAndMendsAStaircase}: in the lower slab both steps are low
+     * enough to be owed whether they stand or not, so every column there is
+     * followed by knocking one of them out and the repair putting it back.
+     *
+     * <p>Counted as the times a step goes from standing to air. The lower step
+     * goes once anyway — the descent digs it — so a slip is any further time
+     * for it, or any time at all for the top step, which nothing else touches.
+     * At the end both steps stand and the rest of the fixture is mined, the same
+     * as without the slip.
+     */
+    @MinecraftTest(name = "Chunk miner knocks out a step and puts it back",
+            timeoutTicks = 6000, order = 46, repeat = 3)
+    public void putsAKnockedOutStepBack(TestContext ctx) {
+        prepareWithFloor(ctx, STAIR_Y, 1, 0, 0, 7, 0, 1);
+        fill(ctx, 0, STAIR_Y - 3, 0, 7, STAIR_Y - 2, 1, "stone");
+        ctx.runCommand("give @s cobblestone 64");
+        final BlockPos lastFilled = new BlockPos(BASE_X + 7, STAIR_Y - 2, BASE_Z + 1);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastFilled).isAir());
+
+        final BlockPos topStep = new BlockPos(BASE_X, STAIR_Y - 1, BASE_Z);
+        final BlockPos dugStep = new BlockPos(BASE_X + 1, STAIR_Y - 2, BASE_Z);
+        final int[] gone = {0, 0};
+        final boolean[] wasAir = {false, false};
+        withSlips(ctx, 0.0, 1.0, () -> {
+            startChunkMiner(ctx, true, STAIR_Y + 1, STAIR_Y - 2);
+            ctx.waitFor(mc -> {
+                BlockPos[] steps = {topStep, dugStep};
+                for (int i = 0; i < steps.length; i++) {
+                    boolean air = mc.level.getBlockState(steps[i]).isAir();
+                    if (air && !wasAir[i]) {
+                        gone[i]++;
+                    }
+                    wasAir[i] = air;
+                }
+                return !BehaviorRunner.isActive();
+            });
+        });
+
+        if (ctx.computeOnClient(mc -> MinerSetup.chunkMiner().failed())) {
+            throw new AssertionError("Chunk miner aborted: "
+                    + ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine()));
+        }
+        int slips = gone[0] + Math.max(0, gone[1] - 1);
+        if (slips == 0) {
+            throw new AssertionError("No step was ever knocked out (top step gone " + gone[0]
+                    + " times, lower step " + gone[1] + ")");
+        }
+        assertNotAir(ctx, topStep, "the staircase's top step");
+        assertNotAir(ctx, dugStep, "the staircase's lower step");
+        for (int dx = 0; dx <= 7; dx++) {
+            for (int dz = 0; dz <= 1; dz++) {
+                for (int y = STAIR_Y - 2; y <= STAIR_Y + 1; y++) {
+                    BlockPos cell = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (cell.equals(topStep) || cell.equals(dugStep)) {
+                        continue;
+                    }
+                    assertAir(ctx, cell, "cell beside the staircase");
+                }
+            }
+        }
+        LOGGER.info("Chunk miner knocked out {} steps and put every one back", slips);
+    }
+
+    // ================================================================
+    // Test 47: the staircase reaches the ground the run started below
+    // ================================================================
+
+    /**
+     * A pit dug from below the ground around it, the way a real run left one:
+     * started at y=102 with the ground round the chunk at 107 to 111, and every
+     * walk back from a restock ending in {@code no way towards}. Here a hill
+     * stands against the east edge six blocks over the run's top floor —
+     * twice what a mesh edge drops — so without a way up to it the staircase
+     * ends in a wall.
+     *
+     * <p>The ramp's steps for the six layers up the hill cover both halves of
+     * the job: the two in the top slab are air and have to be built against
+     * the hill, the four above the range stand in ground the way out has to dig
+     * through, the last of it out of reach from the floor, so the bot climbs
+     * what it has built. Two slabs, so it then has to come back down the
+     * stairs before the descent rather than dig through them. The lower
+     * slab's step stands already, as rock would: rebuilding a missing one is
+     * another test's business.
+     *
+     * <p>Asserted the way a restock uses it: once the run is done, a journey
+     * from the hill top reaches the pit floor. Placement is off for that walk,
+     * so a bridge cannot stand in for the stairs.
+     */
+    @MinecraftTest(name = "Chunk miner builds its way out up to the ground",
+            timeoutTicks = 6000, order = 47, repeat = 3)
+    public void buildsItsWayOutUpToTheGround(TestContext ctx) {
+        prepareWithFloor(ctx, 12, 6, 9, 15, 2, 9);
+        // The pit floor under the range, the lower slab's step, the hill
+        // outside the east edge, and ground over the range where the way out
+        // climbs through it.
+        fill(ctx, 9, Y - 3, 2, 15, Y - 3, 9, "stone");
+        setBlock(ctx, new BlockPos(BASE_X + 15, Y - 2, BASE_Z + 7), "stone");
+        fill(ctx, 16, Y - 3, -3, 18, Y + 5, 12, "stone");
+        fill(ctx, 15, Y + 2, 0, 15, Y + 7, 3, "stone");
+        ctx.runCommand("give @s cobblestone 64");
+        final BlockPos hillCorner = new BlockPos(BASE_X + 18, Y + 5, BASE_Z + 12);
+        final BlockPos ground = new BlockPos(BASE_X + 15, Y + 7, BASE_Z);
+        ctx.waitFor(mc -> !mc.level.getBlockState(hillCorner).isAir()
+                && !mc.level.getBlockState(ground).isAir());
+
+        final boolean placementWasAllowed = PathPlacement.isAvailable();
+        final net.minecraft.world.level.ChunkPos chunk =
+                new net.minecraft.world.level.ChunkPos(new BlockPos(BASE_X, Y, BASE_Z));
+        try {
+            runChunkMiner(ctx, Y + 1, Y - 2, true);
+
+            for (int y = Y; y <= Y + 5; y++) {
+                assertNotAir(ctx, SpiralStairs.stepAt(chunk, y), "step of the way out");
+            }
+            ctx.runOnClient(mc -> PathPlacement.setAllowed(false));
+            standAt(ctx, new BlockPos(BASE_X + 17, Y + 6, BASE_Z));
+            final BlockPos pitFloor = new BlockPos(BASE_X + 12, Y - 2, BASE_Z + 6);
+            ctx.runOnClient(mc -> Journey.start(pitFloor));
+            ctx.waitFor(mc -> Journey.status() != Journey.Status.RUNNING);
+            if (Journey.status() != Journey.Status.ARRIVED) {
+                throw new AssertionError("No way back into the pit from the hill: " + Journey.failReason());
+            }
+            LOGGER.info("Chunk miner left a way out the journey walked back in by");
+        } finally {
+            ctx.runOnClient(mc -> {
+                Journey.stop();
+                PathPlacement.setAllowed(placementWasAllowed);
+            });
+            fill(ctx, 16, Y - 3, -3, 18, Y + 5, 12, "air");
+            fill(ctx, 15, Y + 2, 0, 15, Y + 7, 3, "air");
+        }
+    }
+
     private static String shortList(Set<BlockPos> cells) {
         return cells.isEmpty() ? "nowhere"
                 : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());
@@ -2656,6 +2857,10 @@ public class ChunkMinerTests {
         ctx.runOnClient(mc -> {
             BehaviorRunner.stop();
             BotController.stop();
+            // A deliberate overdig or knocked-out step would be a block the
+            // fixture's assertions never expected; the tests for those turn
+            // their own chance up.
+            HumanBehavior.suppressBlunders(true);
         });
         ctx.runCommand("clear @s");
         ctx.runCommand("kill @e[type=item]");
@@ -2738,6 +2943,32 @@ public class ChunkMinerTests {
         setBlock(ctx, liquid, block);
         startChunkMiner(ctx, true, Y + 1, Y);
         ctx.runCommand("tick unfreeze");
+    }
+
+    /**
+     * Run {@code body} with the deliberate slips switched on at the given
+     * chances, everything restored afterwards — the suite reads the player's
+     * own config, and every other test runs with the slips suppressed.
+     */
+    private void withSlips(TestContext ctx, double overdig, double stairSlip, Runnable body) {
+        final double configuredOverdig = MinerSetup.CONFIG.chunkMinerOverdigChance;
+        final double configuredSlip = MinerSetup.CONFIG.chunkMinerStairSlipChance;
+        ctx.runOnClient(mc -> {
+            MinerSetup.CONFIG.chunkMinerOverdigChance = overdig;
+            MinerSetup.CONFIG.chunkMinerStairSlipChance = stairSlip;
+            HumanBehavior.suppressBlunders(false);
+        });
+        try {
+            body.run();
+        } finally {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+                MinerSetup.CONFIG.chunkMinerOverdigChance = configuredOverdig;
+                MinerSetup.CONFIG.chunkMinerStairSlipChance = configuredSlip;
+                HumanBehavior.suppressBlunders(true);
+            });
+        }
     }
 
     /** Run {@code body} with an extra blacklist entry, restored afterwards. */
