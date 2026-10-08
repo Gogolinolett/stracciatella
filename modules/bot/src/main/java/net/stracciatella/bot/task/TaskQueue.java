@@ -50,16 +50,25 @@ public class TaskQueue {
         BotTask best = null;
         double bestCost = Double.MAX_VALUE;
         for (BotTask task : queue) {
-            BlockPos target = task.targetPos();
-            Vec3 toTarget = Vec3.atCenterOf(target).subtract(eye).normalize();
-            double turn = Math.acos(Math.max(-1.0, Math.min(1.0, toTarget.dot(view)))) / Math.PI;
-            double cost = Math.sqrt(target.distSqr(from)) + TURN_COST_BLOCKS * turn;
+            double cost = distanceWithTurn(task.targetPos(), from, eye, view);
             if (cost < bestCost) {
                 bestCost = cost;
                 best = task;
             }
         }
         return best;
+    }
+
+    /**
+     * How far {@code target} counts for a person standing on the block
+     * {@code from} with the eye at {@code eye} looking along {@code view}: the
+     * distance, plus {@link #TURN_COST_BLOCKS} for a target straight behind and
+     * half that for one to the side.
+     */
+    public static double distanceWithTurn(BlockPos target, BlockPos from, Vec3 eye, Vec3 view) {
+        Vec3 toTarget = Vec3.atCenterOf(target).subtract(eye).normalize();
+        double turn = Math.acos(Math.max(-1.0, Math.min(1.0, toTarget.dot(view)))) / Math.PI;
+        return Math.sqrt(target.distSqr(from)) + TURN_COST_BLOCKS * turn;
     }
 
     /** {@link #peekNearest}, and take it. */

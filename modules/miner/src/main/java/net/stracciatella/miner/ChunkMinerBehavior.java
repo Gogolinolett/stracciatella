@@ -7,6 +7,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
 
 import net.minecraft.client.Minecraft;
@@ -23,6 +24,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
@@ -146,6 +148,8 @@ public class ChunkMinerBehavior implements BotBehavior {
     private static final int EXIT_WALK_HEADROOM = 2;
     /** The farthest a bot walks down off the top step onto the ground outside: the mesh's drop. */
     private static final int EXIT_MAX_DROP = 3;
+    /** The farthest below the top step the ground outside may lie for the walk back in: the mesh's climb. */
+    private static final int EXIT_MAX_CLIMB = 1;
     private static final int NO_EXIT = Integer.MIN_VALUE;
     /**
      * How far from the chunk edge the block lies that brings the bot back down
@@ -189,8 +193,13 @@ public class ChunkMinerBehavior implements BotBehavior {
     // A stair slip rolled when the last column was planned, carried out once
     // that column's batch is done; see tickClear.
     private boolean stairSlipOwed;
-    // A cell broken by mistake — a knocked-out step, a floor block dug too
-    // deep — that goes back in once the server has settled its break; see
+    // The block past the chunk border a column at the edge digs into by
+    // mistake, rolled when the column is planned and dug once its batch is
+    // done; then the same block, owed back once its break has settled.
+    private BlockPos overreachOwed;
+    private BlockPos overreachRebuild;
+    // A cell broken by mistake — a knocked-out step, a block dug past the
+    // border — that goes back in once the server has settled its break; see
     // tickClear. The sweep holds until then.
     private BlockPos putBack;
     private int putBackWaitTicks;
@@ -209,7 +218,7 @@ public class ChunkMinerBehavior implements BotBehavior {
     // column of the slab would repeat it.
     private boolean stairFillerWarned;
     private int stepRetries;
-    private int breatherTicks;
+    private HumanBehavior.Breather breather = HumanBehavior.Breather.NONE;
 
     private int blocksMined;
     private String failReason;
@@ -337,6 +346,8 @@ public class ChunkMinerBehavior implements BotBehavior {
         sweepColumn = null;
         slabSwept = false;
         stairSlipOwed = false;
+        overreachOwed = null;
+        overreachRebuild = null;
         putBack = null;
         putBackWaitTicks = 0;
         exitChecked = false;
@@ -345,7 +356,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         stepsWithoutSupport.clear();
         stairFillerWarned = false;
         stepRetries = 0;
-        breatherTicks = 0;
+        breather = HumanBehavior.Breather.NONE;
         blocksMined = 0;
         failReason = null;
         dropWaitTicks = 0;
@@ -471,8 +482,13 @@ public class ChunkMinerBehavior implements BotBehavior {
         // out, but a pause on every column *is* an even cadence, and since
         // planning is what releases COLLECTING it sat in the critical path of
         // every column: measured at 3-6 ticks each, on top of the collect.
-        if (breatherTicks > 0) {
-            breatherTicks--;
+        // The controller holds it, because what the gaze does in a pause is
+        // the controller's: the camera stood still for all of it before.
+        if (breather.ticks() > 0) {
+            BotController.pauseBetweenWork(breather);
+            breather = HumanBehavior.Breather.NONE;
+        }
+        if (BotController.isPausing()) {
             return BehaviorStatus.RUNNING;
         }
 
@@ -630,8 +646,19 @@ public class ChunkMinerBehavior implements BotBehavior {
      *
      * <p>On level ground that is the run's own top step and nothing gets built:
      * the cells over it are the top slab, already mined.
+     *
+     * <p>The way out is also the way back in, and in is up: a restock that
+     * teleports out walks back from the spawn, and a mesh edge climbs one
+     * block. Ground two or three under the top step is a drop out and a wall
+     * in — a real return trip found no way onto the stairs, took the cave
+     * beside the pit for the nearest it could get and was stuck there. So a
+     * layer whose ground outside lies more than {@link #EXIT_MAX_CLIMB} below
+     * is climbed past for one further up the terrain that is level with its
+     * step, and is the way out only where there is no such layer — said so
+     * in the log, the walk back in being the restock's to fail.
      */
     private int findExitTop(Level level) {
+        int oneWay = NO_EXIT;
         for (int y = fromY - 2; y < level.getMaxY() - EXIT_CLIMB_HEADROOM; y++) {
             BlockPos step = SpiralStairs.stepAt(chunk, y);
             int lowestGround = y > fromY - 2 ? fromY - 2 : y - EXIT_MAX_DROP;
@@ -640,22 +667,33 @@ public class ChunkMinerBehavior implements BotBehavior {
                 BlockPos beside = step.offset(d[0], 0, d[1]);
                 if (isWalkSpace(level, beside.above()) && isWalkSpace(level, beside.above(2))
                         && isUnderSky(level, beside.above())) {
-                    if (hasGroundWithinDrop(level, beside, lowestGround)) {
+                    int down = groundDrop(level, beside, lowestGround);
+                    if (down < 0) {
+                        drop = true;
+                    } else if (down <= EXIT_MAX_CLIMB) {
                         if (y > fromY - 2) {
                             LOGGER.info("Chunk miner: the way out of the pit climbs to {}", shortPos(step));
                         }
                         return y;
+                    } else if (oneWay == NO_EXIT) {
+                        oneWay = y;
                     }
-                    drop = true;
                 }
             }
             if (drop) {
+                if (oneWay != NO_EXIT) {
+                    break;
+                }
                 LOGGER.info("Chunk miner: the staircase meets an open drop beside {}, no way out to build",
                         shortPos(step));
                 return NO_EXIT;
             }
         }
-        return NO_EXIT;
+        if (oneWay != NO_EXIT) {
+            LOGGER.warn("Chunk miner: the way out at {} drops to the ground outside, and there is no way back"
+                    + " in on foot", shortPos(SpiralStairs.stepAt(chunk, oneWay)));
+        }
+        return oneWay;
     }
 
     /** Room for a body: nothing to collide with and no liquid. */
@@ -677,20 +715,21 @@ public class ChunkMinerBehavior implements BotBehavior {
     }
 
     /**
-     * Whether a body stepping onto {@code beside} lands on ground no more than
-     * the mesh's drop down and no lower than {@code lowestGround}.
+     * How far a body stepping onto {@code beside} drops to the ground: the
+     * blocks down to the first sturdy floor, no more than the mesh's drop and
+     * no lower than {@code lowestGround}; -1 where there is no such floor.
      */
-    private static boolean hasGroundWithinDrop(Level level, BlockPos beside, int lowestGround) {
+    private static int groundDrop(Level level, BlockPos beside, int lowestGround) {
         for (int k = 0; k <= EXIT_MAX_DROP && beside.getY() - k >= lowestGround; k++) {
             BlockPos floor = beside.below(k);
             if (level.getBlockState(floor).isFaceSturdy(level, floor, Direction.UP)) {
-                return true;
+                return k;
             }
             if (!isWalkSpace(level, floor)) {
-                return false;
+                return -1;
             }
         }
-        return false;
+        return -1;
     }
 
     private static boolean touchesFluid(Level level, BlockPos pos) {
@@ -856,6 +895,16 @@ public class ChunkMinerBehavior implements BotBehavior {
             putBack = null;
             putBackWaitTicks = 0;
         }
+        // The block dug past the border goes back in from where the bot dug it,
+        // the way a person fills the hole they did not mean to make.
+        if (overreachRebuild != null) {
+            BlockPos cell = overreachRebuild;
+            overreachRebuild = null;
+            if (isPassable(level.getBlockState(cell))) {
+                LOGGER.info("Chunk miner: putting {} back", shortPos(cell));
+                return planPlacement(player, level, cell, "block dug past the border");
+            }
+        }
         // Groundwork that had nowhere to be clicked from while the column
         // stood is done now, through the opening that column left: a liquid
         // that was walled in when the column was planned, and the floor cell
@@ -888,6 +937,17 @@ public class ChunkMinerBehavior implements BotBehavior {
                 LOGGER.info("Chunk miner: knocking out the step at {} — it goes back in", shortPos(slip));
                 plan(List.of(slip));
                 putBack = slip;
+                return BehaviorStatus.RUNNING;
+            }
+        }
+        if (overreachOwed != null && plannedBlocks.isEmpty()) {
+            BlockPos cell = overreachOwed;
+            overreachOwed = null;
+            if (canOverreach(player, level, cell)) {
+                LOGGER.info("Chunk miner: digging {} past the chunk border — it goes back in", shortPos(cell));
+                plan(List.of(cell));
+                putBack = cell;
+                overreachRebuild = cell;
                 return BehaviorStatus.RUNNING;
             }
         }
@@ -961,14 +1021,9 @@ public class ChunkMinerBehavior implements BotBehavior {
         // be filled until the block above it is gone.
         if (isPassable(level.getBlockState(column.below()))) {
             groundworkAfterOpening = column;
-        } else if (HumanBehavior.blunder(config.chunkMinerOverdigChance) && canOverdig(player, level, column)) {
-            // One block too deep, the slip a person digging down a corridor
-            // makes, and the floor goes straight back in: the groundwork that
-            // fills a hole under a column fills this one too.
-            blocks.add(column.below());
-            groundworkAfterOpening = column;
-            putBack = column.below();
-            LOGGER.info("Chunk miner: digging {} one too deep — it goes back in", shortPos(column.below()));
+        }
+        if (HumanBehavior.blunder(config.chunkMinerOverreachChance)) {
+            overreachOwed = pastTheBorder(level, column);
         }
         // Keep the queue stocked past the end of this column. The controller
         // only skips the collect-and-replan round when another task is already
@@ -1008,77 +1063,101 @@ public class ChunkMinerBehavior implements BotBehavior {
             }
         }
         plan(blocks);
-        breatherTicks = HumanBehavior.randomBreatherTicks(BotController.CONFIG);
+        breather = HumanBehavior.randomBreather(BotController.CONFIG);
         stairSlipOwed |= HumanBehavior.blunder(config.chunkMinerStairSlipChance);
         return BehaviorStatus.RUNNING;
     }
 
     /**
-     * Whether the floor block under {@code column} may be dug out by mistake:
-     * the bot is working the slab, the block is diggable slab work of the next
-     * layer down and no step, nothing liquid touches it, solid ground under it
-     * holds the block that goes back in, and there is filler to put back.
+     * The block just past the chunk border beside {@code column}, at its foot
+     * or its head, for a column on the chunk's edge; null for one inside it.
+     * Only a whole block that is there to dig: a person who digs one too far
+     * into the wall digs into rock, not into the air of a cave or the pit
+     * next door.
      */
-    private boolean canOverdig(LocalPlayer player, Level level, BlockPos column) {
-        BlockPos cell = column.below();
-        if (player.blockPosition().getY() != slabFeetY || cell.getY() < toY
-                || !isDiggable(level.getBlockState(cell)) || SpiralStairs.isStairCell(chunk, cell)
-                || InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
-            return false;
-        }
-        BlockPos under = cell.below();
-        if (!level.getBlockState(under).isFaceSturdy(level, under, Direction.UP)) {
-            return false;
-        }
+    private BlockPos pastTheBorder(Level level, BlockPos column) {
+        List<BlockPos> beyond = new ArrayList<>();
         for (Direction side : Direction.Plane.HORIZONTAL) {
+            for (BlockPos cell : new BlockPos[] {column.relative(side), column.above().relative(side)}) {
+                if (!chunk.equals(new ChunkPos(cell)) && level.getBlockState(cell).isCollisionShapeFullBlock(level, cell)) {
+                    beyond.add(cell);
+                }
+            }
+        }
+        return beyond.isEmpty() ? null : beyond.get(ThreadLocalRandom.current().nextInt(beyond.size()));
+    }
+
+    /**
+     * Whether the block past the border may be dug out by mistake from where
+     * the bot stands now: diggable, no block entity, nothing liquid touching
+     * it, and neither it nor what rests on it a block that falls — the hole is
+     * filled again a moment later, and only a hole that stays as it was dug
+     * can be — and then the same as a stair slip ({@link #canDigByMistake}).
+     */
+    private boolean canOverreach(LocalPlayer player, Level level, BlockPos cell) {
+        BlockState state = level.getBlockState(cell);
+        if (!isDiggable(state) || state.hasBlockEntity() || state.getBlock() instanceof FallingBlock
+                || level.getBlockState(cell.above()).getBlock() instanceof FallingBlock) {
+            return false;
+        }
+        for (Direction side : Direction.values()) {
             if (!level.getFluidState(cell.relative(side)).isEmpty()) {
                 return false;
             }
         }
-        return level.getFluidState(under).isEmpty();
+        return canDigByMistake(player, level, cell);
     }
 
     /**
      * A step of the staircase to knock out by mistake and rebuild: one of the
      * current slab's two layers, low enough in the range that it is a step
      * whether or not it is standing (so {@link #repairStairs} owes it back),
-     * standing and diggable, in reach and in sight, clear of the bot's body, with filler
-     * carried and a face to build it back against that faces the bot. Null if there is none.
+     * and diggable by mistake from where the bot stands. Null if there is none.
      */
     private BlockPos slipCandidate(LocalPlayer player, Level level) {
-        if (player.blockPosition().getY() != slabFeetY
-                || InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
-            return null;
-        }
-        Vec3 eye = player.getEyePosition();
         for (int y = slabFeetY; y <= slabFeetY + 1; y++) {
             if (y > fromY - 2 || y < toY) {
                 continue;
             }
             BlockPos step = SpiralStairs.stepAt(chunk, y);
-            // In sight from where the bot stands, too: a slip it has to walk
-            // for is no slip, and one that fails to break fails the run.
-            if (!isDiggable(level.getBlockState(step))
-                    || eye.distanceTo(Vec3.atCenterOf(step)) > BotController.CONFIG.reachDistance - 0.5
-                    || player.getBoundingBox().inflate(0.3).intersects(new AABB(step))
-                    || columnInTheWay(player, level, step) != null) {
-                continue;
-            }
-            // And put back from here: the face it goes back against has to face
-            // the eye. From the row beside the step the only support can be the
-            // block next to it, whose face toward the step then points away, and
-            // the rebuild stared at that block's side until its look timed out —
-            // twice, and the run ended on a step it could not put back.
-            BlockPos support = PlaceBlockTask.findSupport(level, step, eye);
-            if (support != null) {
-                Vec3 normal = Vec3.atLowerCornerOf(step.subtract(support));
-                Vec3 face = Vec3.atCenterOf(support).add(normal.scale(0.5));
-                if (eye.subtract(face).dot(normal) >= SLIP_FACE_CLEARANCE) {
-                    return step;
-                }
+            if (isDiggable(level.getBlockState(step)) && canDigByMistake(player, level, step)) {
+                return step;
             }
         }
         return null;
+    }
+
+    /**
+     * Whether {@code cell} can be dug out by mistake and put back from where
+     * the bot stands: the bot works from the slab floor, carries filler, and
+     * has the cell in reach and in sight, clear of its body, with a face to
+     * build it back against that faces the eye.
+     */
+    private boolean canDigByMistake(LocalPlayer player, Level level, BlockPos cell) {
+        if (player.blockPosition().getY() != slabFeetY
+                || InventoryHelper.countMatching(player, fillerPredicate()) == 0) {
+            return false;
+        }
+        Vec3 eye = player.getEyePosition();
+        // In sight from where the bot stands, too: a slip it has to walk for is
+        // no slip, and one that fails to break fails the run.
+        if (eye.distanceTo(Vec3.atCenterOf(cell)) > BotController.CONFIG.reachDistance - 0.5
+                || player.getBoundingBox().inflate(0.3).intersects(new AABB(cell))
+                || columnInTheWay(player, level, cell) != null) {
+            return false;
+        }
+        // And put back from here: the face it goes back against has to face
+        // the eye. From the row beside a step the only support can be the
+        // block next to it, whose face toward the step then points away, and
+        // the rebuild stared at that block's side until its look timed out —
+        // twice, and the run ended on a step it could not put back.
+        BlockPos support = PlaceBlockTask.findSupport(level, cell, eye);
+        if (support == null) {
+            return false;
+        }
+        Vec3 normal = Vec3.atLowerCornerOf(cell.subtract(support));
+        Vec3 face = Vec3.atCenterOf(support).add(normal.scale(0.5));
+        return eye.subtract(face).dot(normal) >= SLIP_FACE_CLEARANCE;
     }
 
     /** How far in front of the face a step goes back against the eye has to be. */
@@ -1677,6 +1756,19 @@ public class ChunkMinerBehavior implements BotBehavior {
         double nextZ = invZ == Double.POSITIVE_INFINITY ? Double.POSITIVE_INFINITY
                 : invZ * (stepZ > 0 ? cz + 1 - z : z - cz);
         BlockPos footing = feet.below();
+        if (!isSturdyFloor(level, footing)) {
+            // Held up by the corners of the blocks round its own cell, which is
+            // where a diagonal bridge's step leaves the body — past two faces
+            // at once, over the next cell in. That cell goes first, off the
+            // block beside it under the body.
+            BlockPos beside = floorBeside(player, level, footing);
+            if (beside == null || !isPassable(level.getBlockState(footing))
+                    || !chunk.equals(new ChunkPos(footing))) {
+                return null;
+            }
+            LOGGER.info("Chunk miner: bridging the floor at {}", shortPos(footing));
+            return planPlacement(footing, beside, "floor");
+        }
         for (int laid = 0; laid < MAX_BRIDGE_STEPS; laid++) {
             // Beside the column is the end of the way, not within reach of it.
             // Reach is what the break needs; what falls out of the break needs
@@ -1709,6 +1801,23 @@ public class ChunkMinerBehavior implements BotBehavior {
                 return planPlacement(floor, footing, "floor");
             }
             footing = floor;
+        }
+        return null;
+    }
+
+    /**
+     * A floor block beside {@code cell}, under the bot's body, that a block in
+     * {@code cell} can be built off; null if there is none.
+     */
+    private static BlockPos floorBeside(LocalPlayer player, Level level, BlockPos cell) {
+        AABB body = player.getBoundingBox();
+        for (Direction side : Direction.Plane.HORIZONTAL) {
+            BlockPos floor = cell.relative(side);
+            if (isSturdyFloor(level, floor)
+                    && body.minX < floor.getX() + 1 && body.maxX > floor.getX()
+                    && body.minZ < floor.getZ() + 1 && body.maxZ > floor.getZ()) {
+                return floor;
+            }
         }
         return null;
     }

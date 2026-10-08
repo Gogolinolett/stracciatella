@@ -79,11 +79,12 @@ public class MinerConfig {
     // being the safety net they are here for.
     public boolean chunkMinerRestock = true;
 
-    // Blunders, chance per column; 0 switches one off. Digging the floor block
-    // under a finished column too and putting it back, and knocking out a step
-    // of the staircase in reach and rebuilding it — the slips a person makes,
-    // only ever where they can be undone.
-    public double chunkMinerOverdigChance = 0.01;
+    // Blunders, chance per column; 0 switches one off. Digging one block too
+    // far into the wall past the chunk border at a column on the edge and
+    // putting it back, and knocking out a step of the staircase in reach and
+    // rebuilding it — the slips a person makes, only ever where they can be
+    // undone.
+    public double chunkMinerOverreachChance = 0.02;
     public double chunkMinerStairSlipChance = 0.005;
 
     public void applyFrom(MinerConfig other) {
@@ -96,7 +97,7 @@ public class MinerConfig {
         this.chunkMinerBottomY = other.chunkMinerBottomY;
         this.chunkMinerMinFreeSlots = other.chunkMinerMinFreeSlots;
         this.chunkMinerRestock = other.chunkMinerRestock;
-        this.chunkMinerOverdigChance = other.chunkMinerOverdigChance;
+        this.chunkMinerOverreachChance = other.chunkMinerOverreachChance;
         this.chunkMinerStairSlipChance = other.chunkMinerStairSlipChance;
     }
 

@@ -2,10 +2,13 @@ package net.stracciatella.pathfinding.logic;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -42,6 +45,8 @@ public class ChunkMeshBuilder {
      * ground, which is what keeps a planned route on flat ground free of hops.
      */
     private static final int[] JUMP_SURCHARGE = {0, 0, 4, 12, 30, 55};
+    /** Added to a step onto a node for each side of it with a wall or a drop; see {@code besideCost}. */
+    private static final int BESIDE_COST = 3;
 
     public Mesh generatePathfindingMesh(ChunkAccess chunk, Entity entity) {
         return generatePathfindingMesh(chunk, entity, Integer.MIN_VALUE, Integer.MAX_VALUE);
@@ -141,6 +146,7 @@ public class ChunkMeshBuilder {
      */
     public void rebuildNeighbors(BlockGetter level, Function<BlockPos, MeshNode> nodes, Collection<MeshNode> toRebuild) {
         BlockPos.MutableBlockPos targetPos = new BlockPos.MutableBlockPos();
+        Map<MeshNode, Integer> besideCosts = new HashMap<>();
         for (MeshNode node : toRebuild) {
             List<Neighbor> neighbors = new ArrayList<>();
             BlockPos source = node.getBlockPos();
@@ -153,7 +159,9 @@ public class ChunkMeshBuilder {
                         targetPos.set(node.getX() + dx, node.getY() + dy, node.getZ() + dz);
                         MeshNode candidate = nodes.apply(targetPos);
                         if (candidate != null && isBlockReachable(level, source, targetPos)) {
-                            neighbors.add(new Neighbor(candidate, movementCost(dx, dz, dy)));
+                            int beside = dy != 0 ? 0
+                                    : besideCosts.computeIfAbsent(candidate, n -> besideCost(level, nodes, n));
+                            neighbors.add(new Neighbor(candidate, movementCost(dx, dz, dy) + beside));
                         }
                     }
                 }
@@ -278,6 +286,41 @@ public class ChunkMeshBuilder {
         int heightCost = dy > 0 ? dy * 5 : Math.abs(dy) * 2;
         int surcharge = JUMP_SURCHARGE[dy > 0 ? Math.max(gap, 2) : gap];
         return distance + surcharge + heightCost;
+    }
+
+    /**
+     * What a step onto {@code node} costs on top of its distance for the walls
+     * beside it: {@link #BESIDE_COST} for each side where the body would stand
+     * in something solid and no step a block up or down leads on. A person
+     * keeps off a wall where the ground leaves room; the shortest route runs
+     * along it, scraping the wall and rounding every corner by its edge. Small
+     * against a step's ten, so a margin is taken where one is to be had and a
+     * narrow way is still the way through.
+     *
+     * <p>Walls only, not drops, and only for a step on the level — walking
+     * along a wall is the scraping, landing at its foot is not. Charged for an
+     * edge to fall from, the node at a ledge cost more than a jump down from a
+     * node further back, and the walk jumped every ledge it used to step off;
+     * charged for the step down as well, the foot of a terrace is a wall seen
+     * from below and the same jump came back. A platform in the air charged at
+     * every edge moved where the parkour courses take off.
+     */
+    private static int besideCost(BlockGetter level, Function<BlockPos, MeshNode> nodes, MeshNode node) {
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        int cost = 0;
+        for (Direction side : Direction.Plane.HORIZONTAL) {
+            int x = node.getX() + side.getStepX();
+            int z = node.getZ() + side.getStepZ();
+            boolean open = false;
+            for (int dy = -1; dy <= 1 && !open; dy++) {
+                open = nodes.apply(cursor.set(x, node.getY() + dy, z)) != null;
+            }
+            if (!open && !(Terrain.isPassable(level, cursor.set(x, node.getY() + 1, z))
+                    && Terrain.isPassable(level, cursor.set(x, node.getY() + 2, z)))) {
+                cost += BESIDE_COST;
+            }
+        }
+        return cost;
     }
 
     private boolean isColumnClear(BlockGetter level, int x, int y, int z, int headroom) {

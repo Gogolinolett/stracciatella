@@ -141,6 +141,75 @@ public final class Terrain {
         return true;
     }
 
+    /**
+     * {@link #isStraightWalk}, but over ground that rises and falls a block at a
+     * time: the floor under the centre of the body may step up or down one
+     * block from one sample to the next, the floor under either edge may lie a
+     * block above or below the centre's, and a step up has room overhead for
+     * the hop onto it. Rolling ground is crossed on the same straight line as
+     * flat ground — held to one level, the line broke at every patch edge into
+     * the grid's straight and diagonal steps.
+     */
+    public static boolean isGroundWalk(BlockGetter level, Entity entity, double fromX, double fromZ,
+                                       double toX, double toZ, int floorY, int headroom) {
+        double dx = toX - fromX;
+        double dz = toZ - fromZ;
+        double length = Math.sqrt(dx * dx + dz * dz);
+        int steps = Math.max(1, (int) Math.ceil(length / LINE_SAMPLE_STEP));
+        double sideX = length < 1.0e-6 ? 0.0 : -dz / length * BODY_HALF_WIDTH;
+        double sideZ = length < 1.0e-6 ? 0.0 : dx / length * BODY_HALF_WIDTH;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        int floor = floorY;
+        int prevX = (int) Math.floor(fromX);
+        int prevZ = (int) Math.floor(fromZ);
+        for (int i = 0; i <= steps; i++) {
+            double t = (double) i / steps;
+            int x = (int) Math.floor(fromX + dx * t);
+            int z = (int) Math.floor(fromZ + dz * t);
+            int found = Integer.MIN_VALUE;
+            for (int rise : new int[] {0, 1, -1}) {
+                if (hasRoomOn(level, entity, pos, x, floor + rise, z, headroom)) {
+                    found = floor + rise;
+                    break;
+                }
+            }
+            if (found == Integer.MIN_VALUE) {
+                return false;
+            }
+            // The hop onto a block one up takes off from the cell before it.
+            if (found > floor && !isPassable(level, pos.set(prevX, floor + headroom + 1, prevZ))) {
+                return false;
+            }
+            floor = found;
+            prevX = x;
+            prevZ = z;
+            for (int side = -1; side <= 1; side += 2) {
+                int sx = (int) Math.floor(fromX + dx * t + sideX * side);
+                int sz = (int) Math.floor(fromZ + dz * t + sideZ * side);
+                if (!hasRoomOn(level, entity, pos, sx, floor, sz, headroom)
+                        && !hasRoomOn(level, entity, pos, sx, floor + 1, sz, headroom)
+                        && !hasRoomOn(level, entity, pos, sx, floor - 1, sz, headroom)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** A standable floor at {@code (x, floorY, z)} with {@code headroom} passable cells over it. */
+    private static boolean hasRoomOn(BlockGetter level, Entity entity, BlockPos.MutableBlockPos pos,
+                                     int x, int floorY, int z, int headroom) {
+        if (!isStandable(level, pos.set(x, floorY, z), entity)) {
+            return false;
+        }
+        for (int up = 1; up <= headroom; up++) {
+            if (!isPassable(level, pos.set(x, floorY + up, z))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Collision-free blocks that a body must still not walk into. */
     private static boolean isHazard(BlockState state) {
         return state.is(Blocks.FIRE)

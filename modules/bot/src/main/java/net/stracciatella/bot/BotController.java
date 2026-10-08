@@ -16,6 +16,7 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.util.Mth;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -100,6 +101,29 @@ public class BotController {
     private static boolean forceApproach = false;
     private static int wrongHitStreak = 0;
     private static BlockPos lastWrongHit = null;
+    // The last block placed, so that the next one laid off it can tell a
+    // bridge that runs straight from one that runs diagonally (bridgeSide).
+    private static PlaceBlockTask lastLaid = null;
+    // A pause between two pieces of work — a behavior's breather, or the
+    // controller's own delay before it acts — and what the gaze does in it:
+    // ticks left, its length, whether the player is away (tabbed out, the
+    // camera not touched at all), and where a glance looks, if it has one.
+    private static int pauseLeft = 0;
+    private static int pauseLength = 0;
+    private static boolean pauseAway = false;
+    private static Vec3 glanceAt = null;
+    /** A pause shorter than this has no time to look round in. */
+    private static final int GLANCE_MIN_TICKS = 20;
+    /** Ticks into a pause before a glance sets off, and before its end that it comes back. */
+    private static final int GLANCE_SETTLE_TICKS = 4;
+    private static final int GLANCE_RETURN_TICKS = 6;
+    /** How far a glance turns off the work, and how far up or down it looks, in degrees. */
+    private static final double GLANCE_YAW_MIN = 30.0;
+    private static final double GLANCE_YAW_MAX = 100.0;
+    private static final double GLANCE_PITCH_MIN = -15.0;
+    private static final double GLANCE_PITCH_MAX = 25.0;
+    /** How far out the point a glance looks at lies, which only sets its direction. */
+    private static final double GLANCE_DISTANCE = 6.0;
     /**
      * How close POSITIONING walks before it hands over to LOOKING — where the
      * bot <em>works</em> from, as opposed to the farthest place it could still
@@ -135,6 +159,15 @@ public class BotController {
      * heading.
      */
     private static final double CONTACT_DISTANCE = 1.0;
+    /**
+     * How far off the middle of the block it stands on the body may be to dig
+     * that block out from under itself: the 0.6-wide hitbox then lies inside
+     * the column with a twentieth of a block to spare and drops straight
+     * through once the block is gone.
+     */
+    private static final double UNDERFOOT_SLACK = 0.15;
+    /** Ticks LOOKING waits for the body to get there before it digs regardless. */
+    private static final int UNDERFOOT_CENTRE_TICKS = 20;
     /**
      * Layers meshed above the higher and below the lower of the bot's and the
      * target's height for a walk. A band rather than the whole column, because
@@ -560,8 +593,68 @@ public class BotController {
         forgetRow();
         lookRetryUsed = false;
         forceApproach = false;
+        lastLaid = null;
+        pauseLeft = 0;
+        pauseAway = false;
+        glanceAt = null;
         releaseMovementKeys();
         LOGGER.info("Bot stopped");
+    }
+
+    /**
+     * A behavior pausing between two pieces of work: the bot stands, and the
+     * gaze does what a person's does in a pause — rests on the work with its
+     * small tremor, or in a long enough pause, now and then
+     * ({@code pauseGlanceChance}), looks off somewhere and comes back. Away
+     * from the game — tabbed out — the camera is not touched at all.
+     */
+    public static void pauseBetweenWork(HumanBehavior.Breather breather) {
+        startPause(Minecraft.getInstance().player, breather.ticks(), breather.away());
+    }
+
+    /**
+     * Whether a behavior's pause is still running, so it can wait it out. Only
+     * while idle: the controller's own delays before it acts run inside a task.
+     */
+    public static boolean isPausing() {
+        return phase == Phase.IDLE && pauseLeft > 0;
+    }
+
+    private static void startPause(LocalPlayer player, int ticks, boolean away) {
+        pauseLeft = ticks;
+        pauseLength = ticks;
+        pauseAway = away;
+        glanceAt = null;
+        if (!away && player != null && ticks >= GLANCE_MIN_TICKS
+                && HumanBehavior.blunder(CONFIG.pauseGlanceChance)) {
+            java.util.concurrent.ThreadLocalRandom random = java.util.concurrent.ThreadLocalRandom.current();
+            float yaw = player.getYRot() + (random.nextBoolean() ? 1 : -1)
+                    * (float) random.nextDouble(GLANCE_YAW_MIN, GLANCE_YAW_MAX);
+            float pitch = (float) random.nextDouble(GLANCE_PITCH_MIN, GLANCE_PITCH_MAX);
+            glanceAt = player.getEyePosition().add(Vec3.directionFromRotation(pitch, yaw).scale(GLANCE_DISTANCE));
+        }
+    }
+
+    /**
+     * The gaze through a pause: off at the glance in its middle, where it has
+     * one, and otherwise on the last aim point, where the camera's saccades
+     * keep it from freezing — a person at the keyboard never holds the mouse
+     * dead still, and the bot's pauses read as stop-motion while it did. Away
+     * from the game it is the other way round: a tabbed-out player's view does
+     * not move by a hair, so the camera is not driven at all.
+     */
+    private static void pauseGaze(LocalPlayer player) {
+        if (camera != null && !pauseAway) {
+            int elapsed = pauseLength - pauseLeft;
+            if (glanceAt != null && elapsed >= GLANCE_SETTLE_TICKS && pauseLeft > GLANCE_RETURN_TICKS) {
+                camera.aimAt(player, glanceAt.x, glanceAt.y, glanceAt.z);
+            } else if (hasLastAim) {
+                camera.aimAt(player, lastAimX, lastAimY, lastAimZ);
+            }
+        }
+        if (pauseLeft > 0) {
+            pauseLeft--;
+        }
     }
 
     public static void pause() {
@@ -572,6 +665,7 @@ public class BotController {
         // it was in and re-derives the next transition naturally.
         deferredAction = null;
         deferredActionDelay = 0;
+        pauseLeft = 0;
         releaseMovementKeys();
         // A meal in progress is abandoned with the button; EATING picks it up
         // again on resume, from the start.
@@ -663,6 +757,11 @@ public class BotController {
         }
 
         if (paused || phase == Phase.IDLE) {
+            // A behavior's pause between two pieces of work: the bot stands,
+            // the gaze does not freeze.
+            if (!paused && pauseLeft > 0) {
+                pauseGaze(player);
+            }
             return;
         }
 
@@ -674,9 +773,7 @@ public class BotController {
         // swing, saccading if enabled), because a gaze that halts mid-turn
         // and resumes N ticks later reads as stop-motion.
         if (deferredActionDelay > 0) {
-            if (camera != null && hasLastAim) {
-                camera.aimAt(player, lastAimX, lastAimY, lastAimZ);
-            }
+            pauseGaze(player);
             deferredActionDelay--;
             if (deferredActionDelay == 0) {
                 Runnable action = deferredAction;
@@ -879,10 +976,19 @@ public class BotController {
             // Resting the gaze behind the bot removes both swings: the yaw is
             // already the one the placement needs, and it does not move again
             // until the bridge itself changes direction.
+            //
+            // Along a diagonal that direction is the diagonal. Its blocks go
+            // off the two axes by turns, a staircase, and looking back along
+            // each block's own face swung the gaze a quarter turn one way and
+            // back for every block — a bridge laid in a zigzag.
+            net.minecraft.core.Direction side = bridgeSide(client.level, currentTask);
+            double wayX = pinned.getStepX() + (side != null ? side.getStepX() : 0);
+            double wayZ = pinned.getStepZ() + (side != null ? side.getStepZ() : 0);
+            double wayLength = Math.sqrt(wayX * wayX + wayZ * wayZ);
             aimCameraAt(player,
-                    player.getX() - pinned.getStepX() * BRIDGE_LOOK_BACK,
+                    player.getX() - wayX / wayLength * BRIDGE_LOOK_BACK,
                     target.getY() + 0.5,
-                    player.getZ() - pinned.getStepZ() * BRIDGE_LOOK_BACK);
+                    player.getZ() - wayZ / wayLength * BRIDGE_LOOK_BACK);
             // Which makes the walk a backwards one, and the floor check has to
             // be asked about the gap rather than about the bridge already laid
             // behind. It says no from one block out, and by then the crouch is
@@ -903,10 +1009,15 @@ public class BotController {
             // onGround, and the back key held the entire time. Aiming the
             // walk at the support closes the sideways offset first and turns
             // into the rim step itself once the bot is over it.
-            double toX = target.getX() + 0.5 + pinned.getStepX() * EDGE_STEP_OVERHANG
-                    - player.getX();
-            double toZ = target.getZ() + 0.5 + pinned.getStepZ() * EDGE_STEP_OVERHANG
-                    - player.getZ();
+            //
+            // On a diagonal, at the support's corner: the eye there is past
+            // both the face this block goes off and the one the next block
+            // goes off, so the two are laid from one spot and the body steps
+            // from corner to corner straight along the diagonal. To the middle
+            // of each rim it went a block's width sideways and back between
+            // every two blocks.
+            double toX = target.getX() + 0.5 + wayX * EDGE_STEP_OVERHANG - player.getX();
+            double toZ = target.getZ() + 0.5 + wayZ * EDGE_STEP_OVERHANG - player.getZ();
             if (!bridging && !hasFloorToward(client, player, toX, toZ)) {
                 releaseMovementKeys();
                 return;
@@ -1078,6 +1189,14 @@ public class BotController {
         }
         double[] aim = workAim(client, player, currentTask);
         aimCameraAt(player, aim[0], aim[1], aim[2]);
+
+        // Digging out the block the body stands on: onto its middle first, so
+        // the body drops through the hole instead of staying up on the block
+        // beside it. Bounded; past that the dig goes ahead from where it is.
+        if (digsUnderfoot(player, currentTask) && !centreOverWork(client, player, target)
+                && phaseTicks <= UNDERFOOT_CENTRE_TICKS) {
+            return;
+        }
 
         // Single gate before transitioning to INTERACTING: the client's
         // raycast actually lands on the target block. A human starts mining
@@ -1394,7 +1513,8 @@ public class BotController {
      *   <li>the next block's aim point, when this block covers it
      *       ({@link #predictiveAim}) — one aim for both;</li>
      *   <li>otherwise a visible point on the least-turn face, leaning toward
-     *       the next target.</li>
+     *       the next target — or, for a block a bridge is built off, where the
+     *       view line meets the face ({@link #alongTheView}).</li>
      * </ol>
      *
      * The first three are for mining only: a placement's face is pinned and its
@@ -1417,7 +1537,44 @@ public class BotController {
             }
         }
         net.minecraft.core.Direction face = aimFace(client, task);
-        return visibleAimPoint(client, player, target, face, aimPoint(player, target, face, next));
+        double[] bridged = alongTheView(player, task);
+        return visibleAimPoint(client, player, target, face,
+                bridged != null ? bridged : aimPoint(player, target, face, next));
+    }
+
+    /**
+     * Where the view line meets the side face a bridge is built off, kept on
+     * the face: from past the rim the face lies below and behind the eye, and
+     * the gaze the edge step parked behind the bot already points most of the
+     * way onto it. Aimed at the face's own point instead, the yaw swung onto
+     * that face's axis for every block — along a diagonal, whose blocks go off
+     * the two axes by turns, a quarter turn each way per block. Null unless the
+     * eye is over the support's top and past the face's plane.
+     */
+    private static double[] alongTheView(LocalPlayer player, BotTask task) {
+        net.minecraft.core.Direction face = task.preferredFace();
+        BlockPos support = task.targetPos();
+        Vec3 eye = player.getEyePosition();
+        if (task.interactionType() != InteractionType.USE || face == null || face.getAxis().isVertical()
+                || eye.y <= support.getY() + 1.0) {
+            return null;
+        }
+        double past = pastFacePlane(eye, support, face);
+        if (past < 0.0) {
+            return null;
+        }
+        Vec3 look = player.getViewVector(1.0f);
+        double into = -(look.x * face.getStepX() + look.z * face.getStepZ());
+        Vec3 hit = into > 1.0e-3 ? eye.add(look.scale(past / into)) : eye;
+        double lo = AIM_EDGE_MARGIN;
+        double hi = 1.0 - AIM_EDGE_MARGIN;
+        double y = Mth.clamp(hit.y, support.getY() + lo, support.getY() + hi);
+        if (face.getAxis() == net.minecraft.core.Direction.Axis.X) {
+            return new double[] {support.getX() + (face.getStepX() > 0 ? 1.0 : 0.0), y,
+                    Mth.clamp(hit.z, support.getZ() + lo, support.getZ() + hi)};
+        }
+        return new double[] {Mth.clamp(hit.x, support.getX() + lo, support.getX() + hi), y,
+                support.getZ() + (face.getStepZ() > 0 ? 1.0 : 0.0)};
     }
 
     /**
@@ -1934,6 +2091,10 @@ public class BotController {
             if (lastBlock || !walkAlongRow(client, player, aimTask.targetPos())) {
                 releaseMovementKeys();
             }
+        } else if (digsUnderfoot(player, currentTask)) {
+            // Out from under itself the body stays over the middle: a step
+            // after a drop leaves it on the block beside the hole.
+            centreOverWork(client, player, target);
         } else if (!(policy.opportunisticCollection()
                         && tickOpportunisticCollection(client, player, target))
                 && !stepTowardWork(client, player, target)) {
@@ -2095,6 +2256,7 @@ public class BotController {
         // A placement drops nothing, so there is nothing to collect —
         // take the next task straight after the reaction beat.
         if (placing) {
+            lastLaid = currentTask instanceof PlaceBlockTask laid ? laid : null;
             scheduleAction(BotController::completeCurrentTask);
             return;
         }
@@ -2304,6 +2466,44 @@ public class BotController {
             return false;
         }
         return stepToward(client, player, target, target.getX() + 0.5, target.getZ() + 0.5);
+    }
+
+    /** Whether the task digs out the block the body is standing on. */
+    private static boolean digsUnderfoot(LocalPlayer player, BotTask task) {
+        return task.interactionType() == InteractionType.ATTACK && player.onGround()
+                && task.targetPos().equals(player.blockPosition().below());
+    }
+
+    /**
+     * Walk the body onto the middle of {@code target}, the block it stands on,
+     * and hold it there; true once it rests inside that block's column.
+     *
+     * <p>A person digging straight down steps onto the middle of the block
+     * first. The hitbox is 0.6 wide, so with the body's centre more than 0.2
+     * off the middle it reaches over the block beside it: the block under the
+     * centre went, the body stayed up on the neighbour, and the chunk miner —
+     * which digs whatever holds the bot up — took that one too. Reported as a
+     * two-by-one hole where one block would do.
+     *
+     * <p>The walk aims at where the body will come to rest, not where it is: a
+     * body let go of slides on by its speed over one minus the floor's
+     * friction, on stone more than twice its speed per tick, and one tick of
+     * walking from a third of a block off already gets it to the middle. Aimed
+     * at the rest point the same keys brake when it would slide past.
+     */
+    private static boolean centreOverWork(Minecraft client, LocalPlayer player, BlockPos target) {
+        Vec3 speed = player.getDeltaMovement();
+        double slide = 1.0 / (1.0 - client.level.getBlockState(target).getBlock().getFriction() * 0.91);
+        double offX = target.getX() + 0.5 - player.getX();
+        double offZ = target.getZ() + 0.5 - player.getZ();
+        double restX = offX - speed.x * slide;
+        double restZ = offZ - speed.z * slide;
+        if (Math.abs(restX) > UNDERFOOT_SLACK || Math.abs(restZ) > UNDERFOOT_SLACK) {
+            walkToward(client, player, restX, restZ);
+            return false;
+        }
+        releaseMovementKeys();
+        return Math.abs(offX) <= UNDERFOOT_SLACK && Math.abs(offZ) <= UNDERFOOT_SLACK;
     }
 
     /**
@@ -2670,7 +2870,16 @@ public class BotController {
         if (eye.y <= support.getY() + 1.0 || !isWithinReach(player, support)) {
             return false;
         }
-        return pastFacePlane(eye, support, face) < EDGE_STEP_CLEARANCE;
+        // On a diagonal the step goes to the support's corner, past the side
+        // the next block goes off as well; arrived at this face's plane alone,
+        // the body stopped short of the corner and the next block wanted a
+        // step of its own, sideways.
+        net.minecraft.core.Direction side = bridgeSide(player.level(), task);
+        double past = pastFacePlane(eye, support, face);
+        if (side != null) {
+            past = Math.min(past, pastFacePlane(eye, support, side));
+        }
+        return past < EDGE_STEP_CLEARANCE;
     }
 
     /**
@@ -2691,6 +2900,38 @@ public class BotController {
         }
         return pastFacePlane(player.getEyePosition(), task.targetPos(), task.preferredFace())
                 > -EDGE_STEP_APPROACH;
+    }
+
+    /**
+     * Which way a diagonal bridge runs besides the way {@code task} builds: the
+     * face the block before was laid off, where that block is this one's
+     * support and went off the other axis. A diagonal bridge is a staircase of
+     * blocks laid off the two axes by turns; null for a straight one, and null
+     * where a body has no room at the support's corner — the bridge's own end
+     * stood there once, the column it was laid to, and the step pressed into
+     * it for the whole position timeout.
+     */
+    private static net.minecraft.core.Direction bridgeSide(Level level, BotTask task) {
+        net.minecraft.core.Direction face = task.preferredFace();
+        if (lastLaid == null || face == null || face.getAxis().isVertical()
+                || !task.targetPos().equals(lastLaid.placePos())) {
+            return null;
+        }
+        net.minecraft.core.Direction before = lastLaid.preferredFace();
+        if (before == null || !before.getAxis().isHorizontal() || before.getAxis() == face.getAxis()) {
+            return null;
+        }
+        BlockPos support = task.targetPos();
+        for (BlockPos cell : new BlockPos[] {
+                support.relative(face), support.relative(before), support.relative(face).relative(before)}) {
+            for (int up = 1; up <= 2; up++) {
+                BlockPos body = cell.above(up);
+                if (!level.getBlockState(body).getCollisionShape(level, body).isEmpty()) {
+                    return null;
+                }
+            }
+        }
+        return before;
     }
 
     /**
@@ -3087,8 +3328,9 @@ public class BotController {
             // Reaction delay between "I've spotted it" and "I start walking".
             // Occasionally a longer breather — humans don't set off with a
             // machine-constant cadence every single time.
-            scheduleAction(BotController::beginNavigationFresh,
-                    HumanBehavior.randomTaskSwitchDelayTicks(CONFIG));
+            HumanBehavior.Breather breather = HumanBehavior.randomBreather(CONFIG);
+            scheduleAction(BotController::beginNavigationFresh, breather.ticks() > 0 ? breather
+                    : new HumanBehavior.Breather(HumanBehavior.randomReactionDelayTicks(CONFIG), false));
         }
     }
 
@@ -3277,21 +3519,23 @@ public class BotController {
      * old behaviour when humanness is disabled.
      */
     private static void scheduleAction(Runnable action) {
-        scheduleAction(action, HumanBehavior.randomReactionDelayTicks(CONFIG));
+        scheduleAction(action, new HumanBehavior.Breather(HumanBehavior.randomReactionDelayTicks(CONFIG), false));
     }
 
     /**
-     * Variant with an explicit delay for callers that draw from a different
+     * Variant with an explicit pause for callers that draw from a different
      * distribution (e.g. the occasional long "breather" pause at
-     * SCANNING→NAVIGATING).
+     * SCANNING→NAVIGATING, which may be spent away from the game).
      */
-    private static void scheduleAction(Runnable action, int delay) {
+    private static void scheduleAction(Runnable action, HumanBehavior.Breather pause) {
+        int delay = pause.ticks();
         if (delay <= 0) {
             action.run();
             return;
         }
         deferredAction = action;
         deferredActionDelay = delay;
+        startPause(Minecraft.getInstance().player, delay, pause.away());
         // Release any held movement input so the bot visibly pauses rather
         // than coasting forward into the delay. Interaction is left alone
         // because INTERACTING calls stopInteraction itself before scheduling.
@@ -3358,9 +3602,18 @@ public class BotController {
         LocalPlayer player = Minecraft.getInstance().player;
         BlockPos target = currentTask.targetPos();
 
-        // Already within reach — skip navigation. In reach is not the same as
-        // aimable, though: see beginNavigation.
-        if (isWithinReach(player, target) && !needsEdgeStep(player, currentTask)) {
+        // A face that only opens up from past the edge: straight into the step
+        // back to the rim. Looking at the target first, the way a walk starts,
+        // turned the bot round to face the gap — the support is the block it
+        // stands on — and the step turned it back again: half a turn out and
+        // back for every block of a bridge.
+        if (needsEdgeStep(player, currentTask)) {
+            transitionTo(Phase.POSITIONING);
+            return;
+        }
+
+        // Already within reach — skip navigation.
+        if (isWithinReach(player, target)) {
             transitionTo(Phase.LOOKING);
             return;
         }
@@ -3394,6 +3647,7 @@ public class BotController {
         phaseTicks = 0;
         deferredAction = null;
         deferredActionDelay = 0;
+        pauseLeft = 0;
         preAttackHesitationRemaining = -1;
         lookRetryUsed = false;
         forceApproach = false;

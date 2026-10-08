@@ -215,6 +215,48 @@ public class MeshTests {
     }
 
     /**
+     * A floor four wide with a wall along one side, and both ends of the route
+     * beside the wall. The shortest route scrapes the wall the whole way; a
+     * person walks a step off it. Asserts that no more of the route's inner
+     * steps than {@link #MAX_STEPS_BESIDE_WALL} run beside the wall.
+     */
+    @MinecraftTest(name = "Mesh plans a margin off a wall", timeoutTicks = 400, order = 65)
+    public void plansAMarginOffAWall(TestContext ctx) {
+        int z0 = ORIGIN_Z + 50;
+        BlockPos min = new BlockPos(ORIGIN_X + 1, ORIGIN_Y, z0);
+        BlockPos max = new BlockPos(ORIGIN_X + 14, ORIGIN_Y, z0 + 4);
+        BlockPos from = new BlockPos(ORIGIN_X + 1, ORIGIN_Y, z0 + 1);
+        BlockPos to = new BlockPos(ORIGIN_X + 14, ORIGIN_Y, z0 + 1);
+        BlockPos wallEnd = new BlockPos(max.getX(), ORIGIN_Y + 2, z0);
+        prepare(ctx, min, max);
+        fill(ctx, min, max, "stone");
+        fill(ctx, min.above(), max.above(4), "air");
+        fill(ctx, min.above(), wallEnd, "stone");
+        awaitBlock(ctx, wallEnd, Blocks.STONE);
+
+        List<BlockPos> path = freshPath(ctx, from, to);
+        if (path.size() < 3 || !path.get(0).equals(from) || !path.get(path.size() - 1).equals(to)) {
+            ctx.fail("no route from " + from.toShortString() + " to " + to.toShortString() + ": " + path);
+            return;
+        }
+        int beside = 0;
+        for (int i = 1; i < path.size() - 1; i++) {
+            if (path.get(i).getZ() == z0 + 1) {
+                beside++;
+            }
+        }
+        if (beside > MAX_STEPS_BESIDE_WALL) {
+            ctx.fail(beside + " of the route's " + (path.size() - 2) + " inner steps run beside the wall: "
+                    + path.stream().map(BlockPos::toShortString).toList());
+            return;
+        }
+        LOGGER.info("Route kept off the wall: {} of {} inner steps beside it", beside, path.size() - 2);
+    }
+
+    /** Steps beside the wall a route may take: the one off it and the one back. */
+    private static final int MAX_STEPS_BESIDE_WALL = 2;
+
+    /**
      * Creative, nothing walking, and both ends of the fixture loaded on the
      * client — the player standing above it is what keeps it resident on the
      * server too, see {@code JourneyTests.buildBridge}.

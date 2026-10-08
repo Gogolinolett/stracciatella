@@ -71,13 +71,16 @@ public final class Journey {
     }
 
     /**
-     * The traveller's rare slips, chance per leg: heading off to a point beside
+     * The traveller's quirks: chance per leg of heading off to a point beside
      * the way first (a detour — another way than the best one, still a walkable
-     * one), and standing still for a moment between two legs. Off for every
-     * journey but those whose caller asks — the bot's own trips.
+     * one) and of standing still for a moment between two legs, and chance per
+     * sprint-jump of looking off to the side in the air
+     * ({@link PathWalker#setTravelGlanceChance}). Off for every journey but
+     * those whose caller asks — the bot's own trips.
      */
-    public record Quirks(double detourChance, double pauseChance, int pauseMinTicks, int pauseMaxTicks) {
-        public static final Quirks NONE = new Quirks(0.0, 0.0, 0, 0);
+    public record Quirks(double detourChance, double pauseChance, int pauseMinTicks, int pauseMaxTicks,
+                         double glanceChance) {
+        public static final Quirks NONE = new Quirks(0.0, 0.0, 0, 0, 0.0);
     }
 
     /** How far ahead on the way a detour's point lies; only taken with twice that still to go. */
@@ -171,6 +174,8 @@ public final class Journey {
     private static int legLength;
     private static Quirks quirks = Quirks.NONE;
     private static int pauseTicks;
+    /** The floor cell the placement in flight is to fill. */
+    private static BlockPos bridgeCell;
 
     private Journey() {
     }
@@ -186,6 +191,7 @@ public final class Journey {
     public static void start(BlockPos destination, Quirks slips) {
         stop();
         quirks = slips;
+        PathWalker.setTravelGlanceChance(slips.glanceChance());
         LocalPlayer player = Minecraft.getInstance().player;
         if (player == null) {
             status = Status.FAILED;
@@ -219,6 +225,7 @@ public final class Journey {
         active = false;
         pending.clear();
         target = null;
+        PathWalker.setTravelGlanceChance(0.0);
     }
 
     public static boolean isActive() {
@@ -260,7 +267,7 @@ public final class Journey {
             case MESHING -> tickMeshing(player, level);
             case PLANNING -> tickPlanning(player, level);
             case WALKING -> tickWalking(player, level);
-            case PLACING -> tickPlacing(player);
+            case PLACING -> tickPlacing(player, level);
             case PAUSED -> {
                 if (--pauseTicks <= 0) {
                     phase = Phase.MESHING;
@@ -296,6 +303,20 @@ public final class Journey {
     private static void tickPlanning(LocalPlayer player, Level level) {
         MeshNode start = MeshManager.findOrBuildNearestNode(level, player, player.blockPosition());
         if (start == null) {
+            // The ground underfoot has not arrived yet: a journey started the
+            // moment a teleport lands is ahead of the chunks the server sends
+            // after it, and a restock's way from the spawn to the first barrel
+            // failed on that in the same tick it began. Waited for, the way a
+            // person waits for the world to load — until it is there, not for a
+            // set time, which a lagging server would outlast; the journey's own
+            // overall timeout is the only bound. A chunk that is there and
+            // still has no node is standing nowhere, as before.
+            BlockPos feet = player.blockPosition();
+            if (!MeshManager.isChunkLoaded(level, new ChunkCoordinate(feet.getX() >> 4, feet.getZ() >> 4))) {
+                queueCorridor(player);
+                phase = Phase.MESHING;
+                return;
+            }
             fail("standing where the mesh has no node at all");
             return;
         }
@@ -365,14 +386,21 @@ public final class Journey {
         endLeg(player, level, "walked out");
     }
 
-    private static void tickPlacing(LocalPlayer player) {
+    private static void tickPlacing(LocalPlayer player, Level level) {
         if (PathPlacement.isBusy()) {
             return;
         }
-        // The block is down (or the placement gave up — either way nothing is in
-        // flight). Re-read the world rather than assume: the next plan finds the
-        // step if it worked, and stalls again if it did not, which the stall
-        // counter then turns into a failure.
+        // The placement gave up and the cell is still open: the plan that asked
+        // for it comes to the same gap and asks again, every time — no leg ends
+        // in between, so no stall is ever counted. A real return trip spent ten
+        // minutes in a cave asking for one block it could not place, a ceiling
+        // too low to step out to the rim under.
+        if (!isSolidFloor(level, player, bridgeCell)) {
+            fail("could not bridge " + shortPos(bridgeCell) + " on the way towards " + shortPos(target));
+            return;
+        }
+        // The block is down. Re-read the world rather than assume: the next plan
+        // finds the step.
         queueCorridor(player);
         phase = Phase.MESHING;
     }
@@ -567,6 +595,7 @@ public final class Journey {
             if (isSolidFloor(level, player, candidate)) {
                 if (gap != null) {
                     LOGGER.info("Journey bridging {} against {}", shortPos(gap), shortPos(support));
+                    bridgeCell = gap;
                     return PathPlacement.place(gap, support);
                 }
                 if (step + 1 >= MAX_BRIDGE_CELLS) {

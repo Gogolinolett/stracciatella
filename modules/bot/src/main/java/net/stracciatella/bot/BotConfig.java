@@ -65,22 +65,29 @@ public class BotConfig {
     // at the SCANNING→NAVIGATING transition (the "spotted it, about to walk
     // over" moment). A human doesn't keep a perfectly constant cadence — every
     // now and then there's a beat of distraction before setting off. Chance is
-    // rolled once per transition. Set chance to 0 to disable.
+    // rolled once per transition. Set chance to 0 to disable. The length is
+    // log-normal across the range, most pauses short and some long; a pause
+    // long enough is now and then spent looking round (pauseGlanceChance).
     public double longPauseChance = 0.04;
-    public int longPauseMinTicks = 12;
-    public int longPauseMaxTicks = 25;
+    public int longPauseMinTicks = 6;
+    public int longPauseMaxTicks = 60;
+    public double pauseGlanceChance = 0.5;
 
     // Blunders: rare deliberate slips, because a worker that never wastes a
     // second is not a person. Each is a chance per opportunity; 0 switches it
     // off. A zone-out replaces a breather (per column of the chunk miner, per
-    // SCANNING→NAVIGATING) with a pause of a few seconds. On the bot's own
+    // SCANNING→NAVIGATING) with 3 to 10 seconds away from the game, tabbed out:
+    // the camera dead still, log-normal across the range. On the bot's own
     // journeys — the restock trip — a leg may be planned round an imaginary
-    // obstacle (a detour) and the walk may stop for a moment between two legs.
+    // obstacle (a detour) and the walk may stop between two legs, as long.
     public double zoneOutChance = 0.005;
-    public int zoneOutMinTicks = 80;
-    public int zoneOutMaxTicks = 120;
+    public int zoneOutMinTicks = 60;
+    public int zoneOutMaxTicks = 200;
     public double travelDetourChance = 0.05;
     public double travelPauseChance = 0.03;
+    // On the same journeys, the chance per sprint-jump of a look off to the
+    // side while in the air.
+    public double travelGlanceChance = 0.2;
     // On the same journeys, a burst of idle left clicks now and then: chance
     // per tick of starting one, and how many clicks it has. Into the air, or a
     // block the crosshair rests on, held too short to break it; never anyone.
@@ -196,11 +203,13 @@ public class BotConfig {
         this.longPauseChance = other.longPauseChance;
         this.longPauseMinTicks = other.longPauseMinTicks;
         this.longPauseMaxTicks = other.longPauseMaxTicks;
+        this.pauseGlanceChance = other.pauseGlanceChance;
         this.zoneOutChance = other.zoneOutChance;
         this.zoneOutMinTicks = other.zoneOutMinTicks;
         this.zoneOutMaxTicks = other.zoneOutMaxTicks;
         this.travelDetourChance = other.travelDetourChance;
         this.travelPauseChance = other.travelPauseChance;
+        this.travelGlanceChance = other.travelGlanceChance;
         this.travelClickChance = other.travelClickChance;
         this.travelClickMin = other.travelClickMin;
         this.travelClickMax = other.travelClickMax;

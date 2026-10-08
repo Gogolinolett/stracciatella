@@ -26,6 +26,7 @@ import net.stracciatella.bot.server.ServerSettingsStore;
 import net.stracciatella.bot.server.StorageSite;
 import net.stracciatella.bot.task.ChopTreeTask;
 import net.stracciatella.bot.task.MineBlockTask;
+import net.stracciatella.bot.task.OpenContainerTask;
 import net.stracciatella.bot.task.PlaceBlockTask;
 import net.stracciatella.testing.api.MinecraftTest;
 import net.stracciatella.testing.api.TestContext;
@@ -2631,6 +2632,192 @@ public class BotTests {
             ctx.runCommand("kill @e[type=pig]");
         }
     }
+
+    /**
+     * Two barrels, one four blocks in front of the bot with the pickaxe the
+     * probe asks for in it, one three blocks behind it and empty — the nearer
+     * one registered first. A trip that sorts its storages by distance turns
+     * round for the one behind; a person at a camp takes the one in front of
+     * them first.
+     */
+    @MinecraftTest(name = "Bot takes the storage in view first", timeoutTicks = 1200, order = -157)
+    public void takesTheStorageInViewFirst(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1980, 30, 1900);
+        final BlockPos ahead = origin.offset(0, 0, 4);
+        final BlockPos behind = origin.offset(0, 0, -3);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        for (BlockPos barrel : List.of(ahead, behind)) {
+            ctx.runCommand("setblock " + barrel.getX() + " " + barrel.getY() + " " + barrel.getZ()
+                    + " barrel");
+        }
+        ctx.waitFor(mc -> mc.level.getBlockState(ahead).is(Blocks.BARREL)
+                && mc.level.getBlockState(behind).is(Blocks.BARREL));
+        ctx.runCommand("item replace block " + ahead.getX() + " " + ahead.getY() + " "
+                + ahead.getZ() + " container.0 with minecraft:diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        lookAtBlock(ctx, origin, ahead);
+        generateMesh(ctx, origin);
+
+        final List<StorageSite> before = ctx.computeOnClient(
+                mc -> new ArrayList<>(ServerSettingsStore.current().storages));
+        final RestockProbeBehavior probe = new RestockProbeBehavior();
+        try {
+            ctx.runOnClient(mc -> {
+                ServerSettings settings = ServerSettingsStore.current();
+                settings.storages.clear();
+                settings.exitStrategy = ServerSettings.ExitStrategy.STAIRCASE;
+                String dimension = ServerSettingsStore.dimensionOf(mc);
+                settings.storages.add(StorageSite.of(dimension, behind));
+                settings.storages.add(StorageSite.of(dimension, ahead));
+                BehaviorRunner.register(probe);
+                BehaviorRunner.start(RestockProbeBehavior.ID);
+            });
+
+            final BlockPos[] first = {null};
+            ctx.waitFor(mc -> {
+                if (first[0] == null && BotController.getCurrentTask() instanceof OpenContainerTask open) {
+                    first[0] = open.targetPos();
+                }
+                return !BehaviorRunner.isActive();
+            });
+            ctx.runOnClient(mc -> BotController.stop());
+
+            if (!ahead.equals(first[0])) {
+                throw new AssertionError("The trip opened " + (first[0] == null ? "nothing"
+                        : first[0].toShortString()) + " first, expected the barrel in front of the"
+                        + " bot at " + ahead.toShortString() + " rather than turning round for the"
+                        + " nearer one behind it");
+            }
+            if (probe.starts != 2) {
+                throw new AssertionError("The probe was started " + probe.starts
+                        + " times, expected 2 (start, then resume after the restock)");
+            }
+            LOGGER.info("Took the storage in view first");
+        } finally {
+            ctx.runOnClient(mc -> {
+                BehaviorRunner.stop();
+                BotController.stop();
+                ServerSettingsStore.current().storages.clear();
+                ServerSettingsStore.current().storages.addAll(before);
+                ServerSettingsStore.save();
+            });
+        }
+    }
+
+    /**
+     * A long pause between two pieces of work, with the glance forced: the
+     * gaze has to leave the block it just mined, by at least
+     * {@link #MIN_GLANCE_DEG}, and the pause has to end. Before, the camera
+     * stood still through every pause, staring at the hole.
+     */
+    @MinecraftTest(name = "Bot looks round in a long pause", timeoutTicks = 400, order = -156)
+    public void looksRoundInALongPause(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2010, 30, 1900);
+        final BlockPos front = origin.offset(0, 0, 2);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + front.getX() + " " + front.getY() + " " + front.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        lookAtBlock(ctx, origin, front);
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(front)));
+        ctx.waitFor(mc -> mc.level.getBlockState(front).isAir()
+                && BotController.getPhase() == BotController.Phase.IDLE);
+
+        final BotConfig config = BotController.CONFIG;
+        final double chance = config.pauseGlanceChance;
+        final float[] start = {0f};
+        final double[] widest = {0.0};
+        try {
+            ctx.runOnClient(mc -> {
+                config.pauseGlanceChance = 1.0;
+                HumanBehavior.suppressBlunders(false);
+                start[0] = mc.player.getYRot();
+                BotController.pauseBetweenWork(new HumanBehavior.Breather(PAUSE_TICKS, false));
+            });
+            ctx.waitFor(mc -> {
+                widest[0] = Math.max(widest[0], Math.abs(mc.player.getYRot() - start[0]));
+                return !BotController.isPausing();
+            });
+        } finally {
+            ctx.runOnClient(mc -> {
+                config.pauseGlanceChance = chance;
+                HumanBehavior.suppressBlunders(true);
+                BotController.stop();
+            });
+        }
+        if (widest[0] < MIN_GLANCE_DEG) {
+            throw new AssertionError("The gaze moved at most " + String.format(java.util.Locale.US, "%.1f", widest[0])
+                    + " degrees through a pause of " + PAUSE_TICKS + " ticks with a glance due");
+        }
+        LOGGER.info("Looked {} degrees off the work in a pause", String.format(java.util.Locale.US, "%.0f", widest[0]));
+    }
+
+    /**
+     * A pause spent away from the game — tabbed out — right after a block was
+     * mined, with a glance as likely as it gets: the view must not move by a
+     * hair for all of it, no glance and no tremor, and the pause has to end.
+     */
+    @MinecraftTest(name = "Bot holds the camera dead still while tabbed out", timeoutTicks = 600, order = -155)
+    public void holdsStillWhileTabbedOut(TestContext ctx) {
+        final BlockPos origin = new BlockPos(2040, 30, 1900);
+        final BlockPos front = origin.offset(0, 0, 2);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        ctx.runCommand("setblock " + front.getX() + " " + front.getY() + " " + front.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        lookAtBlock(ctx, origin, front);
+
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(front)));
+        ctx.waitFor(mc -> mc.level.getBlockState(front).isAir()
+                && BotController.getPhase() == BotController.Phase.IDLE);
+
+        final BotConfig config = BotController.CONFIG;
+        final double chance = config.pauseGlanceChance;
+        final float[] start = {0f, 0f};
+        final double[] moved = {0.0};
+        final int[] ticks = {0};
+        try {
+            ctx.runOnClient(mc -> {
+                config.pauseGlanceChance = 1.0;
+                HumanBehavior.suppressBlunders(false);
+                start[0] = mc.player.getYRot();
+                start[1] = mc.player.getXRot();
+                BotController.pauseBetweenWork(new HumanBehavior.Breather(AWAY_TICKS, true));
+            });
+            ctx.waitFor(mc -> {
+                ticks[0]++;
+                moved[0] = Math.max(moved[0], Math.max(Math.abs(mc.player.getYRot() - start[0]),
+                        Math.abs(mc.player.getXRot() - start[1])));
+                return !BotController.isPausing();
+            });
+        } finally {
+            ctx.runOnClient(mc -> {
+                config.pauseGlanceChance = chance;
+                HumanBehavior.suppressBlunders(true);
+                BotController.stop();
+            });
+        }
+        if (moved[0] > 0.0) {
+            throw new AssertionError("The view moved " + String.format(java.util.Locale.US, "%.3f", moved[0])
+                    + " degrees while the player was away from the game");
+        }
+        if (ticks[0] < AWAY_TICKS - 2) {
+            throw new AssertionError("The pause away ended after " + ticks[0] + " ticks, asked for " + AWAY_TICKS);
+        }
+        LOGGER.info("Held the camera still for {} ticks away from the game", ticks[0]);
+    }
+
+    /** The spell away from the game the still-camera test asks for, five seconds. */
+    private static final int AWAY_TICKS = 100;
+
+    /** The pause the glance test asks for, two seconds. */
+    private static final int PAUSE_TICKS = 40;
+    /** How far a glance has to take the yaw: most of the least turn a glance makes. */
+    private static final double MIN_GLANCE_DEG = 20.0;
 
     /** How long each part of the click test drives the clicks. */
     private static final int CLICK_TICKS = 60;

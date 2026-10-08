@@ -1,6 +1,7 @@
 package net.stracciatella.miner.test;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -181,6 +182,52 @@ public class ChunkMinerTests {
                     + ", expected y=" + (Y - 2) + " or below");
         }
         LOGGER.info("Chunk miner descent test passed (feet at y={})", feetY);
+    }
+
+    /**
+     * Digging down from a spot off the middle of a block: the bot stands with
+     * its centre 0.3 off the middle of its cell, the hitbox reaching 0.1 into
+     * the cell beside it. A person digging straight down stands over the middle of
+     * the block first and drops through a hole one block wide; reported, the
+     * bot dug a two-by-one hole — the block under its centre went, the body
+     * stayed up on the neighbour, and the neighbour went too. Asserts that the
+     * descent through the lower slab opens one column, watched until the feet
+     * reach its floor. Three repeats.
+     */
+    @MinecraftTest(name = "Chunk miner digs down a one-wide hole", timeoutTicks = 3000, order = 51, repeat = 3)
+    public void digsDownAOneWideHole(TestContext ctx) {
+        prepareWithFloor(ctx, STAND_DX, STAND_DZ, 4, 10, 4, 10);
+        fill(ctx, 4, Y - 3, 4, 10, Y - 2, 10, "stone");
+        final BlockPos corner = new BlockPos(BASE_X + 10, Y - 3, BASE_Z + 10);
+        ctx.waitFor(mc -> !mc.level.getBlockState(corner).isAir());
+        final double sx = BASE_X + STAND_DX + 0.2;
+        final double sz = BASE_Z + STAND_DZ + 0.5;
+        ctx.runCommand("tp @s " + sx + " " + Y + " " + sz + " 0 0");
+        ctx.waitFor(mc -> mc.player.onGround() && Math.abs(mc.player.getX() - sx) < 0.05);
+
+        final Set<BlockPos> opened = new LinkedHashSet<>();
+        startChunkMiner(ctx, true, Y + 1, Y - 2);
+        ctx.waitFor(mc -> {
+            for (int dx = STAND_DX - 1; dx <= STAND_DX + 1; dx++) {
+                for (int dz = STAND_DZ - 1; dz <= STAND_DZ + 1; dz++) {
+                    for (int y = Y - 2; y <= Y - 1; y++) {
+                        if (mc.level.getBlockState(new BlockPos(BASE_X + dx, y, BASE_Z + dz)).isAir()) {
+                            opened.add(new BlockPos(BASE_X + dx, 0, BASE_Z + dz));
+                        }
+                    }
+                }
+            }
+            return mc.player.onGround() && mc.player.getY() < Y - 1.5 || !BehaviorRunner.isActive();
+        });
+        ctx.runOnClient(mc -> {
+            BehaviorRunner.stop();
+            BotController.stop();
+        });
+        if (opened.size() != 1) {
+            throw new AssertionError("Chunk miner dug down through " + opened.size() + " columns, expected one: "
+                    + shortList(opened));
+        }
+        LOGGER.info("Chunk miner dug down a one-wide hole at {}", shortList(opened));
     }
 
     // ================================================================
@@ -382,7 +429,7 @@ public class ChunkMinerTests {
      *       {@code continueDestroyBlock}. The flag survives one tick per block.
      *   <li><b>Gaps.</b> A break is allowed to be interrupted — a drop that
      *       landed out of reach has to be walked to, and
-     *       {@code randomBreatherTicks} pauses 12-25 ticks with 4% probability
+     *       {@code randomBreather} pauses 6-60 ticks with 4% probability
      *       per column by design. What is not allowed is that happening often.
      *   <li><b>Aim.</b> Degrees of yaw travelled per block mined, as a coarse
      *       guard — see {@link #holdsItsAim} for what that number can and
@@ -807,10 +854,10 @@ public class ChunkMinerTests {
     private static final double MIN_SWING_CYCLE = 0.90;
     /**
      * A gap longer than this counts as an interruption rather than a beat. The
-     * bound is the longest pause the design actually sanctions:
-     * {@code randomBreatherTicks} may hold for 25 ticks on 4% of columns, and
-     * a reaction delay may add 10. Anything past 35 is not a pause the
-     * behaviour chose, it is the bot failing to get back to work.
+     * bound was the longest pause the design sanctioned when it was set: a
+     * 25-tick breather on 4% of columns, and a reaction delay may add 10.
+     * Breathers now run to 60 ticks (log-normal, median 19), so the rare long
+     * one counts as one of the {@link #MAX_LONG_GAPS} interruptions.
      *
      * <p>Currently measured: gaps of 16-24 in the corridor, up to 74 on the
      * aim patch.
@@ -1719,8 +1766,10 @@ public class ChunkMinerTests {
 
         startChunkMiner(ctx, true, Y + 1, Y);
         final int[] lowestFeetY = {Integer.MAX_VALUE};
+        final BridgeYaw yaw = new BridgeYaw();
         ctx.waitFor(mc -> {
             lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            yaw.sample(mc);
             return !BehaviorRunner.isActive();
         });
         awaitChunkMiner(ctx, true);
@@ -1731,6 +1780,7 @@ public class ChunkMinerTests {
             throw new AssertionError("Bot dropped off its own bridge instead of walking it:"
                     + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
         }
+        yaw.assertSteady("straight");
         LOGGER.info("Chunk miner long-bridge test passed (feet stayed at y={})", lowestFeetY[0]);
     }
 
@@ -1775,8 +1825,10 @@ public class ChunkMinerTests {
 
         startChunkMiner(ctx, true, Y + 1, Y);
         final int[] lowestFeetY = {Integer.MAX_VALUE};
+        final BridgeYaw yaw = new BridgeYaw();
         ctx.waitFor(mc -> {
             lowestFeetY[0] = Math.min(lowestFeetY[0], mc.player.blockPosition().getY());
+            yaw.sample(mc);
             return !BehaviorRunner.isActive();
         });
         awaitChunkMiner(ctx, true);
@@ -1787,6 +1839,7 @@ public class ChunkMinerTests {
             throw new AssertionError("Bot walked off its own staircase instead of onto it:"
                     + " feet reached y=" + lowestFeetY[0] + ", expected to stay at y=" + Y);
         }
+        yaw.assertSteady("diagonal");
         LOGGER.info("Chunk miner staircase-bridge test passed (feet stayed at y={})",
                 lowestFeetY[0]);
     }
@@ -2620,62 +2673,62 @@ public class ChunkMinerTests {
     }
 
     // ================================================================
-    // Test 45: a floor block dug by mistake goes back in
+    // Test 45: a block dug past the chunk border by mistake goes back in
     // ================================================================
 
     /**
-     * The overdig slip, forced: one column, the floor under it diggable slab
-     * work of the next layer down, ground under that, and cobblestone carried.
-     * The floor block has to come out with the column and go back in as
-     * cobblestone, and the bot must never stand in the hole meanwhile.
-     *
-     * <p>Stopped once the floor is back: the range has to reach the floor layer
-     * for the floor to be slab work at all, and the second slab would then dig
-     * the whole fixture floor out for real.
+     * The overreach slip, forced: one column on the chunk's east edge, rock
+     * past the border beside it, and cobblestone carried. One of the two
+     * blocks beside the column past the border has to come out after the
+     * column and go back in as cobblestone, the run has to finish, and the
+     * rest of the rock past the border must stand untouched.
      */
-    @MinecraftTest(name = "Chunk miner digs one too deep and puts the floor back",
+    @MinecraftTest(name = "Chunk miner digs past the border and puts the block back",
             timeoutTicks = 3000, order = 45, repeat = 3)
-    public void putsAnOverdugFloorBack(TestContext ctx) {
-        final BlockPos stand = prepareWithFloor(ctx, STAND_DX, STAND_DZ,
-                STAND_DX - 3, STAND_DX + 6, STAND_DZ - 3, STAND_DZ + 3);
-        // Ground under the floor, for the block dug by mistake to go back on.
-        fill(ctx, STAND_DX - 3, Y - 2, STAND_DZ - 3, STAND_DX + 6, Y - 2, STAND_DZ + 3, "stone");
-        final BlockPos feet = stand.offset(1, 0, 0);
-        final BlockPos head = stand.offset(1, 1, 0);
-        final BlockPos under = stand.offset(1, -1, 0);
+    public void putsABlockDugPastTheBorderBack(TestContext ctx) {
+        prepareWithFloor(ctx, 13, STAND_DZ, 12, 15, STAND_DZ - 1, STAND_DZ + 1);
+        final BlockPos feet = new BlockPos(BASE_X + 15, Y, BASE_Z + STAND_DZ);
+        final BlockPos head = feet.above();
+        // A wall past the border, deep enough that what is dug out of it has
+        // a block behind to go back against.
+        fill(ctx, 16, Y - 1, STAND_DZ - 1, 17, Y + 2, STAND_DZ + 1, "stone");
         setBlock(ctx, feet, "stone");
         setBlock(ctx, head, "stone");
         ctx.runCommand("give @s cobblestone 16");
         ctx.waitFor(mc -> countItem(mc, net.minecraft.world.item.Items.COBBLESTONE) >= 16);
 
-        final boolean[] dug = {false};
-        final double[] lowestFeet = {Double.MAX_VALUE};
+        final BlockPos[] beyond = {feet.east(), head.east()};
+        final boolean[] dug = {false, false};
         withSlips(ctx, 1.0, 0.0, () -> {
-            startChunkMiner(ctx, true, Y + 1, Y - 1);
+            startChunkMiner(ctx, true, Y + 1, Y);
             ctx.waitFor(mc -> {
-                dug[0] |= mc.level.getBlockState(under).isAir();
-                lowestFeet[0] = Math.min(lowestFeet[0], mc.player.getY());
-                return !BehaviorRunner.isActive()
-                        || dug[0] && mc.level.getBlockState(under).is(Blocks.COBBLESTONE);
+                for (int i = 0; i < beyond.length; i++) {
+                    dug[i] |= mc.level.getBlockState(beyond[i]).isAir();
+                }
+                return !BehaviorRunner.isActive();
             });
+            awaitChunkMiner(ctx, true);
         });
 
-        final String status = ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine());
-        if (!dug[0]) {
-            throw new AssertionError("The floor under the column was never dug out — run: " + status);
+        if (!dug[0] && !dug[1]) {
+            throw new AssertionError("Nothing past the border beside the column was dug out");
         }
-        boolean refilled = ctx.computeOnClient(mc -> mc.level.getBlockState(under).is(Blocks.COBBLESTONE));
-        if (!refilled) {
-            throw new AssertionError("The floor dug out at " + under.toShortString()
-                    + " was not put back — run: " + status);
+        if (dug[0] && dug[1]) {
+            throw new AssertionError("Both blocks past the border were dug out, expected one");
+        }
+        BlockPos taken = dug[0] ? beyond[0] : beyond[1];
+        BlockPos left = dug[0] ? beyond[1] : beyond[0];
+        if (!ctx.computeOnClient(mc -> mc.level.getBlockState(taken).is(Blocks.COBBLESTONE))) {
+            throw new AssertionError("The block dug past the border at " + taken.toShortString()
+                    + " was not put back");
+        }
+        if (!ctx.computeOnClient(mc -> mc.level.getBlockState(left).is(Blocks.STONE))) {
+            throw new AssertionError("The other block past the border at " + left.toShortString()
+                    + " did not stay stone");
         }
         assertAir(ctx, feet, "column foot block");
         assertAir(ctx, head, "column head block");
-        if (lowestFeet[0] < Y - 0.01) {
-            throw new AssertionError("The bot went down into the hole: feet at " + lowestFeet[0]
-                    + " against a floor at " + Y);
-        }
-        LOGGER.info("Chunk miner put the overdug floor back ({})", status);
+        LOGGER.info("Chunk miner dug {} past the border and put it back", taken.toShortString());
     }
 
     // ================================================================
@@ -2775,6 +2828,26 @@ public class ChunkMinerTests {
     @MinecraftTest(name = "Chunk miner builds its way out up to the ground",
             timeoutTicks = 6000, order = 47, repeat = 3)
     public void buildsItsWayOutUpToTheGround(TestContext ctx) {
+        buildWayOutAndWalkBackIn(ctx, false);
+    }
+
+    /**
+     * The same hill with a notch cut into it beside the step of layer Y+3,
+     * down to Y+1: that layer is open to the sky outside with the ground two
+     * under its step. A way out off that step drops two blocks to the ground,
+     * and coming back a mesh edge climbs one — a real return trip found no way
+     * onto the stairs, took a cave beside the pit for the nearest it could get
+     * and was stuck there. The way out has to climb on past the notch to the
+     * hill top level with the corner step, and the journey from the hill top
+     * then walks back in as before.
+     */
+    @MinecraftTest(name = "Chunk miner builds its way out where it can walk back in",
+            timeoutTicks = 6000, order = 50, repeat = 3)
+    public void buildsItsWayOutWhereItCanWalkBackIn(TestContext ctx) {
+        buildWayOutAndWalkBackIn(ctx, true);
+    }
+
+    private void buildWayOutAndWalkBackIn(TestContext ctx, boolean notch) {
         prepareWithFloor(ctx, 12, 6, 9, 15, 2, 9);
         // The pit floor under the range, the lower slab's step, the hill
         // outside the east edge, and ground over the range where the way out
@@ -2783,6 +2856,13 @@ public class ChunkMinerTests {
         setBlock(ctx, new BlockPos(BASE_X + 15, Y - 2, BASE_Z + 7), "stone");
         fill(ctx, 16, Y - 3, -3, 18, Y + 5, 12, "stone");
         fill(ctx, 15, Y + 2, 0, 15, Y + 7, 3, "stone");
+        if (notch) {
+            fill(ctx, 16, Y + 2, 2, 16, Y + 5, 2, "air");
+            // Air over hill: the hill has arrived, and the notch after it.
+            final BlockPos notchCell = new BlockPos(BASE_X + 16, Y + 2, BASE_Z + 2);
+            ctx.waitFor(mc -> mc.level.getBlockState(notchCell).isAir()
+                    && !mc.level.getBlockState(notchCell.below()).isAir());
+        }
         ctx.runCommand("give @s cobblestone 64");
         final BlockPos hillCorner = new BlockPos(BASE_X + 18, Y + 5, BASE_Z + 12);
         final BlockPos ground = new BlockPos(BASE_X + 15, Y + 7, BASE_Z);
@@ -3237,6 +3317,52 @@ public class ChunkMinerTests {
         }
     }
 
+    /**
+     * How far the bot turns its head while it lays a bridge: the yaw summed
+     * tick by tick over its placements, from the first one's break onward — the
+     * turn round to face back along the bridge is the first block's and is not
+     * counted. Measured with a straight bridge that turns one corner and with a
+     * diagonal one: 82 and 75 degrees; turning to look at each support before
+     * stepping back to it cost about 315 degrees a block.
+     */
+    private static final class BridgeYaw {
+        final Set<BlockPos> laid = new HashSet<>();
+        double turned;
+        Float last;
+
+        void sample(net.minecraft.client.Minecraft mc) {
+            if (!(BotController.getCurrentTask() instanceof net.stracciatella.bot.task.PlaceBlockTask place)) {
+                return;
+            }
+            laid.add(place.placePos());
+            float yaw = mc.player.getYRot();
+            if (last != null) {
+                turned += Math.abs(yaw - last);
+                last = yaw;
+            } else if (BotController.getPhase() == BotController.Phase.INTERACTING) {
+                last = yaw;
+            }
+        }
+
+        void assertSteady(String bridge) {
+            if (laid.size() < 2) {
+                throw new AssertionError("The " + bridge + " bridge laid " + laid.size()
+                        + " blocks, too few to measure");
+            }
+            if (turned > laid.size() * MAX_BRIDGE_YAW_PER_BLOCK) {
+                throw new AssertionError("The bot turned its head " + String.format(java.util.Locale.US, "%.0f", turned)
+                        + " degrees laying the " + bridge + " bridge's " + laid.size() + " blocks, at most "
+                        + MAX_BRIDGE_YAW_PER_BLOCK + " a block — a person bridging backwards keeps looking"
+                        + " back along the bridge");
+            }
+            LOGGER.info("The {} bridge's {} blocks cost {} degrees of yaw", bridge, laid.size(),
+                    String.format(java.util.Locale.US, "%.0f", turned));
+        }
+    }
+
+    /** Yaw a bridge may cost per block laid: a corner's quarter turn, shared out, and the saccades. */
+    private static final double MAX_BRIDGE_YAW_PER_BLOCK = 40.0;
+
     private static String shortList(Set<BlockPos> cells) {
         return cells.isEmpty() ? "nowhere"
                 : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());
@@ -3370,11 +3496,11 @@ public class ChunkMinerTests {
      * chances, everything restored afterwards — the suite reads the player's
      * own config, and every other test runs with the slips suppressed.
      */
-    private void withSlips(TestContext ctx, double overdig, double stairSlip, Runnable body) {
-        final double configuredOverdig = MinerSetup.CONFIG.chunkMinerOverdigChance;
+    private void withSlips(TestContext ctx, double overreach, double stairSlip, Runnable body) {
+        final double configuredOverreach = MinerSetup.CONFIG.chunkMinerOverreachChance;
         final double configuredSlip = MinerSetup.CONFIG.chunkMinerStairSlipChance;
         ctx.runOnClient(mc -> {
-            MinerSetup.CONFIG.chunkMinerOverdigChance = overdig;
+            MinerSetup.CONFIG.chunkMinerOverreachChance = overreach;
             MinerSetup.CONFIG.chunkMinerStairSlipChance = stairSlip;
             HumanBehavior.suppressBlunders(false);
         });
@@ -3384,7 +3510,7 @@ public class ChunkMinerTests {
             ctx.runOnClient(mc -> {
                 BehaviorRunner.stop();
                 BotController.stop();
-                MinerSetup.CONFIG.chunkMinerOverdigChance = configuredOverdig;
+                MinerSetup.CONFIG.chunkMinerOverreachChance = configuredOverreach;
                 MinerSetup.CONFIG.chunkMinerStairSlipChance = configuredSlip;
                 HumanBehavior.suppressBlunders(true);
             });

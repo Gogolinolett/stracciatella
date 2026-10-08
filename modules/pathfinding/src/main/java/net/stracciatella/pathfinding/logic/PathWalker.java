@@ -177,12 +177,43 @@ public class PathWalker {
     private static final int CRUISE_REFRESH_MAX = 40;
     // Drift off the heading's line after which it is corrected at once.
     private static final double CRUISE_LINE_TOLERANCE = 0.35;
+    // Where the ground a block to either side of the line is as walkable as
+    // the line itself, the drift that may build up before the heading is
+    // corrected: the walk bends with the wander below instead of running down
+    // a ruler line.
+    private static final double CRUISE_WIDE_SLACK = 1.0;
+    private static double cruiseSlack = CRUISE_LINE_TOLERANCE;
+    // The heading a hand on a mouse holds is not a constant: it wanders a few
+    // degrees off the course and back, slowly. A random walk pulled back to
+    // the course, in degrees; the pull, the jitter per tick and the bound, the
+    // bound kept small where the line has no room to either side.
+    private static double cruiseWander = 0.0;
+    private static final double CRUISE_WANDER_PULL = 0.04;
+    private static final double CRUISE_WANDER_JITTER = 0.7;
+    private static final double CRUISE_WANDER_MAX = 6.0;
+    private static final double CRUISE_WANDER_MAX_NARROW = 1.5;
+    // A look to the side in the air of a sprint-jump, where the body's course
+    // is the jump's and the eyes are free: how far, and for how many ticks
+    // before they come back for the landing. How often is the caller's
+    // (setTravelGlanceChance), a quirk like a journey's detours.
+    private static double travelGlanceChance = 0.0;
+    private static double glanceOffset = 0.0;
+    private static int glanceTicks = 0;
+    private static final double GLANCE_MIN_DEG = 15.0;
+    private static final double GLANCE_MAX_DEG = 35.0;
+    private static final int GLANCE_AIR_TICKS = 5;
     // Level open ground a sprint-jump needs ahead of it: a sprint-jump covers
     // about three and a half blocks, and it has to come down on the run.
     private static final double CRUISE_JUMP_LENGTH = 4.0;
     // Below this horizontal speed (blocks/tick) the bot is not sprinting yet.
     private static final double CRUISE_JUMP_MIN_SPEED = 0.12;
     private static final float CRUISE_JUMP_FACING_DEG = 10.0f;
+    /** How far along the heading the cruise looks for a block one up to hop onto. */
+    private static final double STEP_UP_LOOKAHEAD = 0.7;
+    /** How far under the stretch being walked the feet must be to have fallen off it: a block, less float noise. */
+    private static final double FELL_OFF_DEPTH = 0.9;
+    /** Nodes ahead of the current one whose height still counts as the stretch being walked. */
+    private static final int FELL_OFF_WINDOW = 2;
 
     /** Walk {@code path} node by node and stop exactly on its last node. */
     public static void start(List<MeshNode> path) {
@@ -214,6 +245,9 @@ public class PathWalker {
         cruiseRetryIn = 0;
         cruiseJumpHoldoff = 0;
         cruiseWasAirborne = false;
+        cruiseWander = 0.0;
+        cruiseSlack = CRUISE_LINE_TOLERANCE;
+        glanceTicks = 0;
         hasStableDesiredYaw = false;
         LocalPlayer player = Minecraft.getInstance().player;
         camera = new CameraController();
@@ -387,6 +421,17 @@ public class PathWalker {
                     landingBrakeMaxSpeed = currSegGap <= 1 ? 0.03 : (currSegGap <= 2 ? 0.04 : 0.08);
                 }
             }
+        }
+
+        // Slipped off the way: on the ground below the stretch being walked —
+        // under the node left and the node ahead alike, which a planned step
+        // up or down never is. The route was made for up there, and its next
+        // node lies back up the edge; walked to anyway, the bot turned round
+        // and went back to where it fell. A journey plans its next leg from
+        // wherever the walk ends, so the walk ends here.
+        if (travelling && player.onGround() && index > 0 && fellBelowPath(player)) {
+            stop();
+            return;
         }
 
         if (travelling && tickCruise(client, player)) {
@@ -1205,6 +1250,7 @@ public class PathWalker {
                 return false;
             }
             takeCruiseAim(player, currentPath.get(cruiseIndex));
+            cruiseSlack = roomBesideLine(player) ? CRUISE_WIDE_SLACK : CRUISE_LINE_TOLERANCE;
             // Nobody takes a heading to the degree: it is a little off, the
             // walk drifts from the line, and CRUISE_LINE_TOLERANCE has it
             // looked at again — not the dead-straight run along the grid.
@@ -1230,14 +1276,22 @@ public class PathWalker {
 
     /**
      * The farthest node, at most {@link #CRUISE_LOOKAHEAD} ahead, that the path
-     * reaches on one level in plain walking steps and the player can walk to in
-     * a straight line from where it stands — or -1 when that is not at least two
-     * nodes beyond the current one. Never the path's last node: the last stretch
-     * is the node-by-node walk's.
+     * reaches in plain walking steps a block up or down at most, and the player
+     * can walk to in a straight line over the ground from where it stands
+     * ({@link Terrain#isGroundWalk}) — or -1 when that is not at least two nodes
+     * beyond the current one. Never the path's last node: the last stretch is
+     * the node-by-node walk's. Held to one level, the run broke at every edge of
+     * rolling ground, and the walk between the breaks was the grid's: a zigzag
+     * with the yaw on the bearing 19% of the time, against all of it on the
+     * flat.
      */
     private static int chooseCruiseTarget(LocalPlayer player) {
         MeshNode here = currentPath.get(index);
-        if (Math.abs(player.getY() - (here.getY() + 1.0)) > 0.5) {
+        // From the floor the feet are on, not the current node's: over rolling
+        // ground the walk runs ahead of its index, and right after a hop the
+        // node is still the one below.
+        int floor = player.getBlockY() - 1;
+        if (Math.abs(floor - here.getY()) > 1 || player.getY() - (floor + 1.0) > 0.5) {
             return -1;
         }
         int last = index;
@@ -1245,7 +1299,7 @@ public class PathWalker {
         while (last < limit) {
             MeshNode a = currentPath.get(last);
             MeshNode b = currentPath.get(last + 1);
-            if (b.getY() != here.getY()
+            if (Math.abs(b.getY() - a.getY()) > 1
                     || Math.max(Math.abs(b.getX() - a.getX()), Math.abs(b.getZ() - a.getZ())) > 1) {
                 break;
             }
@@ -1253,8 +1307,8 @@ public class PathWalker {
         }
         for (int k = last; k >= index + 2; k--) {
             MeshNode aim = currentPath.get(k);
-            if (Terrain.isStraightWalk(player.level(), player, player.getX(), player.getZ(),
-                    aim.getX() + 0.5, aim.getZ() + 0.5, here.getY(), 2)) {
+            if (Terrain.isGroundWalk(player.level(), player, player.getX(), player.getZ(),
+                    aim.getX() + 0.5, aim.getZ() + 0.5, floor, 2)) {
                 return k;
             }
         }
@@ -1287,12 +1341,52 @@ public class PathWalker {
         }
         double laneX = cx - hz / length * lane;
         double laneZ = cz + hx / length * lane;
-        if (Terrain.isStraightWalk(player.level(), player, player.getX(), player.getZ(),
-                laneX, laneZ, aim.getY(), 2)) {
+        if (Terrain.isGroundWalk(player.level(), player, player.getX(), player.getZ(),
+                laneX, laneZ, player.getBlockY() - 1, 2)) {
             cruiseAimX = laneX;
             cruiseAimZ = laneZ;
             cruiseLane = lane;
         }
+    }
+
+    /**
+     * Whether the ground {@link #CRUISE_WIDE_SLACK} to either side of the line
+     * to the heading's aim is as walkable as the line itself — open ground,
+     * where the walk may bend off the line before it is corrected.
+     */
+    private static boolean roomBesideLine(LocalPlayer player) {
+        double hx = cruiseAimX - player.getX();
+        double hz = cruiseAimZ - player.getZ();
+        double length = Math.sqrt(hx * hx + hz * hz);
+        if (length < 1.0e-6) {
+            return false;
+        }
+        double sideX = -hz / length * CRUISE_WIDE_SLACK;
+        double sideZ = hx / length * CRUISE_WIDE_SLACK;
+        int floor = player.getBlockY() - 1;
+        for (int side = -1; side <= 1; side += 2) {
+            if (!Terrain.isGroundWalk(player.level(), player,
+                    player.getX() + sideX * side, player.getZ() + sideZ * side,
+                    cruiseAimX + sideX * side, cruiseAimZ + sideZ * side, floor, 2)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The course actually held: the heading with the hand's wander on it. */
+    private static float cruiseCourse() {
+        return (float) (cruiseYaw + cruiseWander);
+    }
+
+    /**
+     * Let a sprint-jump spend part of its time in the air looking off to the
+     * side, the way a person running over open ground looks round, at
+     * {@code chance} per jump. The jump carries the body; the look comes back
+     * before the landing.
+     */
+    public static void setTravelGlanceChance(double chance) {
+        travelGlanceChance = chance;
     }
 
     /** Tick off the nodes of the run the player has already drawn level with. */
@@ -1312,21 +1406,42 @@ public class PathWalker {
         }
     }
 
-    /** Hold the cruise heading: turn onto it, then walk and sprint along it. */
+    /**
+     * Hold the cruise heading: turn onto it, then walk and sprint along it.
+     * The course wanders a few degrees off the heading and back
+     * ({@link #cruiseWander}), and only within the drift the line has room for.
+     */
     private static void steerCruise(Minecraft client, LocalPlayer player, boolean jump) {
         MeshNode aim = currentPath.get(cruiseIndex);
         double ax = cruiseAimX - player.getX();
         double az = cruiseAimZ - player.getZ();
-        float newYaw = camera.updateYaw(cruiseYaw);
+        double wanderMax = cruiseSlack > CRUISE_LINE_TOLERANCE ? CRUISE_WANDER_MAX : CRUISE_WANDER_MAX_NARROW;
+        cruiseWander = Math.max(-wanderMax, Math.min(wanderMax, cruiseWander * (1.0 - CRUISE_WANDER_PULL)
+                + ThreadLocalRandom.current().nextGaussian() * CRUISE_WANDER_JITTER));
+        if (player.onGround()) {
+            glanceTicks = 0;
+        } else if (glanceTicks > 0) {
+            glanceTicks--;
+        }
+        float course = cruiseCourse();
+        float newYaw = camera.updateYaw((float) (course + (glanceTicks > 0 ? glanceOffset : 0.0)));
         float newPitch = camera.updatePitch(AngleUtil.computeDesiredPitch(
                 aim.getY() + 1.0 - player.getEyeY(), Math.sqrt(ax * ax + az * az)));
         player.setYRot(newYaw);
         player.setXRot(newPitch);
-        boolean aligned = Math.abs(AngleUtil.wrapDegrees(cruiseYaw - newYaw))
+        boolean aligned = Math.abs(AngleUtil.wrapDegrees(course - newYaw))
                 <= CameraController.WALK_TURN_THRESHOLD_DEG;
-        boolean jumpNow = jump && aligned;
+        // Over rolling ground the line meets a block one up now and then: a
+        // hop onto it, the step a person takes without breaking stride.
+        boolean hop = player.onGround() && jumpCooldownTicks == 0 && stepUpAhead(player);
+        boolean jumpNow = (jump || hop) && aligned;
         if (jumpNow) {
             jumpCooldownTicks = CONFIG.jumpCooldownTicks;
+            if (jump && ThreadLocalRandom.current().nextDouble() < travelGlanceChance) {
+                ThreadLocalRandom random = ThreadLocalRandom.current();
+                glanceOffset = random.nextDouble(GLANCE_MIN_DEG, GLANCE_MAX_DEG) * (random.nextBoolean() ? 1 : -1);
+                glanceTicks = GLANCE_AIR_TICKS;
+            }
         }
         applyMovement(client, aligned || !player.onGround(), false, jumpNow, true, 0);
     }
@@ -1341,7 +1456,7 @@ public class PathWalker {
         }
         double px = player.getX() - cruiseFromX;
         double pz = player.getZ() - cruiseFromZ;
-        return Math.abs(px * lz - pz * lx) / length > CRUISE_LINE_TOLERANCE;
+        return Math.abs(px * lz - pz * lx) / length > cruiseSlack;
     }
 
     /**
@@ -1355,20 +1470,50 @@ public class PathWalker {
         }
         Vec3 velocity = player.getDeltaMovement();
         if (Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z) < CRUISE_JUMP_MIN_SPEED
-                || Math.abs(AngleUtil.wrapDegrees(cruiseYaw - player.getYRot())) > CRUISE_JUMP_FACING_DEG) {
+                || Math.abs(AngleUtil.wrapDegrees(cruiseCourse() - player.getYRot())) > CRUISE_JUMP_FACING_DEG) {
             return false;
         }
-        MeshNode aim = currentPath.get(cruiseIndex);
         double ax = cruiseAimX - player.getX();
         double az = cruiseAimZ - player.getZ();
         if (Math.sqrt(ax * ax + az * az) < CRUISE_JUMP_LENGTH) {
             return false;
         }
-        // Along the heading actually held, which is a little off the aim.
-        double yawRad = Math.toRadians(cruiseYaw);
+        // Along the heading actually held, which is a little off the aim, and
+        // on the floor underfoot: the aim lies at another height over rolling
+        // ground, and asked at its height a level stretch here never counted.
+        double yawRad = Math.toRadians(cruiseCourse());
         return Terrain.isStraightWalk(player.level(), player, player.getX(), player.getZ(),
                 player.getX() - Math.sin(yawRad) * CRUISE_JUMP_LENGTH,
-                player.getZ() + Math.cos(yawRad) * CRUISE_JUMP_LENGTH, aim.getY(), 3);
+                player.getZ() + Math.cos(yawRad) * CRUISE_JUMP_LENGTH, player.getBlockY() - 1, 3);
+    }
+
+    /**
+     * Whether the feet stand a block or more below every node from the one
+     * left to {@link #FELL_OFF_WINDOW} ahead. Ahead as well, because the walk
+     * runs ahead of its index: stepping down along the cruise, the node at the
+     * top of the step is often not ticked off yet when the feet are already a
+     * block lower, and a step down planned that close is no slip.
+     */
+    private static boolean fellBelowPath(LocalPlayer player) {
+        int floor = Integer.MAX_VALUE;
+        for (int i = index - 1; i <= Math.min(currentPath.size() - 1, index + FELL_OFF_WINDOW); i++) {
+            floor = Math.min(floor, currentPath.get(i).getY());
+        }
+        return player.getY() < floor + 1.0 - FELL_OFF_DEPTH;
+    }
+
+    /**
+     * Whether the cruise heading runs into a block one up just ahead: a block
+     * at foot height {@link #STEP_UP_LOOKAHEAD} along the heading, standable
+     * and with room for a body over it.
+     */
+    private static boolean stepUpAhead(LocalPlayer player) {
+        double yawRad = Math.toRadians(cruiseCourse());
+        BlockPos ahead = BlockPos.containing(player.getX() - Math.sin(yawRad) * STEP_UP_LOOKAHEAD,
+                player.getY(), player.getZ() + Math.cos(yawRad) * STEP_UP_LOOKAHEAD);
+        return Terrain.isStandable(player.level(), ahead, player)
+                && Terrain.isPassable(player.level(), ahead.above())
+                && Terrain.isPassable(player.level(), ahead.above(2));
     }
 
     private static boolean shouldCancelOffCourse(double distance, LocalPlayer player, MeshNode target, boolean canMoveForward, boolean shouldBrake) {

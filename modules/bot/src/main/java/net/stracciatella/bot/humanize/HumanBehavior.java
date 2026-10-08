@@ -38,8 +38,8 @@ public class HumanBehavior {
     }
 
     // Blunders — the rare deliberate slips (a long zone-out, a detour, a block
-    // too many dug out and put back, a stair step knocked out and rebuilt, idle
-    // clicks on the way) —
+    // dug past the chunk border and put back, a stair step knocked out and
+    // rebuilt, idle clicks on the way) —
     // switched off for the length of a run that asserts an exact outcome. A
     // runtime flag rather than the config chances, so nothing a test does here
     // can be written back to the player's files.
@@ -145,39 +145,56 @@ public class HumanBehavior {
     }
 
     /**
-     * Reaction delay for the "spotted the target, about to walk over" moment
-     * (SCANNING→NAVIGATING). Usually the standard
-     * {@link #randomReactionDelayTicks reaction delay}, but with probability
-     * {@code longPauseChance} it is replaced by a longer uniform "breather"
-     * pause in {@code [longPauseMinTicks, longPauseMaxTicks]} — the occasional
-     * beat of distraction that breaks an otherwise machine-constant cadence.
+     * A pause between two pieces of work: how long, and whether it is spent
+     * away from the game — tabbed out, with the camera dead still.
      */
-    public static int randomTaskSwitchDelayTicks(BotConfig config) {
-        int breather = randomBreatherTicks(config);
-        return breather > 0 ? breather : randomReactionDelayTicks(config);
+    public record Breather(int ticks, boolean away) {
+        public static final Breather NONE = new Breather(0, false);
     }
 
     /**
-     * The occasional breather on its own: a pause of
+     * The occasional breather: a pause in
      * {@code [longPauseMinTicks, longPauseMaxTicks]} with probability
-     * {@code longPauseChance}, and nothing the rest of the time.
+     * {@code longPauseChance}, now and then (a blunder, {@code zoneOutChance})
+     * a spell away from the game of {@code [zoneOutMinTicks, zoneOutMaxTicks]},
+     * and nothing the rest of the time.
      *
-     * <p>For an action a behavior repeats thousands of times, this is the
-     * right half of {@link #randomTaskSwitchDelayTicks}. Pausing on *every*
-     * repetition is itself the machine-constant cadence the pause exists to
-     * break, and it lands in the critical path of every single one.
+     * <p>For an action a behavior repeats thousands of times. Pausing on
+     * *every* repetition is itself the machine-constant cadence the pause
+     * exists to break, and it lands in the critical path of every single one.
+     *
+     * <p>Both lengths are log-normal across their range, not uniform: most
+     * pauses short, some a good deal longer, the way a person's are. Uniform
+     * over 12-25 ticks every pause was the same second, reported as pauses
+     * with no variety in them.
      */
-    public static int randomBreatherTicks(BotConfig config) {
-        // Far rarer and far longer: the bot zoning out for a few seconds, the
-        // way a person's attention wanders off the work now and then.
+    public static Breather randomBreather(BotConfig config) {
+        // Far rarer and far longer: the player tabbed out for a few seconds,
+        // the way a person's attention leaves the game now and then.
         if (blunder(config.zoneOutChance)) {
-            return randomIntInRange(config.zoneOutMinTicks, config.zoneOutMaxTicks);
+            return new Breather(randomLogNormalInRange(config.zoneOutMinTicks, config.zoneOutMaxTicks), true);
         }
         ThreadLocalRandom r = ThreadLocalRandom.current();
         if (config.longPauseChance > 0 && r.nextDouble() < config.longPauseChance) {
-            return randomIntInRange(config.longPauseMinTicks, config.longPauseMaxTicks);
+            return new Breather(randomLogNormalInRange(config.longPauseMinTicks, config.longPauseMaxTicks), false);
         }
-        return 0;
+        return Breather.NONE;
+    }
+
+    /**
+     * A length in {@code [min, max]}, log-normal round their geometric mean
+     * with the range four standard deviations wide, so about one draw in twenty
+     * is clamped to an end.
+     */
+    static int randomLogNormalInRange(int min, int max) {
+        if (min <= 0 || min >= max) {
+            return randomIntInRange(min, max);
+        }
+        double low = Math.log(min);
+        double high = Math.log(max);
+        double draw = Math.exp((low + high) / 2.0
+                + ThreadLocalRandom.current().nextGaussian() * (high - low) / 4.0);
+        return (int) Math.max(min, Math.min(max, Math.round(draw)));
     }
 
     private static double randomInRange(double min, double max) {

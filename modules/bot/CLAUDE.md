@@ -183,6 +183,24 @@ timeouts there. `WORK_DISTANCE` (2.0) is
 untouched and still POSITIONING's arrival: that phase walks *before* the break
 and has no face to stand against yet.
 
+**Digging out what it stands on, it stands on the middle first** (`digsUnderfoot`,
+`centreOverWork`). A person digging straight down steps onto the middle of the
+block. The hitbox is 0.6 wide, so with the body's centre more than 0.2 off the
+middle it reaches over the block beside it: the block under the centre went, the
+body stayed up on the neighbour, and the chunk miner — which digs whatever holds the
+bot up — took that one too, a two-by-one hole where one block would do. LOOKING
+therefore walks the body over the block's middle (within `UNDERFOOT_SLACK`, 0.15,
+the hitbox then inside the column) before it lets the dig start, bounded by
+`UNDERFOOT_CENTRE_TICKS` (20), and INTERACTING keeps it there — nothing else gets
+the movement keys while the block underfoot is under the pick, so the opportunistic
+step cannot carry the body off it either. The walk aims at where the body will come
+to rest rather than where it is: let go of, a body slides on by its speed over one
+minus the floor's friction, on stone more than twice its speed per tick, and one
+tick of walking from a third of a block off already reaches the middle; aimed at
+the rest point the same keys brake. Measured by the miner's `Chunk miner digs down a
+one-wide hole`: from 0.3 off the middle the descent opened two columns in all three
+repeats, centred it opens one.
+
 **Measured horizontally, in both places.** The 3-D eye→centre distance is the
 right answer to *can I reach this* and the wrong one to *should I walk*: mining
 the block under its own feet, the bot read 3.12 — nearly all of it the 1.1-block
@@ -207,6 +225,10 @@ Three pieces, all in `BotController`:
 Not behind a policy flag, unlike `approachOccluded` and the rest. Those are trade-offs — a short walk against a turn, safety against pace — and their owner has to choose. This one has no other side: without it the placement is not slower or riskier, it is impossible, and the alternative is a task that can only time out. Measured: `Bot bridges into a gap` crouches out to x=1801.16 over a four-deep cavity and places; on the same fixture without it the bot stops at x=1800.74, never crouches, and the cell stays air.
 
 **The suite could not have caught that offset, and now can.** Every bridging fixture in the suite places from a spot the bot never leaves — measured across the whole of it, the support sat 2.2 blocks away in *every* bridging placement, always dead ahead on the face axis, so the perpendicular offset the bug lives in was never once non-zero. Catching it takes a bridge long enough that the bot has to walk out along its own: the miner's `Chunk miner steps onto its bridge instead of walking beside it` puts the target column diagonally across a pit, and reverted to the face-axis walk it fails with `could not place the floor at 3013, 39, 3015 — 2 attempts failed`.
+
+**Straight into the step, no look at the support first.** A task normally starts by looking at its target (SCANNING) and then walks. For a placement that needs the edge step, `beginCurrentTask` goes straight to POSITIONING: the target is the support, the block the bot stands on, so the look swung the head round to the gap and the step's gaze behind the bot swung it back — measured on a straight bridge at about 315 degrees of yaw for every block, the bot turning round each time instead of sneaking straight back.
+
+**A diagonal bridge is laid from the corners** (`bridgeSide`, `lastLaid`). Its blocks go off the two axes by turns, a staircase, and the controller only ever sees one placement: so it remembers the last block placed, and a placement whose support is that block and whose face is on the other axis is a diagonal step. Three things change for it. The gaze rests back along the diagonal rather than along the face. The step goes to the support's corner, past the side the next block goes off as well, and `needsEdgeStep` only counts it arrived there — so the next block is laid from the same spot, and the body moves from corner to corner straight along the diagonal. Only where a body has room at that corner: at the bridge's end the corner was the column the bridge was laid to, and the step pressed into it for the whole position timeout; there the plain rim step is taken. Standing on a corner leaves the body's centre over the next cell in, held up by the blocks round it, so the miner's `ensureStepToward` bridges the cell under the bot first when `feet.below()` is open (`floorBeside`) — reading that cell as the floor, it stopped bridging there. And LOOKING aims where the view line meets the face (`alongTheView`) rather than at a point of the face's own: from past the rim the face is below and behind the eye, and the face's point swung the yaw a quarter turn one way and back for every block. Measured on the miner's two bridge fixtures: a straight bridge with one corner and a diagonal one cost 82 and 75 degrees of yaw over all their blocks; their tests now bar 40 degrees a block (`BridgeYaw`).
 
 ### Smart transitions after block break
 
@@ -575,8 +597,9 @@ that looks busy and never mines a block.
 | **RETURN** | `Journey` back to the anchor, which is simply where the bot stood when the shortfall was noticed: the runner suspends on that tick, so nothing has moved yet and nobody has to remember to record it earlier. |
 
 **A camp is a row of barrels, and one of them is full.** The trip therefore walks
-a **route**, not a chest: `sortedStorages` puts every storage of this dimension in
-distance order from the work site at `start()`, and `stop` indexes it. Three things
+a **route**, not a chest: every storage of this dimension is a candidate, and
+`nextStop` picks the next one each time the trip sets off — once the work site is
+left, and again after every container. Three things
 move the trip on to the next one, and all three used to end it instead — measured
 on a real server with 33 barrels, where the first one was full and the bot came
 home with every block it had set out with, `Transfer stalled` in the log and
@@ -598,11 +621,23 @@ camp looks like, and a barrel that is full today is the right barrel tomorrow.
 Whether work is left is decided in `TRANSFER` while the menu is still open, where
 the answer is cheap and certain, and read by `CLOSE` — which is also why a trip
 that fills up the first barrel and needs nothing back goes straight home rather
-than touring the camp. Sorting by distance is `RestockBehavior`'s own business
-rather than the store's, because "nearest" is nearest *to the work site*, and only
-the trip knows where that is. Pinned by *Bot moves on when the nearest storage is
+than touring the camp. Pinned by *Bot moves on when the nearest storage is
 full*, which puts a deliberately-full barrel nearest and registers the route
 far-first so the ordering is under test too.
+
+**The next storage is the one in front of the bot, not the next on a list.**
+`nextStop` takes the one nearest to where the bot stands, a storage to its side
+counting up to one and a half blocks further than one straight ahead and one
+behind it three — `TaskQueue.distanceWithTurn`, the weighing the controller takes
+its next block by. Asked from the bot's place and view at that moment: leaving
+the work site, after the teleport, and with the container it has just shut in
+front of it, so it works along the row of barrels it is looking at. The list used
+to be sorted once at `start()`, by distance from the work site, and walked as a
+fixed tour: at the camp the bot turned its back on the barrel in front of it for
+the next one on the list, reported as robotic. `Bot takes the storage in view
+first` registers an empty barrel three blocks behind the bot first and the one
+with the pickaxe four blocks in front second, and asserts which one is opened
+first.
 
 **The send is early and the jump is the arrival** — two halves of `LEAVE_SITE`
 that both went wrong in a real run, and both for the same reason: the server's
@@ -747,13 +782,14 @@ The held-slot-sync race is handled separately: tool selection in LOOKING tick 1 
 - Spring-damper camera smoothing (5–15 ticks to converge), with a randomised look-speed multiplier per target so successive aims don't all turn at the same rate
 - Random aim offset within block face (Gaussian, clustered near center, clamped to ±aimOffsetMax)
 - Gaussian reaction delay between phase decisions — applied at `SCANNING→NAVIGATING`, `POSITIONING→LOOKING`, and the block-broken transition *except* when it continues a seam (see `continueSeam`); mean 4 ticks (~200 ms), σ=2. During the delay the body pauses but the camera keeps easing toward its last aim point (no stop-motion freeze)
-- Occasional long "breather" pause at `SCANNING→NAVIGATING`: with `longPauseChance` (default 4%) the standard reaction delay is replaced by a 12–25 tick pause — breaks the otherwise machine-constant cadence
+- Occasional long "breather" pause at `SCANNING→NAVIGATING` (and the chunk miner's per column): with `longPauseChance` (default 4%) the standard reaction delay is replaced by a pause of 6–60 ticks, log-normal round 19 (`randomLogNormalInRange`), so most pauses are short and some a good deal longer — uniform over 12–25 every pause was the same second, reported as pauses with no variety in them. Pinned by `HumanBehaviorTest` (JUnit)
+- The gaze through a pause (`pauseGaze`): the camera stood still for all of a pause, a frozen stare at the block just mined. Now it stays on the last aim point with its saccades, and a pause of 20 ticks or more (`GLANCE_MIN_TICKS`) is now and then (`pauseGlanceChance`, 0.5, a blunder so the fixtures never meet one) spent looking off 30–100° to a side and 15° up to 25° down, and back for the work. Behaviors pause through the controller (`pauseBetweenWork`, `isPausing`) so the pause is the controller's to look round in; the controller's own reaction delays go through the same gaze. Measured by `Bot looks round in a long pause`. **Away from the game it is the other way round**: a zone-out is the player tabbed out, and a tabbed-out view does not move by a hair — `pauseAway`, from `HumanBehavior.Breather.away`, leaves the camera undriven for the whole pause, no tremor and no glance. Measured by `Bot holds the camera dead still while tabbed out` (100 ticks, not a thousandth of a degree)
 - Pre-attack commit hesitation: a 1–3 tick "I see it, I click" beat between both LOOKING gates firing and the first `startAttack`, skipped on a seam continuation. Distinct from the old settle delay — tool sync already happens during the LOOKING camera turn, this is purely humanness
 - Micro-saccades during sustained aim (INTERACTING and COLLECTING): ±0.5° yaw, ±0.3° pitch perturbations refreshed every ~12 ticks. Avoid the "frozen gaze" look while mining and while standing over drops
 - One angle per row: turning into a straight row the bot takes one angle — mostly right at once, now and then corrected after the first block — and holds the camera still while the body, walking on into the face the whole time, brings each next block under the crosshair (see *One angle for the rest of a row*)
 - Gaze follows the work: POSITIONING walks while smoothly looking at the target block (no hard yaw snap); COLLECTING looks at the drop being collected / the expected drop position, with the downward pitch capped at a per-phase ground-scan angle (~45° with variance) — tracking the item point directly would crane the head ever steeper on approach
 - Nearest-task routing: the next task is always the one closest to the bot's current position, not the scanner's fixed order — no zigzag routes across a gather area — with a block in view preferred over one behind (see *Task selection*)
-- Blunders, rare and deliberate (`HumanBehavior.blunder`): a zone-out of 4–6 seconds in place of a breather (`zoneOutChance`, per chunk-miner column and per SCANNING→NAVIGATING), and on the bot's own journeys a detour and a pause between two legs (`travelDetourChance`, `travelPauseChance`, passed to `Journey.Quirks`) plus bursts of idle left clicks (`TravelClicks`, below). The chunk miner adds its own two (the miner module's *Deliberate slips*). All of them go through one runtime gate, `HumanBehavior.suppressBlunders`, which the test fixtures switch on (`setupTest`, the miner's `prepareWithFloor`) and the tests for the blunders switch off for themselves — a gate rather than zeroed config chances, so nothing a test does can be written back to the player's `bot.json`
+- Blunders, rare and deliberate (`HumanBehavior.blunder`): a spell away from the game — tabbed out, 3–10 seconds with the camera dead still — in place of a breather (`zoneOutChance`, per chunk-miner column and per SCANNING→NAVIGATING), and on the bot's own journeys a detour and a pause between two legs (`travelDetourChance`, `travelPauseChance`, passed to `Journey.Quirks`) plus bursts of idle left clicks (`TravelClicks`, below). The chunk miner adds its own two (the miner module's *Deliberate slips*). All of them go through one runtime gate, `HumanBehavior.suppressBlunders`, which the test fixtures switch on (`setupTest`, the miner's `prepareWithFloor`) and the tests for the blunders switch off for themselves — a gate rather than zeroed config chances, so nothing a test does can be written back to the player's `bot.json`
 - Idle clicks on the way (`TravelClicks`, ticked by `RestockBehavior` while its journey runs): now and then (`travelClickChance` per tick) a burst of `travelClickMin`–`Max` clicks 2–5 ticks apart, wherever the crosshair already is. Into the air it is vanilla's miss — a swing and a reset attack strength. On a block it is a short press through `BlockInteractor` — START, then ABORT a tick or few later, which is what a player's tap puts on the wire — held only as long as the block's break stays under half done (`MAX_PROGRESS`), and a block the first tick would already break (grass, flowers, torches) or anything in creative is not clicked at all. An entity in the crosshair gets nothing, not even the swing: nothing here ever calls `attack`, and the swing alone at a mob would look like a missed hit. The press is released only if `BlockInteractor` is still on the block it started (`currentTarget`), so a click can never end an interaction the controller has started since, and there are no clicks at all while the controller works (a journey's bridge placement goes through it); `RestockBehavior` stops the burst when the journey ends and in `abort`. Measured by `Bot clicks on its way without breaking or hitting anything` (stone tapped and standing, short grass never pressed, a pig in the crosshair neither hit nor swung at)
 - Tool selection done in LOOKING tick 1 (carried-item packet travels in parallel with the camera turn, no separate tool-settle wait in INTERACTING)
 - Per-session "skill jitter": at `loadConfig` (world join), `HumanBehavior.rollSessionSkill` draws a Gaussian multiplier in [0.85, 1.15]. Multiplied into look-speed and divided out of reaction-delay so every session has slightly different baseline cadence — sometimes the bot is a touch faster, sometimes a touch slower
@@ -816,10 +852,12 @@ Humanness:
 - `reactionDelayMeanTicks` / `reactionDelaySigmaTicks` / `reactionDelayMinTicks` / `reactionDelayMaxTicks` — clamped Gaussian for inter-phase reaction delay (default mean 4, σ=2, range [1, 10] ≈ 50–500 ms). Set mean and σ to 0 to disable.
 - `preAttackHesitationMin/Max` — uniform pre-attack hesitation ticks between LOOKING gate firing and first `startAttack` (default 1–3)
 - `rowAngleMissChance` — chance (default 0.25) that the angle a row is taken at is a little off at first, right for the head block and not the foot block, and is put right after it (see *One angle for the rest of a row*)
-- `longPauseChance` / `longPauseMinTicks` / `longPauseMaxTicks` — chance (default 0.04) that the SCANNING→NAVIGATING reaction delay becomes a longer uniform "breather" pause (default 12–25 ticks). Set chance to 0 to disable.
+- `longPauseChance` / `longPauseMinTicks` / `longPauseMaxTicks` — chance (default 0.04) that the SCANNING→NAVIGATING reaction delay, or the chunk miner's next column, waits for a "breather" pause (default 6–60 ticks, log-normal round 19). Set chance to 0 to disable.
+- `pauseGlanceChance` — chance (default 0.5) that a pause of 20 ticks or more is spent looking round; a blunder, off in the fixtures
 - `collectGazePitchMinDeg/MaxDeg` — cap on the downward pitch while looking at drops in COLLECTING (uniform per phase, default 38–52°); steeper aims become a "scan the ground ahead" look in the item's direction
-- `zoneOutChance` / `zoneOutMinTicks` / `zoneOutMaxTicks` — chance (default 0.005) that a breather becomes a zone-out of 80–120 ticks; the same tick range is the length of a journey's pause between legs
+- `zoneOutChance` / `zoneOutMinTicks` / `zoneOutMaxTicks` — chance (default 0.005) that a breather becomes a spell away from the game of 60–200 ticks (3–10 s, log-normal), the camera not driven at all; the same range is the length of a journey's pause between legs
 - `travelDetourChance` / `travelPauseChance` — per leg of the bot's own journeys (defaults 0.05 / 0.03), see the pathfinding module's *Quirks*
+- `travelGlanceChance` — per sprint-jump of the bot's own journeys, a look off to the side in the air (default 0.2), likewise a quirk
 - `travelClickChance` / `travelClickMin` / `travelClickMax` — per tick of a journey, the chance (default 0.004, about one burst every twelve seconds) of a burst of 2–6 idle clicks
 
 Phases / timing:
@@ -854,7 +892,7 @@ Restocking (see *Restocking*; where a chest **is** is per server in `servers.jso
 Tests in `test/BotTests.java`, registered via `TestRunner.instance().registerSuite(BotTests.class)`.
 Run via `./gradlew runMinecraftTests`. Each test builds its environment with `/fill` + `/setblock`.
 
-Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, a restock whose nearest barrel is full, the `/bot server exit command` argument against servers.json, an exit command driven against a real teleport, an occluded approach that has to walk before it may break, a corner walked up to rather than climbed onto, a block walked up to instead of reached for, one closed in on while the break is already running, one across a trench that has to be mined from where the bot stands, a one-block teleport that has to end the run, and the lower block of a column taken from its top, and a column mined with one aim, the block in view taken before an equally near one behind, and idle clicks on the way that never break a block or touch a mob.
+Test cases: single block mine, tool selection, tree chop, camera smoothness, walk-and-mine, multi-task queue, walk→mine→walk→chop, ore vein, out-of-reach failure, place block, place-needs-support, policy damage stop, policy inventory-full stop, policy fast collect exit, policy opportunistic collection, ledge refusal, bridging, digging down without turning, stepping up out of a dip, collecting from a dip, a block falling into the cell, an ignored drop, a meal between tasks, hungry with nothing to eat, hungry with only what the meal list rules out, the `/bot ignore` commands against bot.json, the `/bot storage` commands against servers.json, a restock that interrupts and resumes a run, a shortfall with no chest to serve it, a restock whose nearest barrel is full, the `/bot server exit command` argument against servers.json, an exit command driven against a real teleport, an occluded approach that has to walk before it may break, a corner walked up to rather than climbed onto, a block walked up to instead of reached for, one closed in on while the break is already running, one across a trench that has to be mined from where the bot stands, a one-block teleport that has to end the run, and the lower block of a column taken from its top, and a column mined with one aim, the block in view taken before an equally near one behind, idle clicks on the way that never break a block or touch a mob, the storage in view opened before a nearer one behind, a long pause spent looking round, and a spell away from the game with the camera dead still.
 
 **The suite reads the player's live `stracciatella/bot.json`**, and that is a trap worth naming: with `ignoredItems` set to cobblestone and dirt — a perfectly reasonable thing for a player to want — thirteen tests fail, because they assert that the bot collects the cobblestone it mines and the config forbids exactly that. Measured both ways in one sitting: 16 failures with that list, 4 with it empty, nothing else changed. Measured again later on `-Psuites=bot` alone, with cobblestone and dirt on the list: **6 failures, and 0 with the list emptied** — all six were collect assertions. A suite whose result depends on what was last typed in-game cannot tell a regression from a setting, so set the file aside before reading a run as a verdict, and put it back afterwards. The same file is why a test that edits `ignoredItems` in memory must **put the whole list back**, not undo its own edit: `Bot ignore commands edit the list` saves whatever it finds later in the same run, so anything left over is written to the player's config and is there again at the next start. Undoing the edit was tried and is the subtler bug — `ignoredItems` is a `List`, so adding an entry the player already had is *not* a no-op, it appends a second copy, and a removal skipped on the grounds that the entry was already there leaves that copy behind. One duplicate per run, silently: a real `bot.json` had accumulated twelve `minecraft:cobblestone`. Snapshot with `new ArrayList<>(...)` up front and `clear` + `addAll` in the `finally`; there is then nothing to reason about and no case to get wrong.
 
