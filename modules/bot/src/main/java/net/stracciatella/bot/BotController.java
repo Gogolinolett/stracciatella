@@ -348,6 +348,9 @@ public class BotController {
     // Ticks LOOKING walks on for the block to come under the held line before
     // the angle is given up as the wrong one: half a step takes about four.
     private static final int ROW_FIND_TICKS = 20;
+    // How near the held angle the camera has to be before the line counts as
+    // landing on a block (degrees, the settle tolerance LOOKING uses elsewhere).
+    private static final float ROW_ON_ANGLE_DEG = 3.0f;
 
     // The name of a block the bot was about to mine while carrying nothing that
     // would drop it. A latch rather than a query, because the fact is only
@@ -812,6 +815,18 @@ public class BotController {
             arrived = false;
         } else if (forceApproach && policy.approachOccluded()) {
             arrived = hasLineOfSight(client, player, currentTask);
+            // The straight walk toward the target has stuck: whatever hides it
+            // also stands in the way. A path round to a place it is in sight
+            // from, then — once, which is why the approach ends with it. Turned
+            // into a corner the staircase closes off, the bot pressed into the
+            // step that hid the next block for the whole position timeout,
+            // three times over, and the run ended on cannot break.
+            if (!arrived && !closingIn(horizontalDistanceTo(player, approaching))
+                    && closeStalledTicks == CLOSING_STALL_TICKS
+                    && navigateToStandoff(player, approaching, true)) {
+                forceApproach = false;
+                return;
+            }
         } else if (forceApproach) {
             // Close range, measured the whole way, with no settling for reach:
             // this walk exists to change the viewpoint, and a re-approach that
@@ -1083,14 +1098,19 @@ public class BotController {
             // its way onto the row's angle; that is no hit while the body still
             // stands in the row before, or the block is dug from beside the row.
             boolean inLane = Math.abs(rowLateral(player, target)) <= ROW_LANE_ENTRY;
+            // Nor while the camera is still on its way onto the angle: the
+            // line that is held is to land on the block, not the crosshair
+            // sweeping past it. With the body in the lane a little early, a
+            // turn's first column was dug looking 32 degrees off the row.
+            boolean onAngle = camera.isAimedAt(player, aim[0], aim[1], aim[2], ROW_ON_ANGLE_DEG);
             boolean walking = walkAlongRow(client, player, target);
-            if (!aimedHit || !inLane) {
+            if (!aimedHit || !inLane || !onAngle) {
                 // A first try that misses is put right once it has had a moment.
                 if (inLane && rowAngleOff && phaseTicks >= ROW_MISS_TICKS) {
                     rowPitch = rowPitchMeant;
                     rowAngleOff = false;
                 }
-                if (walking && phaseTicks <= ROW_FIND_TICKS) {
+                if ((walking || aimedHit && inLane) && phaseTicks <= ROW_FIND_TICKS) {
                     return;
                 }
                 releaseRow();
@@ -1457,7 +1477,7 @@ public class BotController {
             return;
         }
         net.minecraft.core.Direction step = rowColumn == null ? null : stepBetween(rowColumn, column);
-        if (step == null) {
+        if (step == null || !opensForBody(player, rowColumn) || !opensForBody(player, column)) {
             forgetRow();
         } else if (!rowHeld || step != rowAxis) {
             // The wait at the end of the column before did not see this one
@@ -1517,7 +1537,8 @@ public class BotController {
         // the block back: let go on the prediction, the camera had turned for
         // the next row while the row's last block stood again.
         boolean settled = ServerBlockSync.isSettled(completionSequence);
-        if (step == null || level < 0 || level > 1) {
+        if (step == null || level < 0 || level > 1
+                || !opensForBody(player, rowColumn) || !opensForBody(player, next)) {
             if (settled) {
                 releaseRow();
             }
@@ -1646,6 +1667,32 @@ public class BotController {
             solid[i] = wall ? 1 : 0;
         }
         return solid[0] == solid[1] ? 0 : solid[0] == 1 ? 1 : -1;
+    }
+
+    /**
+     * Whether a body fits into {@code column} on the level it stands on once
+     * the work there is done: each of its two cells empty already or the
+     * target of this task or a queued one. A row walks the body from column to
+     * column — into each it digs, and first into the one behind where it turns
+     * into a row — so a block left standing at foot or head height in either
+     * ends it. The chunk miner's staircase runs through the chunk's
+     * outer rows, and a step at head height in the last row is such a block:
+     * turned into that row, the bot stood in the corner behind the step, the
+     * next block hidden by it and the straight walk round it blocked by it —
+     * three look timeouts, cannot break.
+     */
+    private static boolean opensForBody(LocalPlayer player, BlockPos column) {
+        Level level = Minecraft.getInstance().level;
+        for (int dy = 0; dy <= 1; dy++) {
+            BlockPos cell = new BlockPos(column.getX(), player.getBlockY() + dy, column.getZ());
+            boolean empty = level.getBlockState(cell).getCollisionShape(level, cell).isEmpty();
+            boolean worked = currentTask != null && currentTask.targetPos().equals(cell)
+                    || taskQueue.targets(cell);
+            if (!empty && !worked) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Whether {@code target} is in the row's current column or the next one along it. */
@@ -3096,6 +3143,17 @@ public class BotController {
             return;
         }
 
+        if (!navigateToStandoff(player, target, false)) {
+            transitionTo(Phase.POSITIONING);
+        }
+    }
+
+    /**
+     * Walk a path to the best place to stand within reach of {@code target}
+     * that a path reaches — with {@code inSight}, only one from which a face of
+     * it is in sight. Whether the walk started (the phase is NAVIGATING).
+     */
+    private static boolean navigateToStandoff(LocalPlayer player, BlockPos target, boolean inSight) {
         // Nothing else builds the meshes this walk needs. The standoff search
         // reads only meshes that already exist, so without this a session that
         // had not meshed the area some other way never once walked a path here —
@@ -3106,26 +3164,47 @@ public class BotController {
                 Math.max(player.getBlockY(), target.getY()) + NAV_BAND);
 
         List<MeshNode> standoffs = findStandoffNodes(player, target);
-        if (standoffs.isEmpty()) {
-            transitionTo(Phase.POSITIONING);
-            return;
+        if (inSight) {
+            // On the bot's own floor: the way round, not up onto whatever
+            // stands there. Offered the top of the chunk miner's staircase — a
+            // fine view of the block — the bot climbed it and was left two
+            // blocks over the slab, out of reach of the rest of the row.
+            int floor = player.getBlockY() - 1;
+            standoffs = standoffs.stream()
+                    .filter(node -> node.getY() == floor && isInSightFrom(level, player, node, target))
+                    .toList();
         }
-
-        MeshNode startNode = MeshManager.findOrBuildNearestNode(level, player, player.blockPosition());
+        MeshNode startNode = standoffs.isEmpty() ? null
+                : MeshManager.findOrBuildNearestNode(level, player, player.blockPosition());
         if (startNode == null) {
-            transitionTo(Phase.POSITIONING);
-            return;
+            return false;
         }
 
         MeshPathfinder pathfinder = new MeshPathfinder();
         List<MeshNode> path = pathfinder.findPathToFirst(startNode, standoffs);
         if (path.isEmpty()) {
-            transitionTo(Phase.POSITIONING);
-            return;
+            return false;
         }
 
         PathWalker.start(path);
         transitionTo(Phase.NAVIGATING);
+        return true;
+    }
+
+    /** Whether an eye standing on {@code node} — the block stood on — sees an open face of {@code target}. */
+    private static boolean isInSightFrom(Level level, LocalPlayer player, MeshNode node, BlockPos target) {
+        Vec3 eye = new Vec3(node.getX() + 0.5, node.getY() + 1 + player.getEyeHeight(), node.getZ() + 0.5);
+        for (net.minecraft.core.Direction face : net.minecraft.core.Direction.values()) {
+            if (!level.getBlockState(target.relative(face)).isAir()) {
+                continue;
+            }
+            BlockHitResult clip = level.clip(new ClipContext(eye, faceCentre(target, face),
+                    ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+            if (clip.getType() == HitResult.Type.BLOCK && clip.getBlockPos().equals(target)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // --- State transitions ---
@@ -3494,9 +3573,11 @@ public class BotController {
                     continue;
                 }
                 for (MeshNode node : mesh.getNodes().values()) {
-                    // Check the node is within reach of the target
+                    // Check the node is within reach of the target. A node is
+                    // the block stood on, so the eye is a block plus eye height
+                    // over it; measured from the node itself it sat a block low.
                     double ndx = (node.getX() + 0.5) - (target.getX() + 0.5);
-                    double ndy = (node.getY() + 1.62) - (target.getY() + 0.5); // eye height
+                    double ndy = (node.getY() + 1 + 1.62) - (target.getY() + 0.5);
                     double ndz = (node.getZ() + 0.5) - (target.getZ() + 0.5);
                     double distToTarget = Math.sqrt(ndx * ndx + ndy * ndy + ndz * ndz);
                     if (distToTarget > maxReach) {

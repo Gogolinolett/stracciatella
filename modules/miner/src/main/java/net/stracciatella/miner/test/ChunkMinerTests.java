@@ -3184,6 +3184,59 @@ public class ChunkMinerTests {
         }
     }
 
+    // ================================================================
+    // Test 49: a row the staircase stands in
+    // ================================================================
+
+    /**
+     * The turn into a slab's last row where the staircase runs through it, as
+     * a real run met it: row 14 east to the chunk's edge, the turn column at
+     * (15, 15), and row 15 west with the head layer's step at (14, 15) and the
+     * foot layer's step under the column after it, at (13, 15). Turned into that
+     * row, the bot walked into the corner behind the head-high step; from there
+     * the head block over the lower step was hidden by that step on one side and
+     * faced away on the other, the straight approach round it was blocked by
+     * it, and the run ended on {@code cannot break} after 754 blocks.
+     *
+     * <p>The head layer is derived from the ring the way {@link #STAIR_Y} is, so
+     * that its step is (14, 15). A one-slab range keeps both steps: they stand
+     * when the run starts, and a standing step in the top two layers is kept.
+     * Asserts the run succeeds, both steps stand and every other cell of the two
+     * rows is air. Three repeats, because where the bot stands when it turns
+     * varies with how the row before ended.
+     */
+    @MinecraftTest(name = "Chunk miner turns into a row the staircase stands in", timeoutTicks = 4000,
+            order = 49, repeat = 3)
+    public void turnsIntoARowTheStaircaseStandsIn(TestContext ctx) {
+        final int head = Y + Math.floorMod(
+                SpiralStairs.ringIndexAt(Y) - SpiralStairs.ringIndex(14, 15),
+                SpiralStairs.RING_LENGTH);
+        final int feet = head - 1;
+        prepareWithFloor(ctx, feet, 8, 14, 0, 15, 12, 15);
+        fill(ctx, 9, feet, 14, 15, head, 14, "stone");
+        fill(ctx, 8, feet, 15, 15, head, 15, "stone");
+        final BlockPos headStep = new BlockPos(BASE_X + 14, head, BASE_Z + 15);
+        final BlockPos footStep = new BlockPos(BASE_X + 13, feet, BASE_Z + 15);
+        final BlockPos lastCell = new BlockPos(BASE_X + 15, head, BASE_Z + 15);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastCell).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        runChunkMiner(ctx, head, feet, true);
+
+        assertNotAir(ctx, headStep, "the head layer's step");
+        assertNotAir(ctx, footStep, "the foot layer's step");
+        for (int dx = 8; dx <= 15; dx++) {
+            for (int dz = 14; dz <= 15; dz++) {
+                for (int y = feet; y <= head; y++) {
+                    BlockPos pos = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (!pos.equals(headStep) && !pos.equals(footStep)) {
+                        assertAir(ctx, pos, "row cell " + dx + "/" + dz + " at y=" + y);
+                    }
+                }
+            }
+        }
+    }
+
     private static String shortList(Set<BlockPos> cells) {
         return cells.isEmpty() ? "nowhere"
                 : String.join("; ", cells.stream().map(BlockPos::toShortString).toList());

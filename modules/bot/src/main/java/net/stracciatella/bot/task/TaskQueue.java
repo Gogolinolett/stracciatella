@@ -71,6 +71,16 @@ public class TaskQueue {
         return best;
     }
 
+    /** Whether a queued task's current target is {@code pos}. */
+    public boolean targets(BlockPos pos) {
+        for (BotTask task : queue) {
+            if (task.targetPos().equals(pos)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public void clear() {
         queue.clear();
     }
