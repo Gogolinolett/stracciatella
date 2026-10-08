@@ -30,9 +30,15 @@ public class ClientPacketListenerMixin {
 
     @Inject(at = @At("TAIL"), method = "handleDamageEvent")
     private void stracciatella$onDamageEvent(ClientboundDamageEventPacket packet, CallbackInfo ci) {
-        LocalPlayer player = Minecraft.getInstance().player;
+        Minecraft client = Minecraft.getInstance();
+        LocalPlayer player = client.player;
         if (player != null && packet.entityId() == player.getId()) {
-            BotAlarm.raiseDamage();
+            net.minecraft.world.entity.Entity cause = client.level == null ? null
+                    : client.level.getEntity(packet.sourceCauseId());
+            String what = packet.sourceType().getRegisteredName()
+                    + (cause != null ? " from " + cause.getName().getString() : "")
+                    + " at " + player.blockPosition().toShortString();
+            BotAlarm.raiseDamage(what);
         }
     }
 

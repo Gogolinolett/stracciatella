@@ -371,7 +371,7 @@ public class BehaviorRunner {
             return null;
         }
         if (activePolicy.stopOnDamage() && damaged) {
-            return "took damage";
+            return "took damage (" + BotAlarm.lastDamage() + ")";
         }
         if (activePolicy.stopOnPlayerAttack() && attacked) {
             return "a player attacked the bot";

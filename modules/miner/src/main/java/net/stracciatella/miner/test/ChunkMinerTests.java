@@ -2818,16 +2818,16 @@ public class ChunkMinerTests {
     }
 
     // ================================================================
-    // Test 48: one heading for the rest of a row
+    // Test 48: one angle for the rest of a row
     // ================================================================
 
     /**
-     * Columns a row may take before the heading has to stand. A person
-     * starting a row turns into it and finds, within the first one to three
-     * columns, the angle from which each next column comes into the crosshair
-     * by walking on — the bound is the upper end of that.
+     * Columns a row may take before its angle has to stand: the first, dug
+     * from the end of the row before and aimed at on its own, and the second,
+     * in which the first try at the row's angle may not quite fit both blocks
+     * and is put right once.
      */
-    private static final int ROW_SETTLE_COLUMNS = 3;
+    private static final int ROW_SETTLE_COLUMNS = 2;
     /**
      * How far yaw and pitch may each wander from the angle once it stands. Not
      * zero: the camera's micro-saccades move them by up to half a degree and a
@@ -2836,37 +2836,96 @@ public class ChunkMinerTests {
      * head block to the foot block under it.
      */
     private static final double MAX_ROW_ANGLE_DRIFT = 3.0;
+    /**
+     * How far the body may move back along the row once the angle stands. A
+     * person mining down a row walks on into the face and never steps back to
+     * get a block under the crosshair; a few centimetres are a collision push,
+     * not a step.
+     */
+    private static final double MAX_ROW_BACK_STEP = 0.05;
+    /**
+     * Share of the held ticks the forward key must be down. All of them is the
+     * requirement — walking on into the face, the body stopped by the block —
+     * less a little for the tick a phase change takes.
+     */
+    private static final double MIN_ROW_WALK_SHARE = 0.95;
+    /**
+     * How far off a row's centre line the body may stand when a block of the
+     * row's second or later column starts to break: its centre inside the
+     * row's lane. Only the first column of a row is dug from the row before.
+     */
+    private static final double MAX_ROW_LANE_OFFSET = 0.5;
+    /**
+     * Sidesteps a row may take once its angle stands. One: drifting toward the
+     * unmined row the wall keeps the body on line by itself, and toward open
+     * ground one correction past the line lasts a row.
+     */
+    private static final int MAX_ROW_STRAFES = 1;
+    /**
+     * How far across the rows' direction the body may stand off the column
+     * when the first column of a row after the first starts to break: its
+     * centre inside the cell straight behind it, the last column of the row
+     * before. A person walks on into the column just dug, turns a quarter and
+     * digs the next row's first column straight ahead, not aslant from a
+     * column short.
+     */
+    private static final double MAX_TURN_OFFSET = 0.5;
+    /**
+     * How far the view may point off straight across the rows at that break.
+     * A quarter turn from the row before, give or take a person's own slant;
+     * dug aslant from a column short, the bot looked 64 to 73 degrees off it.
+     */
+    private static final double MAX_TURN_YAW_OFF = 15.0;
 
     /**
-     * Two neighbouring rows of a slab, two high and fourteen long: the first
-     * runs east, the snake turns, the second runs back west beside the one just
-     * cleared — which is every row of a real slab after its first. A person
-     * mining a row does not aim anew at every column: after the first one to
-     * three columns they have found a heading from which walking on brings the
-     * next column under the crosshair, and they keep it to the row's end.
+     * Three neighbouring rows of a slab, two high and fourteen long, run as a
+     * snake: east, west beside the first, east again — every row but the last
+     * with the unmined next row on one side and the cleared one before it on
+     * the other, as in a real slab. At a row's end a person walks on into the
+     * last column, turns a quarter, digs the next row's first column straight
+     * ahead, walks into it and turns a quarter again into the row. They do not
+     * aim anew at every column there: they take the angle from
+     * which walking on brings the next block under the crosshair — mostly the
+     * right one at the first try, now and then one block late — and keep it to
+     * the row's end. They do not sidestep back to the middle of the row every
+     * few blocks, and not back and forth to put a block under the crosshair:
+     * they walk on into the face the whole time, the forward key down.
      * Collecting is the exception the requirement names, so COLLECTING ticks
-     * are left out; the body stepping toward a drop while the camera holds is
-     * not a turn and needs no exception.
+     * are left out.
      *
-     * <p>Measured as the largest yaw and pitch difference from the angle the
-     * row had when the first block of its fourth column began to break, over
-     * every later tick that works a block of that row while the block still
-     * stands. The first: the angle found over three columns may be turned onto
-     * as the fourth comes up, but that column is worked at it. The second: once
-     * the row's last block is gone, turning to the next row is the next piece
-     * of work. Aimed per block, the same run turned 9 to 34 degrees of yaw per
-     * column and swung the pitch by 25 to 35.
+     * <p>Measured per row: the largest yaw and pitch difference from the angle
+     * at the first break of its third column, over every later tick that works
+     * a block of that row while the block still stands — once the row's last
+     * block is gone, turning to the next row is the next piece of work; over
+     * the same ticks how far the body moved back along the row, the share of
+     * ticks with the forward key down and the number of strafes; where the
+     * body stood at the first break of every column after the first; and, for
+     * every row after the first, where it stood and which way it looked at the
+     * first break of the row's first column. Dug from a column short of the
+     * row before's end, that column was aslant: the body 0.8 off it and the
+     * view 64 to 73 degrees off straight across. Aimed per
+     * block, the bot turned 9 to 34 degrees of yaw per column and swung the
+     * pitch by 25 to 35; walking to a measured spot it moved 0.43 blocks back
+     * with the key down on 18% of the ticks.
+     *
+     * <p>Three repeats, because where the bot stands when a row begins varies
+     * with how the one before ended, and the case that broke the held angle —
+     * still in the earlier row's lane, diagonal to the new row's first column —
+     * came up in one run of three.
      */
-    @MinecraftTest(name = "Chunk miner holds its heading along a row", timeoutTicks = 6000, order = 48)
+    @MinecraftTest(name = "Chunk miner holds its heading along a row", timeoutTicks = 8000, order = 48,
+            repeat = 3)
     public void holdsItsHeadingAlongARow(TestContext ctx) {
-        final int eastRow = 6;
-        final int westRow = 7;
-        prepareWithFloor(ctx, 0, eastRow, 0, 15, eastRow - 1, westRow + 1);
-        fill(ctx, 1, Y, eastRow, 14, Y + 1, westRow, "stone");
-        final BlockPos lastCell = new BlockPos(BASE_X + 14, Y + 1, BASE_Z + westRow);
+        final int firstRow = 6;
+        final int lastRow = 8;
+        prepareWithFloor(ctx, 0, firstRow, 0, 15, firstRow - 1, lastRow + 1);
+        fill(ctx, 1, Y, firstRow, 14, Y + 1, lastRow, "stone");
+        final BlockPos lastCell = new BlockPos(BASE_X + 14, Y + 1, BASE_Z + lastRow);
         ctx.waitFor(mc -> !mc.level.getBlockState(lastCell).isAir());
 
-        final RowAimTrace trace = new RowAimTrace(BASE_Z + eastRow, BASE_Z + westRow);
+        final RowAimTrace trace = new RowAimTrace(
+                new int[] {BASE_Z + firstRow, BASE_Z + firstRow + 1, BASE_Z + lastRow},
+                new int[] {1, -1, 1});
         startChunkMiner(ctx, true, Y + 1, Y);
         ctx.waitFor(mc -> {
             trace.sample(mc);
@@ -2878,15 +2937,30 @@ public class ChunkMinerTests {
                     + ctx.computeOnClient(mc -> MinerSetup.chunkMiner().statusLine()) + " — " + trace);
         }
         for (int dx = 1; dx <= 14; dx++) {
-            for (int dz = eastRow; dz <= westRow; dz++) {
+            for (int dz = firstRow; dz <= lastRow; dz++) {
                 assertAir(ctx, new BlockPos(BASE_X + dx, Y, BASE_Z + dz), "row block " + dx + "/" + dz);
                 assertAir(ctx, new BlockPos(BASE_X + dx, Y + 1, BASE_Z + dz), "row head " + dx + "/" + dz);
             }
         }
         LOGGER.info("Row heading trace: {}", trace);
-        for (int row = 0; row < 2; row++) {
+        for (int row = 0; row <= lastRow - firstRow; row++) {
             if (trace.heldColumns(row) < 1) {
                 throw new AssertionError("Row " + row + " never got past its settling columns — " + trace);
+            }
+            if (row > 0 && trace.turnOffset(row) > MAX_TURN_OFFSET) {
+                throw new AssertionError("Row " + row + "'s first column was dug from aside: it started breaking"
+                        + " with the body " + Math.round(trace.turnOffset(row) * 100) / 100.0
+                        + " off the column across the rows, allowed " + MAX_TURN_OFFSET + " — " + trace);
+            }
+            if (row > 0 && trace.turnYawOff(row) > MAX_TURN_YAW_OFF) {
+                throw new AssertionError("Row " + row + "'s first column was dug aslant: the view pointed "
+                        + Math.round(trace.turnYawOff(row) * 10) / 10.0 + " degrees off straight across the rows"
+                        + ", allowed " + MAX_TURN_YAW_OFF + " — " + trace);
+            }
+            if (trace.laneOffset(row) > MAX_ROW_LANE_OFFSET) {
+                throw new AssertionError("Row " + row + " was dug from beside it: a column after the first"
+                        + " started breaking with the body " + Math.round(trace.laneOffset(row) * 100) / 100.0
+                        + " off the row's centre line, allowed " + MAX_ROW_LANE_OFFSET + " — " + trace);
             }
             if (trace.drift(row) > MAX_ROW_ANGLE_DRIFT) {
                 throw new AssertionError("Row " + row + " did not keep its heading: yaw wandered "
@@ -2898,25 +2972,50 @@ public class ChunkMinerTests {
                         + Math.round(trace.pitchDrift(row) * 10) / 10.0 + " degrees after column "
                         + ROW_SETTLE_COLUMNS + ", allowed " + MAX_ROW_ANGLE_DRIFT + " — " + trace);
             }
+            if (trace.backStep(row) > MAX_ROW_BACK_STEP) {
+                throw new AssertionError("Row " + row + " walked back and forth: "
+                        + Math.round(trace.backStep(row) * 100) / 100.0 + " blocks back along the row"
+                        + ", allowed " + MAX_ROW_BACK_STEP + " — " + trace);
+            }
+            if (trace.walkShare(row) < MIN_ROW_WALK_SHARE) {
+                throw new AssertionError("Row " + row + " did not keep walking: forward held on "
+                        + Math.round(trace.walkShare(row) * 100) + "% of its ticks, required "
+                        + Math.round(MIN_ROW_WALK_SHARE * 100) + "% — " + trace);
+            }
+            if (trace.strafes(row) > MAX_ROW_STRAFES) {
+                throw new AssertionError("Row " + row + " kept sidestepping back to the middle: "
+                        + trace.strafes(row) + " strafes, allowed " + MAX_ROW_STRAFES + " — " + trace);
+            }
         }
     }
 
     /**
-     * Per row: the columns in the order they were worked, and from the column
-     * after the settling ones on, how far the yaw strayed from the heading it
-     * started that column with. Field arithmetic only, sampled on the tick
-     * thread; the per-column summary is built as text once per column.
+     * Per row: the columns in the order they were worked, and from the first
+     * break after the settling columns on, how the angle and the body behaved.
+     * Field arithmetic only, sampled on the tick thread; the per-column summary
+     * is built as text once per column.
      */
     private static final class RowAimTrace {
         private final int[] rowZ;
-        private final BlockPos[] lastColumn = new BlockPos[2];
-        private final int[] columns = new int[2];
-        private final float[] heading = new float[2];
-        private final boolean[] headingSet = new boolean[2];
-        private final double[] drift = new double[2];
-        private final float[] headingPitch = new float[2];
-        private final double[] pitchDrift = new double[2];
+        private final int[] rowStepX;
+        private final double[] furthest;
+        private final double[] backStep;
+        private final int[] heldTicks;
+        private final int[] walkTicks;
+        private final int[] strafes;
+        private final double[] laneOffset;
+        private final double[] turnOffset;
+        private final double[] turnYawOff;
+        private final BlockPos[] lastColumn;
+        private final int[] columns;
+        private final boolean[] columnBreaking;
+        private final float[] heading;
+        private final boolean[] headingSet;
+        private final double[] drift;
+        private final float[] headingPitch;
+        private final double[] pitchDrift;
         private final StringBuilder log = new StringBuilder();
+        private boolean strafing;
         private float columnYawStart;
         private float columnLastYaw;
         private double columnYawTravel;
@@ -2924,8 +3023,26 @@ public class ChunkMinerTests {
         private float columnPitchMax;
         private boolean columnOpen;
 
-        RowAimTrace(int... rowZ) {
+        RowAimTrace(int[] rowZ, int[] rowStepX) {
             this.rowZ = rowZ;
+            this.rowStepX = rowStepX;
+            int rows = rowZ.length;
+            furthest = new double[rows];
+            backStep = new double[rows];
+            heldTicks = new int[rows];
+            walkTicks = new int[rows];
+            strafes = new int[rows];
+            laneOffset = new double[rows];
+            turnOffset = new double[rows];
+            turnYawOff = new double[rows];
+            lastColumn = new BlockPos[rows];
+            columns = new int[rows];
+            columnBreaking = new boolean[rows];
+            heading = new float[rows];
+            headingSet = new boolean[rows];
+            drift = new double[rows];
+            headingPitch = new float[rows];
+            pitchDrift = new double[rows];
         }
 
         void sample(Minecraft mc) {
@@ -2936,7 +3053,12 @@ public class ChunkMinerTests {
                 return;
             }
             BlockPos target = task.targetPos();
-            int row = target.getZ() == rowZ[0] ? 0 : target.getZ() == rowZ[1] ? 1 : -1;
+            int row = -1;
+            for (int i = 0; i < rowZ.length; i++) {
+                if (target.getZ() == rowZ[i]) {
+                    row = i;
+                }
+            }
             if (row < 0) {
                 return;
             }
@@ -2947,6 +3069,7 @@ public class ChunkMinerTests {
                 closeColumn();
                 lastColumn[row] = column;
                 columns[row]++;
+                columnBreaking[row] = false;
                 log.append(" r").append(row).append("#").append(columns[row])
                         .append(" x=").append(target.getX())
                         .append(String.format(java.util.Locale.US, " body=(%.2f,%.2f)",
@@ -2958,11 +3081,24 @@ public class ChunkMinerTests {
                 columnPitchMax = pitch;
                 columnOpen = true;
             }
-            if (!headingSet[row] && columns[row] > ROW_SETTLE_COLUMNS
-                    && BotController.getPhase() == BotController.Phase.INTERACTING) {
+            boolean breaking = BotController.getPhase() == BotController.Phase.INTERACTING;
+            if (breaking && !columnBreaking[row]) {
+                columnBreaking[row] = true;
+                if (columns[row] > 1) {
+                    laneOffset[row] = Math.max(laneOffset[row],
+                            Math.abs(player.getZ() - (rowZ[row] + 0.5)));
+                } else if (row > 0) {
+                    // The rows lie one after another toward +z, which is yaw 0.
+                    turnOffset[row] = Math.abs(player.getX() - (target.getX() + 0.5));
+                    turnYawOff[row] = Math.abs(Mth.degreesDifference(0.0f, yaw));
+                }
+            }
+            double progress = player.getX() * rowStepX[row];
+            if (!headingSet[row] && columns[row] > ROW_SETTLE_COLUMNS && breaking) {
                 heading[row] = yaw;
                 headingPitch[row] = pitch;
                 headingSet[row] = true;
+                furthest[row] = progress;
             }
             columnYawTravel += Math.abs(Mth.degreesDifference(columnLastYaw, yaw));
             columnLastYaw = yaw;
@@ -2974,7 +3110,42 @@ public class ChunkMinerTests {
                     && !mc.level.getBlockState(target).isAir()) {
                 drift[row] = Math.max(drift[row], Math.abs(Mth.degreesDifference(heading[row], yaw)));
                 pitchDrift[row] = Math.max(pitchDrift[row], Math.abs(pitch - headingPitch[row]));
+                furthest[row] = Math.max(furthest[row], progress);
+                backStep[row] = Math.max(backStep[row], furthest[row] - progress);
+                heldTicks[row]++;
+                if (mc.options.keyUp.isDown()) {
+                    walkTicks[row]++;
+                }
+                boolean strafe = mc.options.keyLeft.isDown() || mc.options.keyRight.isDown();
+                if (strafe && !strafing) {
+                    strafes[row]++;
+                }
+                strafing = strafe;
             }
+        }
+
+        double backStep(int row) {
+            return backStep[row];
+        }
+
+        double walkShare(int row) {
+            return heldTicks[row] == 0 ? 0.0 : (double) walkTicks[row] / heldTicks[row];
+        }
+
+        int strafes(int row) {
+            return strafes[row];
+        }
+
+        double laneOffset(int row) {
+            return laneOffset[row];
+        }
+
+        double turnOffset(int row) {
+            return turnOffset[row];
+        }
+
+        double turnYawOff(int row) {
+            return turnYawOff[row];
         }
 
         private void closeColumn() {
@@ -3001,8 +3172,15 @@ public class ChunkMinerTests {
         @Override
         public String toString() {
             closeColumn();
-            return String.format(java.util.Locale.US, "drift=[%.1f, %.1f] pitchDrift=[%.1f, %.1f] columns=[%d, %d]%s",
-                    drift[0], drift[1], pitchDrift[0], pitchDrift[1], columns[0], columns[1], log);
+            StringBuilder rows = new StringBuilder();
+            for (int i = 0; i < rowZ.length; i++) {
+                rows.append(String.format(java.util.Locale.US,
+                        " [row %d: drift=%.1f pitchDrift=%.1f backStep=%.2f walk=%.2f strafes=%d lane=%.2f"
+                                + " turn=%.2f/%.1f columns=%d]",
+                        i, drift[i], pitchDrift[i], backStep[i], walkShare(i), strafes[i], laneOffset[i],
+                        turnOffset[i], turnYawOff[i], columns[i]));
+            }
+            return rows + log.toString();
         }
     }
 

@@ -65,6 +65,12 @@ public final class BotAlarm {
     private static boolean damaged = false;
     private static boolean attacked = false;
     private static boolean teleported = false;
+    /**
+     * What the last damage was, for the stop message: a bare "took damage" left
+     * a restock stopped on its way back with nothing in the log to say whether
+     * a mob, a fall or a cactus had done it.
+     */
+    private static String lastDamage = "unknown";
 
     /** The last {@link #TRAIL_TICKS} positions, flat as x, y, z triples. */
     private static final double[] trail = new double[TRAIL_TICKS * 3];
@@ -74,9 +80,15 @@ public final class BotAlarm {
     private BotAlarm() {
     }
 
-    /** The bot took damage from any source. */
-    public static void raiseDamage() {
+    /** The bot took damage from any source; {@code what} says which, for the stop message. */
+    public static void raiseDamage(String what) {
         damaged = true;
+        lastDamage = what;
+    }
+
+    /** What the last damage was, as {@link #raiseDamage} described it. */
+    public static String lastDamage() {
+        return lastDamage;
     }
 
     /** A player swung at the bot, whether or not it did damage. */

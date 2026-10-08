@@ -281,37 +281,73 @@ public class BotController {
     private static Vec3 heldAim;
 
     // The row being dug, for the angle held along it — see considerRowHold.
-    // The column the last mining task worked (y zeroed), the step from the
-    // column before it, how many columns of the row so far, and how many this
-    // row is worked with an aim per block before the angle is settled on.
+    // The column the last mining task worked (y zeroed) and the step from the
+    // column before it; the angle held, whether it is, and the one it was
+    // meant to be while a first try that misses is held (rowAngleOff); and
+    // the strafe under way back toward the row's centre line, 0 for none.
     private static BlockPos rowColumn;
     private static net.minecraft.core.Direction rowAxis;
-    private static int rowColumns;
-    private static int rowSettleColumns;
     private static boolean rowHeld;
     private static float rowYaw;
     private static float rowPitch;
-    // The angle a row is held at. Yaw: the row's own direction, kept from the
-    // bot's heading by at most this much — wider, and the line of sight leaves
-    // the row's one-block lane before the row ends.
+    private static boolean rowAngleOff;
+    private static float rowPitchMeant;
+    private static int rowStrafe;
+    // Whether the task in hand opened its column (the first block worked in
+    // it) rather than following a block of the same column.
+    private static boolean rowNewColumn;
+    // The destroy stage (tenths of the break) from which the key goes up on a
+    // block with nothing after it: the last tick or two of a stone block.
+    private static final int ROW_LET_GO_STAGE = 8;
+    // The angle a row is held at, drawn afresh for every row. Yaw: the row's
+    // own direction give or take this much — wider, and the line of sight
+    // leaves the row's one-block lane before the row ends — and with no wall
+    // beside the row to take the drift, this much (0.15 over sixteen blocks).
     private static final float ROW_YAW_SLACK = 1.5f;
-    // Where the body stands to work a column under a held angle: this far from
-    // the column's centre along the row, the eye 0.6 off its face, and within
-    // this much of that. A fixed angle needs a fixed distance. The walk into
-    // the face left it to chance — 0.9 off the face where the step check
-    // refused the step into the column, 0.3 where the walk into the column
-    // just broken carried the body on — and from 0.9 the line met the foot
-    // block under the head block it was meant for, from 0.3 it went over the
-    // foot block's top into the next column. Either let the angle go.
-    private static final double ROW_STAND_OFF = 1.1;
-    private static final double ROW_STAND_TOLERANCE = 0.1;
-    // Pitch: from 0.6 off the face the line meets the head block about a
-    // third of a block above its bottom edge and, once the head block is gone,
-    // the foot block's top about half way into its column — one angle for both
-    // blocks, with a quarter block to spare either way for where the body
-    // actually comes to rest.
-    private static final float ROW_PITCH_MIN = 28.0f;
-    private static final float ROW_PITCH_MAX = 31.0f;
+    private static final float ROW_YAW_SLACK_OPEN = 0.5f;
+    // A first try that misses (rowAngleMissChance) is taken this shallow: the
+    // head block is still met, the foot block's top no longer — from against
+    // the column the line runs on over it into the next one, which takes less
+    // than about 25 degrees — so it is put right with a second, small turn
+    // after the head block, the way a person's first aim at a new row now and
+    // then takes one block to settle. Put right after this many ticks of the
+    // crosshair off the block.
+    private static final float ROW_MISS_PITCH_MIN = 20.0f;
+    private static final float ROW_MISS_PITCH_MAX = 24.0f;
+    private static final int ROW_MISS_TICKS = 6;
+    // Under a held angle the body walks on into the face the whole time, as a
+    // person holding the forward key does, and the block stops it: the eye
+    // then stands half a body's width, 0.3, off the face, and that is the one
+    // distance the angle is made for. A fixed angle needs a fixed distance, and
+    // this one needs nothing but the key. Walking to a measured spot instead
+    // — 0.6 off the face, forward or back to it — got the distance, and made
+    // the bot step back and forth in front of every column.
+    //
+    // Pitch: from 0.3 off the face the line meets the head block well above
+    // its bottom edge and, once the head block is gone, the foot block's top
+    // half way into its column — one angle for both blocks; and walking into
+    // the column the foot block leaves, it lands on the next head block from
+    // about 0.7 off that one's face, half a step on.
+    private static final float ROW_PITCH_MIN = 34.0f;
+    private static final float ROW_PITCH_MAX = 38.0f;
+    // How far ahead of the body the walk looks for a floor to walk onto; how
+    // far off the row's centre line the body may drift toward open ground
+    // before a strafe brings it back — the line of sight runs along the row
+    // from the eye; how far off it the body steps into the row's lane instead,
+    // the centre of the body outside it; and how far short of the column's
+    // centre the body has to be for walking on to lead to it: pressed against
+    // the face it stands 0.8 short.
+    private static final double ROW_FLOOR_LOOKAHEAD = 0.6;
+    private static final double ROW_LANE_DRIFT = 0.3;
+    private static final double ROW_LANE_ENTRY = 0.5;
+    // How far a body coasts once the strafe key is up, in ticks of its current
+    // speed: ground friction leaves 0.546 of it each tick, and 0.546 / (1 -
+    // 0.546) is about 1.2, plus the tick the key is still read on.
+    private static final double ROW_STRAFE_COAST = 2.2;
+    private static final double ROW_BEHIND = 0.6;
+    // Ticks LOOKING walks on for the block to come under the held line before
+    // the angle is given up as the wrong one: half a step takes about four.
+    private static final int ROW_FIND_TICKS = 20;
 
     // The name of a block the bot was about to mine while carrying nothing that
     // would drop it. A latch rather than a query, because the fact is only
@@ -995,7 +1031,7 @@ public class BotController {
                     && onIt.getBlockPos().equals(target)) {
                 heldAim = onIt.getLocation().add(player.getViewVector(1.0f).scale(0.01));
             }
-            trackRow(currentTask);
+            trackRow(player, currentTask);
             // Select the tool now so the carried-item (and any inventory-swap)
             // packets travel to the server *in parallel* with the smooth
             // camera turn. By the time the hit-result gate fires, the server
@@ -1020,7 +1056,10 @@ public class BotController {
                 }
             }
             toolSelected = true;
-            releaseMovementKeys();
+            // Along a held row the walk goes on from block to block.
+            if (!rowHeld) {
+                releaseMovementKeys();
+            }
         }
         double[] aim = workAim(client, player, currentTask);
         aimCameraAt(player, aim[0], aim[1], aim[2]);
@@ -1039,11 +1078,24 @@ public class BotController {
         // the next head block comes into the crosshair half a step on. Where
         // walking on cannot do that the angle was the wrong one for this block,
         // and the aim per block takes over from the next tick.
-        if (!aimedHit && rowHeld) {
-            if (stepToRowStand(client, player, target)) {
-                return;
+        if (rowHeld) {
+            // Turning into a new row, the crosshair sweeps over the block on
+            // its way onto the row's angle; that is no hit while the body still
+            // stands in the row before, or the block is dug from beside the row.
+            boolean inLane = Math.abs(rowLateral(player, target)) <= ROW_LANE_ENTRY;
+            boolean walking = walkAlongRow(client, player, target);
+            if (!aimedHit || !inLane) {
+                // A first try that misses is put right once it has had a moment.
+                if (inLane && rowAngleOff && phaseTicks >= ROW_MISS_TICKS) {
+                    rowPitch = rowPitchMeant;
+                    rowAngleOff = false;
+                }
+                if (walking && phaseTicks <= ROW_FIND_TICKS) {
+                    return;
+                }
+                releaseRow();
+                releaseMovementKeys();
             }
-            releaseRow();
         }
         if (!aimedHit) {
             // Something is in the way, and no amount of aiming moves it. The
@@ -1379,52 +1431,79 @@ public class BotController {
     }
 
     /**
-     * Count the columns of a straight row as their tasks come up. A second
+     * Follow the columns of a straight row as their tasks come up. A second
      * block of the same column changes nothing; the next column one step on
-     * along the row extends it; anything else — a turn, a jump, a placement —
-     * ends the row and lets go of its angle.
+     * extends it — a turn as well, as a row of its own along the new
+     * direction — and takes the angle here where {@link #considerRowHold} did
+     * not already; anything else — a jump, a placement — ends the row and
+     * lets go of its angle.
      */
-    private static void trackRow(BotTask task) {
-        if (task.interactionType() != InteractionType.ATTACK) {
+    private static void trackRow(LocalPlayer player, BotTask task) {
+        BlockPos target = task.targetPos();
+        // A row is dug on the level the body stands on — the foot block and
+        // the head block in front of it. The headroom the chunk miner digs up
+        // its staircase lines up one column on per step as well, a block
+        // higher each time; taken for a row, the walk carried the bot along
+        // the stairs, and the way back down into the pit from where it ended
+        // timed out three times.
+        int level = target.getY() - player.getBlockY();
+        if (task.interactionType() != InteractionType.ATTACK || level < 0 || level > 1) {
             forgetRow();
             return;
         }
-        BlockPos target = task.targetPos();
         BlockPos column = new BlockPos(target.getX(), 0, target.getZ());
         if (column.equals(rowColumn)) {
+            rowNewColumn = false;
             return;
         }
         net.minecraft.core.Direction step = rowColumn == null ? null : stepBetween(rowColumn, column);
-        if (step == null || rowAxis != null && step != rowAxis) {
+        if (step == null) {
             forgetRow();
-        } else {
-            rowAxis = step;
+        } else if (!rowHeld || step != rowAxis) {
+            // The wait at the end of the column before did not see this one
+            // coming: the behavior planned it only afterwards, after a
+            // breather. Taken now, on the column's first look, or a turn after
+            // a breather was dug aslant from a column short and a row after
+            // one aimed per block to its end.
+            takeRowAngle(player, column, step);
         }
         rowColumn = column;
-        rowColumns++;
+        rowNewColumn = true;
     }
 
     /**
-     * Settle on one angle for the rest of the row, once the row has had its
-     * settling columns. Asked while the last block of a column is being
-     * confirmed and the next task is already known — the moment a person's
-     * hand moves on — so the camera turns onto the angle in that wait and the
-     * next column starts on it.
+     * Settle on one angle for the rest of the row. Asked while the last block
+     * of a column is being confirmed and the next column is one step on — the
+     * moment a person's hand moves on — so the camera turns onto the angle in
+     * that wait and the next column starts on it.
      *
-     * <p>Someone digging along a row does not aim afresh at every column. After
-     * the first one to three they have found the angle from which walking on
-     * brings each next block under the crosshair — the head block, the foot
-     * block's top through the gap it leaves, half a step, the next head block —
-     * and they keep it to the row's end. Aimed per block, the bot turned 9 to 34
-     * degrees of yaw and swung its pitch by 25 to 35 on every column of a
-     * straight row it was walking down the middle of.
+     * <p>A next column one step off to the side is a turn, and a turn is a row
+     * of its own along the new direction: at the end of a row the next row's
+     * first column lies beside the last one, and a person walks on into the
+     * column just dug, turns a quarter, digs the next row's first column
+     * straight ahead, walks into it and turns a quarter again into the row. So
+     * the turn takes a new angle and the step into the row's lane carries the
+     * body into the column just dug ({@link #walkAlongRow}). Let go at the
+     * turn, the bot stood a column short, dug the next row's first column
+     * aslant from there and turned through 170 to 200 degrees in one go.
+     *
+     * <p>Someone digging along a row does not aim afresh at every column. They
+     * take the angle from which walking on brings each next block under the
+     * crosshair — the head block, the foot block's top through the gap it
+     * leaves, half a step, the next head block — and keep it to the row's end;
+     * a little different in every row, and now and then one block late
+     * ({@code rowAngleMissChance}, see {@link #ROW_MISS_PITCH_MIN}). Aimed per
+     * block, the bot turned 9 to 34 degrees of yaw and swung its pitch by 25 to
+     * 35 on every column of a straight row it was walking down the middle of.
+     * Settling only after one to three columns aimed one by one, it also dug
+     * the new row's second and third columns from the row before.
      *
      * <p>The line of sight runs along the row, so it only finds the row's blocks
-     * from an eye standing in it; the walk to the stand puts the body there
-     * ({@link #stepToRowStand}). Where that walk cannot be made, the angle lets
-     * go again before a block is missed. A next task that does not continue
-     * the row ends it here, so the turn toward the next row happens in this
-     * same wait.
+     * from an eye standing in it; the walk puts the body there, a step into the
+     * row's lane first where it is not ({@link #walkAlongRow}). Where that walk
+     * cannot be made, the angle lets go again before a block is missed. A next
+     * task that is not a neighbouring column on the body's level ends the row
+     * here.
      */
     private static void considerRowHold(LocalPlayer player, BotTask ahead) {
         BlockPos next = new BlockPos(ahead.targetPos().getX(), 0, ahead.targetPos().getZ());
@@ -1432,36 +1511,168 @@ public class BotController {
             return;
         }
         net.minecraft.core.Direction step = rowColumn == null ? null : stepBetween(rowColumn, next);
-        if (step == null || rowAxis != null && step != rowAxis) {
-            releaseRow();
+        int level = ahead.targetPos().getY() - player.getBlockY();
+        // Not before the server has the block gone too. The client shows it
+        // gone on its own prediction, and a prediction the server refuses puts
+        // the block back: let go on the prediction, the camera had turned for
+        // the next row while the row's last block stood again.
+        boolean settled = ServerBlockSync.isSettled(completionSequence);
+        if (step == null || level < 0 || level > 1) {
+            if (settled) {
+                releaseRow();
+            }
             return;
         }
-        if (rowHeld || rowColumns < rowSettleColumns) {
+        if (rowHeld && (step == rowAxis || !settled)) {
             return;
         }
+        takeRowAngle(player, next, step);
+    }
+
+    /** Take a new angle for a row going {@code step}, whose next column is {@code next}. */
+    private static void takeRowAngle(LocalPlayer player, BlockPos next, net.minecraft.core.Direction step) {
         rowAxis = step;
         float axisYaw = (float) Math.toDegrees(Math.atan2(-step.getStepX(), step.getStepZ()));
-        rowYaw = axisYaw + Math.clamp(AngleUtil.wrapDegrees(player.getYRot() - axisYaw),
-                -ROW_YAW_SLACK, ROW_YAW_SLACK);
-        rowPitch = Math.clamp(player.getXRot(), ROW_PITCH_MIN, ROW_PITCH_MAX);
+        java.util.concurrent.ThreadLocalRandom random = java.util.concurrent.ThreadLocalRandom.current();
+        // How far off the row's own direction is drawn; which way, toward the
+        // unmined row beside it where there is one. Walking on at a slant
+        // drifts the body across the row, and toward that side the wall takes
+        // the drift — no correction all row long. With open ground on both
+        // sides the slant stays small enough that a row's length does not
+        // drift it as far as a correction.
+        int wall = wallSide(player, next, step);
+        float slant = (float) random.nextDouble(0.0, wall != 0 ? ROW_YAW_SLACK : ROW_YAW_SLACK_OPEN);
+        double driftWhenPlus = step.getAxis() == net.minecraft.core.Direction.Axis.X
+                ? Math.cos(Math.toRadians(axisYaw + slant))
+                : -Math.sin(Math.toRadians(axisYaw + slant));
+        boolean plus = wall != 0 ? driftWhenPlus * wall > 0 : random.nextBoolean();
+        rowYaw = axisYaw + (plus ? slant : -slant);
+        rowPitchMeant = (float) random.nextDouble(ROW_PITCH_MIN, ROW_PITCH_MAX);
+        rowAngleOff = random.nextDouble() < CONFIG.rowAngleMissChance;
+        rowPitch = rowAngleOff
+                ? (float) random.nextDouble(ROW_MISS_PITCH_MIN, ROW_MISS_PITCH_MAX)
+                : rowPitchMeant;
+        rowStrafe = 0;
         rowHeld = true;
     }
 
     /**
-     * Walk the body to where the held angle works {@code target}: on the row's
-     * centre line, {@link #ROW_STAND_OFF} short of the column — forward or, if
-     * the walk carried it too far, back. Whether a key went down, false once
-     * it stands there or where the step is not safe.
+     * Hold the forward key down the row toward {@code target}, with a strafe
+     * back toward the row's centre line when the body has drifted off it.
+     * Walking into the face is harmless — the block stops the body, which is
+     * the point. Whether a key went down.
+     *
+     * <p>A body off the row's line first steps once into the cell behind the
+     * column, the way a person turns into a row. That is where a new row
+     * leaves it, still in the lane of the row before, and walking on from there
+     * ran past the column along the cleared lane beside it — three columns on,
+     * the column it was meant for behind it and hidden, and the run ended on
+     * three look timeouts. The step comes before anything else is asked, since
+     * that body often stands level with the column. On the line, two things
+     * refuse the key: a body level with the column or past it, where walking on
+     * goes the wrong way, and open ground ahead without a floor to walk onto.
      */
-    private static boolean stepToRowStand(Minecraft client, LocalPlayer player, BlockPos target) {
-        double standX = target.getX() + 0.5 - rowAxis.getStepX() * ROW_STAND_OFF;
-        double standZ = target.getZ() + 0.5 - rowAxis.getStepZ() * ROW_STAND_OFF;
-        double dx = standX - player.getX();
-        double dz = standZ - player.getZ();
-        if (dx * dx + dz * dz <= ROW_STAND_TOLERANCE * ROW_STAND_TOLERANCE) {
+    private static boolean walkAlongRow(Minecraft client, LocalPlayer player, BlockPos target) {
+        boolean alongX = rowAxis.getAxis() == net.minecraft.core.Direction.Axis.X;
+        double along = (player.getX() - (target.getX() + 0.5)) * rowAxis.getStepX()
+                + (player.getZ() - (target.getZ() + 0.5)) * rowAxis.getStepZ();
+        double lateral = rowLateral(player, target);
+        if (Math.abs(lateral) > ROW_LANE_ENTRY) {
+            return stepToward(client, player, target, target.getX() + 0.5 - rowAxis.getStepX(),
+                    target.getZ() + 0.5 - rowAxis.getStepZ());
+        }
+        if (along > -ROW_BEHIND) {
             return false;
         }
-        return stepToward(client, player, target, standX, standZ);
+        Level level = client.level;
+        BlockPos ahead = BlockPos.containing(player.getX() + rowAxis.getStepX() * ROW_FLOOR_LOOKAHEAD,
+                player.getY(), player.getZ() + rowAxis.getStepZ() * ROW_FLOOR_LOOKAHEAD);
+        boolean blocked = !level.getBlockState(ahead).getCollisionShape(level, ahead).isEmpty()
+                || !level.getBlockState(ahead.above()).getCollisionShape(level, ahead.above()).isEmpty();
+        if (!blocked && !isStandable(level, ahead)) {
+            return false;
+        }
+        // Off the line toward a wall, nothing: the wall stops the body a fifth
+        // of a block off it, well inside what the held line forgives, and it
+        // walks on along the wall. Toward open ground it is let drift further
+        // and then put right in one strafe across the line, so the next one is
+        // a long way off. A strafe whenever it was a little off made it
+        // sidestep to the middle of the row every few blocks.
+        if (rowStrafe == 0 && Math.abs(lateral) > ROW_LANE_DRIFT && isOpenBeside(level, player, lateral)) {
+            rowStrafe = lateral > 0 ? -1 : 1;
+        }
+        // The key goes up where the body will coast to a stop on the line. It
+        // crosses at about 0.2 a tick, so let go as it crossed, it went on to
+        // past the other side's threshold — measured 0.40, 0.20, 0.00, -0.20
+        // and a rest at -0.31 — and swung back and forth four times in a row.
+        if (rowStrafe != 0) {
+            Vec3 motion = player.getDeltaMovement();
+            double coast = (alongX ? motion.z : motion.x) * ROW_STRAFE_COAST;
+            if ((lateral + coast) * rowStrafe >= 0) {
+                rowStrafe = 0;
+            }
+        }
+        int strafe = 0;
+        if (rowStrafe != 0) {
+            // The player's right is (−cos θ, −sin θ); press the side that
+            // pushes the way the strafe goes.
+            double yawRad = Math.toRadians(player.getYRot());
+            double rightAcross = alongX ? -Math.sin(yawRad) : -Math.cos(yawRad);
+            strafe = rightAcross * rowStrafe > 0 ? 1 : -1;
+        }
+        client.options.keyUp.setDown(true);
+        client.options.keyDown.setDown(false);
+        client.options.keyLeft.setDown(strafe < 0);
+        client.options.keyRight.setDown(strafe > 0);
+        client.options.keySprint.setDown(false);
+        return true;
+    }
+
+    /**
+     * Which side of the row, across it, is a wall beside {@code column}: +1 or
+     * -1 along the across axis (z for a row along x, x for one along z), or 0
+     * where neither or both are.
+     */
+    private static int wallSide(LocalPlayer player, BlockPos column, net.minecraft.core.Direction step) {
+        Level level = Minecraft.getInstance().level;
+        boolean alongX = step.getAxis() == net.minecraft.core.Direction.Axis.X;
+        int[] solid = new int[2];
+        for (int i = 0; i < 2; i++) {
+            int side = i == 0 ? 1 : -1;
+            BlockPos beside = new BlockPos(column.getX() + (alongX ? 0 : side), player.getBlockY(),
+                    column.getZ() + (alongX ? side : 0));
+            boolean wall = !level.getBlockState(beside).getCollisionShape(level, beside).isEmpty()
+                    || !level.getBlockState(beside.above()).getCollisionShape(level, beside.above()).isEmpty();
+            solid[i] = wall ? 1 : 0;
+        }
+        return solid[0] == solid[1] ? 0 : solid[0] == 1 ? 1 : -1;
+    }
+
+    /** Whether {@code target} is in the row's current column or the next one along it. */
+    private static boolean isInRow(BlockPos target) {
+        BlockPos column = new BlockPos(target.getX(), 0, target.getZ());
+        return column.equals(rowColumn) || rowAxis != null && column.equals(rowColumn.relative(rowAxis));
+    }
+
+    /** How far the body stands off the centre line of {@code target}'s row, signed. */
+    private static double rowLateral(LocalPlayer player, BlockPos target) {
+        return rowAxis.getAxis() == net.minecraft.core.Direction.Axis.X
+                ? player.getZ() - (target.getZ() + 0.5)
+                : player.getX() - (target.getX() + 0.5);
+    }
+
+    /**
+     * Whether the cell beside the body, across the row on the {@code side}
+     * (sign of the offset from the row's centre line), lets a body in: room at
+     * feet and head height.
+     */
+    private static boolean isOpenBeside(Level level, LocalPlayer player, double side) {
+        boolean alongX = rowAxis.getAxis() == net.minecraft.core.Direction.Axis.X;
+        double reach = Math.signum(side) * 0.8;
+        BlockPos beside = BlockPos.containing(player.getX() + (alongX ? 0.0 : reach), player.getY(),
+                player.getZ() + (alongX ? reach : 0.0));
+        return level.getBlockState(beside).getCollisionShape(level, beside).isEmpty()
+                && level.getBlockState(beside.above()).getCollisionShape(level, beside.above()).isEmpty();
     }
 
     /** A point straight down the row's held angle from the eye. */
@@ -1476,13 +1687,13 @@ public class BotController {
     }
 
     /**
-     * Let go of the row's angle; it is found again over the next settling
-     * columns. The row itself is kept, so digging on along it counts on.
+     * Let go of the row's angle; it is taken again at the end of the next
+     * column. The row itself is kept, so digging on along it carries on.
      */
     private static void releaseRow() {
         rowHeld = false;
-        rowColumns = 0;
-        rowSettleColumns = HumanBehavior.randomRowSettleColumns(CONFIG);
+        rowAngleOff = false;
+        rowStrafe = 0;
     }
 
     /** {@link #releaseRow}, and forget the row as well. */
@@ -1650,16 +1861,30 @@ public class BotController {
         // which a step would spoil — see needsEdgeStep. Its one step is out of
         // the cell it fills.
         //
-        // A row's held angle has a walk of its own: to where that angle works
-        // the block, and once this block is done already to where it works the
-        // next one. No drop either: the step to it leaves the row's lane, and
-        // the angle only finds the row from inside it. What lies in the lane is
-        // picked up walking on; the rest is what the pickup box takes in
-        // passing or the behavior's own sweep.
+        // A row's held angle has a walk of its own: on into the face, the whole
+        // time, and on into the gap the moment the block is gone. No drop
+        // either: the step to it leaves the row's lane, and the angle only finds
+        // the row from inside it. What lies in the lane is picked up walking
+        // on; the rest is what the pickup box takes in passing or the
+        // behavior's own sweep.
         if (placing) {
             stepOutOfPlacement(client, player);
         } else if (rowHeld) {
-            if (!stepToRowStand(client, player, aimTask.targetPos())) {
+            // Into the gap only on the way to a next block of the row: once this
+            // one is gone with nothing after it, there is nowhere to walk; nor
+            // toward a next block off the row, where the row ends and its angle
+            // is only still held until the server has this block gone. And a
+            // block that opens a column on its own with nothing after it — a
+            // step knocked out by mistake, which goes straight back in — is
+            // let go of just before it breaks: pressed into its face the body
+            // dropped into the cell the moment it went, the chunk miner skips
+            // repairing a step with the bot in its cell, and the step stayed
+            // out. A column's foot block keeps the key, since its row goes on.
+            BotTask after = aimTask != currentTask ? aimTask : peekNextTask(player);
+            boolean rowGoesOn = after != null && after != currentTask && isInRow(after.targetPos());
+            boolean lastBlock = !rowGoesOn && (targetDone || rowNewColumn
+                    && client.gameMode != null && client.gameMode.getDestroyStage() >= ROW_LET_GO_STAGE);
+            if (lastBlock || !walkAlongRow(client, player, aimTask.targetPos())) {
                 releaseMovementKeys();
             }
         } else if (!(policy.opportunisticCollection()
@@ -1756,8 +1981,11 @@ public class BotController {
             // a player holding the button gets for free.
             BlockInteractor.releaseAfterBreak();
             // A step from opportunistic collection must not survive the phase
-            // change — transitionTo does not touch the movement keys.
-            releaseMovementKeys();
+            // change — transitionTo does not touch the movement keys. The walk
+            // down a held row does: it carries on into the gap just opened.
+            if (!rowHeld) {
+                releaseMovementKeys();
+            }
 
             // TEMPORARY (multiplayer break investigation, remove with the fix).
             // One line per interaction, unconditional so a run on a server
@@ -1839,6 +2067,8 @@ public class BotController {
             // Straight on to the next work: no stop to fetch what fell outside
             // the pickup box. It is picked up walking there or while the next
             // blocks break, and the behavior sweeps what is left at the end.
+            // A held row's walk stops here: idle is nothing to walk for.
+            releaseMovementKeys();
             lastMinedPos = null;
             currentTask = null;
             transitionTo(Phase.IDLE);
@@ -2062,13 +2292,8 @@ public class BotController {
         if (pushLen < 1.0e-6) {
             return false;
         }
-        // No further than the destination, though: a step that ends short of a
-        // face is not a step into it. Projected a whole block, a walk to a spot
-        // half a block before a column was refused as a step into the column.
-        double lookahead = Math.min(STEP_LOOKAHEAD,
-                Math.hypot(destX - player.getX(), destZ - player.getZ()));
-        double stepX = player.getX() + pushX / pushLen * lookahead;
-        double stepZ = player.getZ() + pushZ / pushLen * lookahead;
+        double stepX = player.getX() + pushX / pushLen * STEP_LOOKAHEAD;
+        double stepZ = player.getZ() + pushZ / pushLen * STEP_LOOKAHEAD;
 
         if (!isStepSafe(client, player, target, stepX, stepZ)) {
             return false;
@@ -2944,7 +3169,12 @@ public class BotController {
         preAttackHesitationRemaining = -1;
         // A row's angle is for working it. Walking anywhere, collecting, eating
         // — the gaze goes elsewhere, and the angle is found again afterwards.
+        // The keys its walk held go up with it, since the walk carries on
+        // across the work's own phase changes.
         if (newPhase != Phase.LOOKING && newPhase != Phase.INTERACTING && newPhase != Phase.IDLE) {
+            if (rowHeld) {
+                releaseMovementKeys();
+            }
             releaseRow();
         }
         // The closing-in watchdog belongs to one POSITIONING phase and has to be

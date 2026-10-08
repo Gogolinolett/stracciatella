@@ -48,11 +48,10 @@ public class BotConfig {
     public int preAttackHesitationMin = 1;
     public int preAttackHesitationMax = 3;
 
-    // Digging along a straight row: how many columns are aimed at one by one
-    // before the bot settles on a single angle for the rest of the row, drawn
-    // uniformly per row and again after anything that lets go of the angle.
-    public int rowSettleColumnsMin = 1;
-    public int rowSettleColumnsMax = 3;
+    // Digging along a straight row the bot holds one angle, taken as it turns
+    // into the row. The chance that this first try is a little off — right
+    // for the head block, not for the foot block — and is put right after it.
+    public double rowAngleMissChance = 0.25;
 
     // COLLECTING gaze: while walking to / standing over drops, the bot does
     // not track the item point directly (the head would tilt ever steeper on
@@ -191,8 +190,7 @@ public class BotConfig {
         this.reactionDelayMaxTicks = other.reactionDelayMaxTicks;
         this.preAttackHesitationMin = other.preAttackHesitationMin;
         this.preAttackHesitationMax = other.preAttackHesitationMax;
-        this.rowSettleColumnsMin = other.rowSettleColumnsMin;
-        this.rowSettleColumnsMax = other.rowSettleColumnsMax;
+        this.rowAngleMissChance = other.rowAngleMissChance;
         this.collectGazePitchMinDeg = other.collectGazePitchMinDeg;
         this.collectGazePitchMaxDeg = other.collectGazePitchMaxDeg;
         this.longPauseChance = other.longPauseChance;
