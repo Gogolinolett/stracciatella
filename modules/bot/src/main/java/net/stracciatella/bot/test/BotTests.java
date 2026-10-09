@@ -2811,6 +2811,100 @@ public class BotTests {
         LOGGER.info("Held the camera still for {} ticks away from the game", ticks[0]);
     }
 
+    /**
+     * A block across open floor at a slant, the way the next column lies across
+     * a cleared pit: nothing to go round, so a person walks a straight line at
+     * the place to stand — not the grid's straight and diagonal steps in turn.
+     */
+    @MinecraftTest(name = "Bot walks a slant across open floor in a straight line", timeoutTicks = 600, order = -154, repeat = 3)
+    public void walksASlantStraight(TestContext ctx) {
+        walkAcrossOpenFloor(ctx, new BlockPos(2080, 30, 1900), 10, 5);
+    }
+
+    /** The same along a true diagonal, which the grid has steps for. */
+    @MinecraftTest(name = "Bot walks a diagonal across open floor in a straight line", timeoutTicks = 600, order = -153, repeat = 3)
+    public void walksADiagonalStraight(TestContext ctx) {
+        walkAcrossOpenFloor(ctx, new BlockPos(2120, 30, 1900), 9, 9);
+    }
+
+    /**
+     * Mine a block {@code dx}, {@code dz} out on an open floor and measure the
+     * path walk to it: the share of its ticks whose yaw lies within
+     * {@link #ON_LINE_TOLERANCE_DEG} of the line from where the walk began to
+     * where it ended, leaving out the first and last block (turning onto the
+     * line and coming off it), and the widest the walk strayed from that line.
+     */
+    private void walkAcrossOpenFloor(TestContext ctx, BlockPos origin, int dx, int dz) {
+        final BlockPos blockPos = origin.offset(dx, 0, dz);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, OPEN_FLOOR_RADIUS);
+        ctx.runCommand("setblock " + blockPos.getX() + " " + blockPos.getY() + " " + blockPos.getZ() + " stone");
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+
+        List<double[]> walk = new ArrayList<>();
+        ctx.runOnClient(mc -> BotController.enqueueTask(new MineBlockTask(blockPos)));
+        ctx.waitFor(mc -> {
+            if (net.stracciatella.pathfinding.logic.PathWalker.isActive()) {
+                walk.add(new double[] {mc.player.getX(), mc.player.getZ(), mc.player.getYRot()});
+            }
+            return mc.level.getBlockState(blockPos).isAir();
+        });
+        waitForBotIdle(ctx);
+
+        if (walk.size() < 2) {
+            throw new AssertionError("The block was mined without a path walk — nothing to measure");
+        }
+        double[] first = walk.get(0);
+        double[] last = walk.get(walk.size() - 1);
+        double lineX = last[0] - first[0];
+        double lineZ = last[1] - first[1];
+        double length = Math.sqrt(lineX * lineX + lineZ * lineZ);
+        if (length < 4.0) {
+            throw new AssertionError("The path walk covered " + String.format(java.util.Locale.US, "%.1f", length)
+                    + " blocks — too short to tell a line from steps");
+        }
+        float bearing = (float) Math.toDegrees(Math.atan2(-lineX, lineZ));
+        int counted = 0;
+        int onLine = 0;
+        double widest = 0.0;
+        double furthest = 0.0;
+        double worstBack = 0.0;
+        for (double[] sample : walk) {
+            double along = ((sample[0] - first[0]) * lineX + (sample[1] - first[1]) * lineZ) / length;
+            double across = ((sample[0] - first[0]) * lineZ - (sample[1] - first[1]) * lineX) / length;
+            widest = Math.max(widest, Math.abs(across));
+            furthest = Math.max(furthest, along);
+            worstBack = Math.max(worstBack, furthest - along);
+            if (along > 1.0 && along < length - 1.0) {
+                counted++;
+                if (Math.abs(net.minecraft.util.Mth.wrapDegrees((float) sample[2] - bearing)) <= ON_LINE_TOLERANCE_DEG) {
+                    onLine++;
+                }
+            }
+        }
+        double share = counted == 0 ? 0.0 : (double) onLine / counted;
+        String summary = String.format(java.util.Locale.US,
+                "yaw on the line %.0f%% of %d ticks over %.1f blocks, widest off it %.2f, worst step back %.2f",
+                share * 100, counted, length, widest, worstBack);
+        if (share < MIN_ON_LINE_SHARE) {
+            throw new AssertionError("The walk did not hold a line across open floor: " + summary);
+        }
+        if (worstBack > MAX_STEP_BACK) {
+            throw new AssertionError("The walk ran past where it was going and came back: " + summary);
+        }
+        LOGGER.info("Walked across open floor in a line: {}", summary);
+    }
+
+    /** Half the width of the open floor the straight-walk tests stand on. */
+    private static final int OPEN_FLOOR_RADIUS = 14;
+    /** How far off the line the yaw may be and still count as on it. */
+    private static final float ON_LINE_TOLERANCE_DEG = 10.0f;
+    /** The share of the walk the yaw has to be on the line, as for a journey across open ground. */
+    private static final double MIN_ON_LINE_SHARE = 0.75;
+    /** How far back along its line the walk may come from the furthest it got: settling, not turning back. */
+    private static final double MAX_STEP_BACK = 0.5;
+
     /** The spell away from the game the still-camera test asks for, five seconds. */
     private static final int AWAY_TICKS = 100;
 

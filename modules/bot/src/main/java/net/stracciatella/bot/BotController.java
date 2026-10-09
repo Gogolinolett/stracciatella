@@ -3428,7 +3428,8 @@ public class BotController {
             return false;
         }
 
-        PathWalker.start(path);
+        // Across the open floor of a pit in a line, not on the grid's steps.
+        PathWalker.startStraight(path);
         transitionTo(Phase.NAVIGATING);
         return true;
     }

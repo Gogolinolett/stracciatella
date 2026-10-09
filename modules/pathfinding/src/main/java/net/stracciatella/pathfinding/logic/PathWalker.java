@@ -136,9 +136,13 @@ public class PathWalker {
 
     // === Travel mode (startTravel) ===
     // A long walk whose end the caller judges for itself — Journey counts two
-    // blocks as arrived — so the last node needs no settling, and straight flat
-    // runs are crossed the way a person crosses open ground (tickCruise).
+    // blocks as arrived — so the last node needs no settling, and a slip off
+    // the way ends the walk for the caller to plan again from where it landed.
     private static boolean travelling = false;
+    // Straight runs crossed the way a person crosses open ground (tickCruise):
+    // a travel walk's, and a walk across open floor to a place to stand
+    // (startStraight).
+    private static boolean cruising = false;
     // The node the cruise heading points at, or -1 while not cruising.
     private static int cruiseIndex = -1;
     private static float cruiseYaw = 0.0f;
@@ -183,6 +187,10 @@ public class PathWalker {
     // a ruler line.
     private static final double CRUISE_WIDE_SLACK = 1.0;
     private static double cruiseSlack = CRUISE_LINE_TOLERANCE;
+    // How far short of an aim the run ends at the wide drift gives way to the
+    // line tolerance, and whether the run ends at the current aim.
+    private static final double CRUISE_SLACK_TAPER = 3.0;
+    private static boolean cruiseRunEnds = false;
     // The heading a hand on a mouse holds is not a constant: it wanders a few
     // degrees off the course and back, slowly. A random walk pulled back to
     // the course, in degrees; the pull, the jitter per tick and the bound, the
@@ -217,7 +225,18 @@ public class PathWalker {
 
     /** Walk {@code path} node by node and stop exactly on its last node. */
     public static void start(List<MeshNode> path) {
-        start(path, false);
+        start(path, false, false);
+    }
+
+    /**
+     * Walk {@code path} to stop exactly on its last node, but cross its
+     * straight runs in a straight line the way the travel mode does — for a
+     * walk across open floor to a place to stand. Node by node, a run at a
+     * slant to the grid is straight and diagonal steps in turn, and the gaze
+     * swings between the two at every node.
+     */
+    public static void startStraight(List<MeshNode> path) {
+        start(path, true, false);
     }
 
     /**
@@ -227,10 +246,10 @@ public class PathWalker {
      * that decides arrival itself — {@code Journey}.
      */
     public static void startTravel(List<MeshNode> path) {
-        start(path, true);
+        start(path, true, true);
     }
 
-    private static void start(List<MeshNode> path, boolean travel) {
+    private static void start(List<MeshNode> path, boolean cruise, boolean travel) {
         if (path == null || path.isEmpty()) {
             stop();
             return;
@@ -238,6 +257,7 @@ public class PathWalker {
         currentPath = path;
         index = 0;
         active = true;
+        cruising = cruise;
         travelling = travel;
         cruiseIndex = -1;
         cruiseLane = ThreadLocalRandom.current().nextDouble(CRUISE_LANE_MIN, CRUISE_LANE_MAX)
@@ -434,7 +454,7 @@ public class PathWalker {
             return;
         }
 
-        if (travelling && tickCruise(client, player)) {
+        if (cruising && tickCruise(client, player)) {
             return;
         }
 
@@ -1212,8 +1232,9 @@ public class PathWalker {
     }
 
     /**
-     * Travel mode on a straight, level, walkable run of the path: steer at the
-     * farthest node of it, hold that heading and only look at it again now and
+     * Travel mode and a straight walk, on a straight, level, walkable run of
+     * the path: steer at the farthest node of it, hold that heading and only
+     * look at it again now and
      * then, and sprint-jump where the ground ahead is level and open — how a
      * person crosses open ground, rather than the grid's straight and diagonal
      * steps from one node to the next. Returns false where there is no such run,
@@ -1251,6 +1272,8 @@ public class PathWalker {
             }
             takeCruiseAim(player, currentPath.get(cruiseIndex));
             cruiseSlack = roomBesideLine(player) ? CRUISE_WIDE_SLACK : CRUISE_LINE_TOLERANCE;
+            cruiseRunEnds = cruiseIndex + 1 >= currentPath.size()
+                    || !isRunStep(currentPath.get(cruiseIndex), currentPath.get(cruiseIndex + 1));
             // Nobody takes a heading to the degree: it is a little off, the
             // walk drifts from the line, and CRUISE_LINE_TOLERANCE has it
             // looked at again — not the dead-straight run along the grid.
@@ -1279,11 +1302,15 @@ public class PathWalker {
      * reaches in plain walking steps a block up or down at most, and the player
      * can walk to in a straight line over the ground from where it stands
      * ({@link Terrain#isGroundWalk}) — or -1 when that is not at least two nodes
-     * beyond the current one. Never the path's last node: the last stretch is
-     * the node-by-node walk's. Held to one level, the run broke at every edge of
-     * rolling ground, and the walk between the breaks was the grid's: a zigzag
-     * with the yaw on the bearing 19% of the time, against all of it on the
-     * flat.
+     * beyond the current one. Never a travel leg's last node: the last stretch
+     * is the node-by-node walk's. A straight walk's last node may be the aim —
+     * it is the place to stand, and a heading taken at the node before it
+     * turned the gaze once more a step short of it; the cruise still hands over
+     * to the node walk and its settle once level with the node before, since
+     * no run starts two nodes on from there. Held to one level, the run broke
+     * at every edge of rolling ground, and the walk between the breaks was the
+     * grid's: a zigzag with the yaw on the bearing 19% of the time, against all
+     * of it on the flat.
      */
     private static int chooseCruiseTarget(LocalPlayer player) {
         MeshNode here = currentPath.get(index);
@@ -1295,14 +1322,8 @@ public class PathWalker {
             return -1;
         }
         int last = index;
-        int limit = Math.min(currentPath.size() - 2, index + CRUISE_LOOKAHEAD);
-        while (last < limit) {
-            MeshNode a = currentPath.get(last);
-            MeshNode b = currentPath.get(last + 1);
-            if (Math.abs(b.getY() - a.getY()) > 1
-                    || Math.max(Math.abs(b.getX() - a.getX()), Math.abs(b.getZ() - a.getZ())) > 1) {
-                break;
-            }
+        int limit = Math.min(currentPath.size() - (travelling ? 2 : 1), index + CRUISE_LOOKAHEAD);
+        while (last < limit && isRunStep(currentPath.get(last), currentPath.get(last + 1))) {
             last++;
         }
         for (int k = last; k >= index + 2; k--) {
@@ -1313,6 +1334,12 @@ public class PathWalker {
             }
         }
         return -1;
+    }
+
+    /** Whether {@code a} to {@code b} is a plain walking step a block up or down at most, one a run goes on through. */
+    private static boolean isRunStep(MeshNode a, MeshNode b) {
+        return Math.abs(b.getY() - a.getY()) <= 1
+                && Math.max(Math.abs(b.getX() - a.getX()), Math.abs(b.getZ() - a.getZ())) <= 1;
     }
 
     /**
@@ -1446,7 +1473,17 @@ public class PathWalker {
         applyMovement(client, aligned || !player.onGround(), false, jumpNow, true, 0);
     }
 
-    /** Whether the player has drifted off the line its heading was taken along. */
+    /**
+     * Whether the player has drifted off the line its heading was taken along.
+     * Within {@link #CRUISE_SLACK_TAPER} of an aim the run ends at only the
+     * narrow tolerance holds, whatever room there is: what follows — a step
+     * down, a jump, the node walk — starts at the node. Allowed the wide drift
+     * to the end, the walk reached the rim of a three-block drop a block beside
+     * its node, and the node walk stood still at the rim to turn sideways to
+     * it. Short of an aim the run goes on past, the wide drift holds: there the
+     * next heading carries on, and correcting onto every such aim bent a walk
+     * over rolling ground, whose runs are short, from aim to aim.
+     */
     private static boolean offCruiseLine(LocalPlayer player) {
         double lx = cruiseAimX - cruiseFromX;
         double lz = cruiseAimZ - cruiseFromZ;
@@ -1456,7 +1493,11 @@ public class PathWalker {
         }
         double px = player.getX() - cruiseFromX;
         double pz = player.getZ() - cruiseFromZ;
-        return Math.abs(px * lz - pz * lx) / length > cruiseSlack;
+        double ax = cruiseAimX - player.getX();
+        double az = cruiseAimZ - player.getZ();
+        double slack = cruiseRunEnds && ax * ax + az * az < CRUISE_SLACK_TAPER * CRUISE_SLACK_TAPER
+                ? CRUISE_LINE_TOLERANCE : cruiseSlack;
+        return Math.abs(px * lz - pz * lx) / length > slack;
     }
 
     /**
@@ -1475,7 +1516,12 @@ public class PathWalker {
         }
         double ax = cruiseAimX - player.getX();
         double az = cruiseAimZ - player.getZ();
-        if (Math.sqrt(ax * ax + az * az) < CRUISE_JUMP_LENGTH) {
+        // Short of where the run ends, a jump has to come down with the
+        // taper's room left to come onto the line: in the air the course
+        // cannot be corrected. Taken four blocks short of a ledge, the jump
+        // came down a block beside the rim node, and the node walk stood at the
+        // edge to turn sideways to it.
+        if (Math.sqrt(ax * ax + az * az) < CRUISE_JUMP_LENGTH + (cruiseRunEnds ? CRUISE_SLACK_TAPER : 0.0)) {
             return false;
         }
         // Along the heading actually held, which is a little off the aim, and
