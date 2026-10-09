@@ -220,10 +220,12 @@ public class BotController {
     // time the ground runs out.
     private static final double EDGE_STEP_APPROACH = 1.5;
     // Where the bridging gaze rests while the bot backs into the gap: this
-    // far behind it, level with the block it is building off. Far enough for
-    // the yaw to be well defined, near enough that the pitch is already most
-    // of the way down to the face it will click.
-    private static final double BRIDGE_LOOK_BACK = 1.0;
+    // far behind it, level with the block it is building off. The yaw comes
+    // from the direction alone; the distance sets the pitch, and this one is
+    // the ~80° the click on the face below the rim needs. At a block back the
+    // gaze rested at 60° and LOOKING yanked it down 23° in four ticks before
+    // every placement, then POSITIONING pulled it back up for the next one.
+    private static final double BRIDGE_LOOK_BACK = 0.3;
     // How far past the support's own centre the edge step aims to stand: half
     // a block to the face plane and a little over it, which is inside what
     // vanilla's crouch allows a body to overhang and comfortably clear of
@@ -2816,6 +2818,11 @@ public class BotController {
      * ends. Standing on the lip of the hole it was trying to fill, a released
      * crouch plus the last of the walk's momentum is precisely the fall the
      * crouch was there to prevent, so a failed placement keeps it.
+     *
+     * <p>Nor while the bot is still laying a bridge. The block it places is
+     * the ground under its feet, so "ground again" came true the tick the
+     * block appeared: the crouch went up for every block laid and down again
+     * for the next. A person bridging backwards holds it the whole way.
      */
     private static void updateBridging(Minecraft client, LocalPlayer player) {
         boolean wanted = currentTask != null
@@ -2824,7 +2831,8 @@ public class BotController {
                                 && !hasFloorAhead(client, player)));
         if (wanted) {
             bridging = true;
-        } else if (bridging && hasFloorWithinOneBlock(client.level, player.blockPosition())) {
+        } else if (bridging && !(currentTask != null && buildsOffFloor(player, currentTask))
+                && hasFloorWithinOneBlock(client.level, player.blockPosition())) {
             bridging = false;
         }
         if (client.options != null && bridging != sneakKeyHeld) {
@@ -2861,15 +2869,12 @@ public class BotController {
      * approach.
      */
     private static boolean needsEdgeStep(LocalPlayer player, BotTask task) {
-        net.minecraft.core.Direction face = task.preferredFace();
-        if (face == null || face.getAxis().isVertical()) {
-            return false;
-        }
         BlockPos support = task.targetPos();
-        Vec3 eye = player.getEyePosition();
-        if (eye.y <= support.getY() + 1.0 || !isWithinReach(player, support)) {
+        if (!buildsOffFloor(player, task) || !isWithinReach(player, support)) {
             return false;
         }
+        net.minecraft.core.Direction face = task.preferredFace();
+        Vec3 eye = player.getEyePosition();
         // On a diagonal the step goes to the support's corner, past the side
         // the next block goes off as well; arrived at this face's plane alone,
         // the body stopped short of the corner and the next block wanted a
@@ -2880,6 +2885,18 @@ public class BotController {
             past = Math.min(past, pastFacePlane(eye, support, side));
         }
         return past < EDGE_STEP_CLEARANCE;
+    }
+
+    /**
+     * Whether {@code task} builds off the side of a block below the eye — the
+     * block the bot stands on, or one it laid to stand on: a bridge. Where it
+     * stands relative to that side does not matter here; that is
+     * {@link #needsEdgeStep}'s question.
+     */
+    private static boolean buildsOffFloor(LocalPlayer player, BotTask task) {
+        net.minecraft.core.Direction face = task.preferredFace();
+        return face != null && !face.getAxis().isVertical()
+                && player.getEyePosition().y > task.targetPos().getY() + 1.0;
     }
 
     /**

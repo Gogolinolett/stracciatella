@@ -3328,7 +3328,10 @@ public class ChunkMinerTests {
     private static final class BridgeYaw {
         final Set<BlockPos> laid = new HashSet<>();
         double turned;
+        double nodded;
+        int uncrouched;
         Float last;
+        float lastPitch;
 
         void sample(net.minecraft.client.Minecraft mc) {
             if (!(BotController.getCurrentTask() instanceof net.stracciatella.bot.task.PlaceBlockTask place)) {
@@ -3336,11 +3339,18 @@ public class ChunkMinerTests {
             }
             laid.add(place.placePos());
             float yaw = mc.player.getYRot();
+            float pitch = mc.player.getXRot();
             if (last != null) {
                 turned += Math.abs(yaw - last);
+                nodded += Math.abs(pitch - lastPitch);
+                if (!mc.options.keyShift.isDown()) {
+                    uncrouched++;
+                }
                 last = yaw;
+                lastPitch = pitch;
             } else if (BotController.getPhase() == BotController.Phase.INTERACTING) {
                 last = yaw;
+                lastPitch = pitch;
             }
         }
 
@@ -3355,8 +3365,17 @@ public class ChunkMinerTests {
                         + MAX_BRIDGE_YAW_PER_BLOCK + " a block — a person bridging backwards keeps looking"
                         + " back along the bridge");
             }
-            LOGGER.info("The {} bridge's {} blocks cost {} degrees of yaw", bridge, laid.size(),
-                    String.format(java.util.Locale.US, "%.0f", turned));
+            // From the first click on: a person bridging backwards does not
+            // stand up between two blocks. It used to, for every block laid —
+            // the block it placed was the ground the crouch waited for.
+            if (uncrouched > 0) {
+                throw new AssertionError("The bot stood up for " + uncrouched + " ticks while laying the "
+                        + bridge + " bridge's " + laid.size() + " blocks — the crouch belongs held the"
+                        + " whole way back");
+            }
+            LOGGER.info("The {} bridge's {} blocks cost {} degrees of yaw and {} of pitch", bridge,
+                    laid.size(), String.format(java.util.Locale.US, "%.0f", turned),
+                    String.format(java.util.Locale.US, "%.0f", nodded));
         }
     }
 
