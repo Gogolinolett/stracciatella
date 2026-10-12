@@ -96,6 +96,17 @@ public class HumanBehavior {
     }
 
     /**
+     * How many ticks a walk stuck against something it will not climb keeps
+     * pressing before it goes round: {@code immediate}, or now and then
+     * ({@code wallBumpChance}, a blunder) longer, up to {@code wallBumpMaxTicks}.
+     */
+    public static int randomGoRoundPatience(BotConfig config, int immediate) {
+        return blunder(config.wallBumpChance)
+                ? randomIntInRange(immediate + 1, Math.max(immediate + 1, config.wallBumpMaxTicks))
+                : immediate;
+    }
+
+    /**
      * Generate a Gaussian-distributed reaction delay in ticks. Clamped to
      * {@code [reactionDelayMinTicks, reactionDelayMaxTicks]} then divided
      * by the current {@link #sessionSkill()} (skilled session = faster

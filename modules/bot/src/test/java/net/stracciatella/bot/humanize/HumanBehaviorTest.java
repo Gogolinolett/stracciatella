@@ -1,9 +1,11 @@
 package net.stracciatella.bot.humanize;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
 
+import net.stracciatella.bot.BotConfig;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -38,5 +40,36 @@ public class HumanBehaviorTest {
         long longOnes = Arrays.stream(draws).filter(ticks -> ticks > 30).count();
         assertTrue(shortOnes > DRAWS * 0.15, "only " + shortOnes + " pauses under 12 ticks");
         assertTrue(longOnes > DRAWS * 0.15, "only " + longOnes + " pauses over 30 ticks");
+    }
+
+    /**
+     * A walk stuck against something it will not climb goes round at once,
+     * and with {@code wallBumpChance} stays pressed against it for longer
+     * first — never past {@code wallBumpMaxTicks}, and never while blunders
+     * are suppressed.
+     */
+    @Test
+    public void aBumpIsLongerThanGoingRoundAndBounded() {
+        BotConfig config = new BotConfig();
+        config.wallBumpMaxTicks = 10;
+        HumanBehavior.suppressBlunders(false);
+        try {
+            config.wallBumpChance = 0.0;
+            for (int i = 0; i < DRAWS; i++) {
+                assertEquals(2, HumanBehavior.randomGoRoundPatience(config, 2));
+            }
+            config.wallBumpChance = 1.0;
+            boolean sawMax = false;
+            for (int i = 0; i < DRAWS; i++) {
+                int ticks = HumanBehavior.randomGoRoundPatience(config, 2);
+                assertTrue(ticks >= 3 && ticks <= 10, "drew " + ticks);
+                sawMax |= ticks == 10;
+            }
+            assertTrue(sawMax, "never drew the longest bump");
+            HumanBehavior.suppressBlunders(true);
+            assertEquals(2, HumanBehavior.randomGoRoundPatience(config, 2));
+        } finally {
+            HumanBehavior.suppressBlunders(false);
+        }
     }
 }

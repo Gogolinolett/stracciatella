@@ -1981,6 +1981,109 @@ public class BotTests {
     }
 
     // ================================================================
+    // Test 30b: a hidden block handed over first waits for one in sight
+    // ================================================================
+
+    /**
+     * The corner beside the chunk miner's staircase, rebuilt around the bot as
+     * a real run left it at chunk [-1, -3]: the bot stands at (0.70, 0.70) in
+     * its cell, the foot layer's step east of it, the next column south of it
+     * standing two high, and the block it was handed — the foot block
+     * diagonally beyond, its head already mined — shows only its top, along a
+     * line that grazes that column's edge. The sweep's order put that hidden
+     * block first and the column in front second; the bot stood at the hidden
+     * one for the whole position timeout.
+     *
+     * <p>Under {@code orderedTasks}, as the chunk miner runs: asserted that the
+     * first block broken is one in sight, that all three come out, and that no
+     * approach runs into the position timeout.
+     */
+    @MinecraftTest(name = "Bot takes the block in sight before a hidden one it was handed first",
+            timeoutTicks = 600, order = -166)
+    public void takesTheBlockInSightBeforeAHiddenOne(TestContext ctx) {
+        final BlockPos origin = new BlockPos(1680, 30, 1720);
+        final BlockPos hidden = origin.offset(1, 0, 1);
+        final BlockPos columnHead = origin.offset(0, 1, 1);
+        final BlockPos columnFoot = origin.offset(0, 0, 1);
+        setupTest(ctx, origin);
+        buildPlatform(ctx, origin, CLEAR_RADIUS);
+        BlockPos[][] stone = {
+                {origin.offset(2, 0, -1), origin.offset(2, 1, 2)},
+                {origin.offset(0, 0, 2), origin.offset(1, 1, 2)},
+                {columnFoot, columnHead},
+                {hidden, hidden},
+                {origin.offset(1, 0, 0), origin.offset(1, 0, 0)},
+                {origin.offset(1, 1, -1), origin.offset(1, 1, -1)}};
+        for (BlockPos[] box : stone) {
+            ctx.runCommand("fill " + box[0].getX() + " " + box[0].getY() + " " + box[0].getZ() + " "
+                    + box[1].getX() + " " + box[1].getY() + " " + box[1].getZ() + " stone");
+        }
+        ctx.waitFor(mc -> !mc.level.getBlockState(hidden).isAir()
+                && !mc.level.getBlockState(origin.offset(1, 1, -1)).isAir()
+                && !mc.level.getBlockState(columnHead).isAir());
+        ctx.runCommand("give @s diamond_pickaxe");
+        switchToSurvivalAt(ctx, origin, origin.getY());
+        final double standX = origin.getX() + 0.70;
+        final double standZ = origin.getZ() + 0.70;
+        double dx = hidden.getX() + 0.5 - standX;
+        double dy = hidden.getY() + 1.0 - (origin.getY() + 1.62);
+        double dz = hidden.getZ() + 0.5 - standZ;
+        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double pitch = -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        ctx.runCommand("tp @s " + standX + " " + origin.getY() + " " + standZ + " " + yaw + " " + pitch);
+        ctx.waitFor(mc -> mc.player.onGround()
+                && Math.abs(mc.player.getX() - standX) < 0.01
+                && Math.abs(mc.player.getZ() - standZ) < 0.01);
+        ctx.waitTicks(5);
+
+        final int positionTimeout = ctx.computeOnClient(mc -> BotController.CONFIG.positionTimeout);
+        final BlockPos[] firstBroken = {null};
+        final int[] positioning = {0, 0};
+        try {
+            ctx.runOnClient(mc -> {
+                BotController.setPolicy(BotPolicy.none().withOrderedTasks().withApproachOccluded());
+                BotController.enqueueTask(new MineBlockTask(hidden));
+                BotController.enqueueTask(new MineBlockTask(columnHead));
+                BotController.enqueueTask(new MineBlockTask(columnFoot));
+            });
+            ctx.waitFor(mc -> {
+                boolean inPositioning = BotController.getPhase() == BotController.Phase.POSITIONING;
+                positioning[0] = inPositioning ? positioning[0] + 1 : 0;
+                positioning[1] = Math.max(positioning[1], positioning[0]);
+                if (firstBroken[0] == null) {
+                    for (BlockPos pos : new BlockPos[] {hidden, columnHead, columnFoot}) {
+                        if (mc.level.getBlockState(pos).isAir()) {
+                            firstBroken[0] = pos;
+                        }
+                    }
+                }
+                return BotController.getPhase() == BotController.Phase.IDLE
+                        && BotController.getTaskQueue().isEmpty();
+            }, 500);
+            for (BlockPos pos : new BlockPos[] {hidden, columnHead, columnFoot}) {
+                if (ctx.computeOnClient(mc -> !mc.level.getBlockState(pos).isAir())) {
+                    throw new AssertionError("Block " + pos.toShortString() + " was not mined");
+                }
+            }
+            if (hidden.equals(firstBroken[0])) {
+                throw new AssertionError("The bot broke the hidden block first, standing at it instead of"
+                        + " taking the column in front of it");
+            }
+            if (positioning[1] >= positionTimeout) {
+                throw new AssertionError("An approach ran " + positioning[1] + " ticks, into the position"
+                        + " timeout of " + positionTimeout);
+            }
+            LOGGER.info("Hidden-block order test passed: first broken {}, longest approach {} ticks",
+                    firstBroken[0].toShortString(), positioning[1]);
+        } finally {
+            ctx.runOnClient(mc -> {
+                BotController.stop();
+                BotController.setPolicy(null);
+            });
+        }
+    }
+
+    // ================================================================
     // Test 31: the block the approach walks up to is not a ledge
     // ================================================================
 

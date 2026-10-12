@@ -441,7 +441,7 @@ public class ChunkMinerBehavior implements BotBehavior {
         // phase too late however promptly it comes.
         //
         // This needs BotPolicy.withOrderedTasks and does not work without it:
-        // handed a choice mid-break, pollNearest took a block behind the column
+        // handed a choice mid-break, nearest-first took a block behind the column
         // still standing in front of the bot, and the corridor test failed
         // outright while the stalling test fell from 19.1 to 62.0 ticks per
         // block. Restricted to the corridor sweep with no placement

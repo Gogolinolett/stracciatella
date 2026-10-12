@@ -94,6 +94,12 @@ public class BotConfig {
     public double travelClickChance = 0.004;
     public int travelClickMin = 2;
     public int travelClickMax = 6;
+    // A walk to a hidden block that runs into something it cannot climb — a
+    // step of the chunk miner's staircase — goes round at once. Now and then,
+    // per approach, it stays pressed against it first, for up to this many
+    // ticks, the way a person bumps into a corner before stepping round it.
+    public double wallBumpChance = 0.15;
+    public int wallBumpMaxTicks = 10;
 
     // Hard timeout for COLLECTING if drops never become reachable. Needs to
     // be large enough for the server→client item-entity sync under heavy load
@@ -213,6 +219,8 @@ public class BotConfig {
         this.travelClickChance = other.travelClickChance;
         this.travelClickMin = other.travelClickMin;
         this.travelClickMax = other.travelClickMax;
+        this.wallBumpChance = other.wallBumpChance;
+        this.wallBumpMaxTicks = other.wallBumpMaxTicks;
         this.collectWaitMax = other.collectWaitMax;
         this.airConfirmTicks = other.airConfirmTicks;
         this.itemAbsenceTicks = other.itemAbsenceTicks;

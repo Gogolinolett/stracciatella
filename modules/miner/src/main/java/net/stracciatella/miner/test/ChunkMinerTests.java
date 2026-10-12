@@ -3317,6 +3317,308 @@ public class ChunkMinerTests {
         }
     }
 
+    // ================================================================
+    // Test 56: the block under the staircase, from the corner beside it
+    // ================================================================
+
+    /**
+     * A row turned into at the staircase, the way a real run met it at chunk
+     * [-1, -3]: row 8 walked east to the chunk's edge, the foot layer's step
+     * at (15, 8) and the head layer's at (15, 7), and row 9 turned into west.
+     * The head block of (15, 9) came out; its foot block, hidden from the
+     * corner the bot stood in by the step on one side and the next column on
+     * the other, held the bot for the whole position timeout — while that next
+     * column stood right in front of it, in view and next in the queue.
+     *
+     * <p>Asserted: the run succeeds, both steps stand, every other cell of the
+     * two rows is air, and no task's approach runs into the position timeout.
+     * The sweep here walks the bot to a spot the block is in sight from, so
+     * this guards the corner but does not reach the dead end itself; that one
+     * depends on where the bot stands to the hundredth and is pinned by the
+     * bot module's {@code Bot takes the block in sight before a hidden one it
+     * was handed first}.
+     */
+    @MinecraftTest(name = "Chunk miner works round the block under its staircase", timeoutTicks = 4000,
+            order = 56, repeat = 3)
+    public void worksRoundTheBlockUnderItsStaircase(TestContext ctx) {
+        final int head = Y + Math.floorMod(
+                SpiralStairs.ringIndexAt(Y) - SpiralStairs.ringIndex(15, 7),
+                SpiralStairs.RING_LENGTH);
+        final int feet = head - 1;
+        prepareWithFloor(ctx, feet, 8, 8, 7, 15, 7, 10);
+        fill(ctx, 9, feet, 8, 15, head, 9, "stone");
+        setBlock(ctx, new BlockPos(BASE_X + 15, head, BASE_Z + 7), "stone");
+        final BlockPos headStep = new BlockPos(BASE_X + 15, head, BASE_Z + 7);
+        final BlockPos footStep = new BlockPos(BASE_X + 15, feet, BASE_Z + 8);
+        final BlockPos lastCell = new BlockPos(BASE_X + 15, head, BASE_Z + 9);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastCell).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        final int positionTimeout = ctx.computeOnClient(mc -> BotController.CONFIG.positionTimeout);
+        final int[] positioning = {0, 0};
+        final Object[] lastTask = {null};
+        startChunkMiner(ctx, true, head, feet);
+        ctx.waitFor(mc -> {
+            var task = BotController.getCurrentTask();
+            boolean inPositioning = BotController.getPhase() == BotController.Phase.POSITIONING;
+            positioning[0] = !inPositioning ? 0 : task == lastTask[0] ? positioning[0] + 1 : 1;
+            positioning[1] = Math.max(positioning[1], positioning[0]);
+            lastTask[0] = task;
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        assertNotAir(ctx, headStep, "the head layer's step");
+        assertNotAir(ctx, footStep, "the foot layer's step");
+        for (int dx = 9; dx <= 15; dx++) {
+            for (int dz = 8; dz <= 9; dz++) {
+                for (int y = feet; y <= head; y++) {
+                    BlockPos pos = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (!pos.equals(footStep)) {
+                        assertAir(ctx, pos, "row cell " + dx + "/" + dz + " at y=" + y);
+                    }
+                }
+            }
+        }
+        if (positioning[1] >= positionTimeout) {
+            throw new AssertionError("An approach ran " + positioning[1] + " ticks, into the position timeout of "
+                    + positionTimeout + " — the bot stood at a hidden block with a visible one in front of it");
+        }
+        LOGGER.info("Corner under the staircase passed: longest approach {} ticks", positioning[1]);
+    }
+
+    // ================================================================
+    // Test 55: a vine falls with the head block it hangs from
+    // ================================================================
+
+    /**
+     * Cave vines under a row's head blocks, the way a real run met them at
+     * chunk [-1, -3] in a lush cave: the sweep plans the vine as the column's
+     * foot block, and it drops the moment the head block above it goes. The
+     * foot task then aimed into the empty cell, the ray landing on the block
+     * behind, ran out its look twice and failed — reported as a row's foot
+     * blocks left standing, and logged with no break for either cell and the
+     * saved world showing both empty.
+     *
+     * <p>Asserted: the run succeeds, no look runs out, and every cell of rows 10
+     * to 12 is air.
+     */
+    @MinecraftTest(name = "Chunk miner lets a vine fall with its head block", timeoutTicks = 4000,
+            order = 55, repeat = 3)
+    public void letsAVineFallWithItsHeadBlock(TestContext ctx) {
+        prepareWithFloor(ctx, 5, 13, 0, 15, 10, 15);
+        fill(ctx, 0, Y, 10, 6, Y + 1, 12, "stone");
+        fill(ctx, 3, Y, 12, 4, Y, 12, "cave_vines");
+        final BlockPos lastCell = new BlockPos(BASE_X + 6, Y + 1, BASE_Z + 10);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastCell).isAir()
+                && mc.level.getBlockState(new BlockPos(BASE_X + 4, Y, BASE_Z + 12)).is(Blocks.CAVE_VINES));
+        ctx.runCommand("give @s cobblestone 64");
+
+        final int[] lookTimeouts = {0};
+        final int[] looking = {0};
+        final Object[] lastTask = {null};
+        final int lookTimeout = ctx.computeOnClient(mc -> BotController.CONFIG.lookTimeout);
+        startChunkMiner(ctx, true, Y + 1, Y);
+        ctx.waitFor(mc -> {
+            var task = BotController.getCurrentTask();
+            boolean inLooking = BotController.getPhase() == BotController.Phase.LOOKING;
+            looking[0] = !inLooking ? 0 : task == lastTask[0] ? looking[0] + 1 : 1;
+            lastTask[0] = task;
+            if (looking[0] == lookTimeout) {
+                lookTimeouts[0]++;
+            }
+            return !BehaviorRunner.isActive();
+        });
+        awaitChunkMiner(ctx, true);
+
+        for (int dx = 0; dx <= 6; dx++) {
+            for (int dz = 10; dz <= 12; dz++) {
+                assertAir(ctx, new BlockPos(BASE_X + dx, Y, BASE_Z + dz), "foot block " + dx + "/" + dz);
+                assertAir(ctx, new BlockPos(BASE_X + dx, Y + 1, BASE_Z + dz), "head block " + dx + "/" + dz);
+            }
+        }
+        if (lookTimeouts[0] > 0) {
+            throw new AssertionError("The bot ran out its look " + lookTimeouts[0] + " times on this row");
+        }
+    }
+
+    // ================================================================
+    // Test 52: a row the staircase stands in, walked along both ways
+    // ================================================================
+
+    /**
+     * The staircase in the middle of a row the sweep walks along, met from
+     * either end: the head layer's step at (6, 0) — a block at head height
+     * with the cell under it to dig — and the foot layer's step after it at
+     * (7, 0). From the west the walk meets the head-high step first, from the
+     * east the foot-high one. Reported from a real run as a bot that walks
+     * into a step of its own staircase while clearing a slab, from in front
+     * or from behind, and stays pressed against it.
+     *
+     * <p>Asserted: the run succeeds, both steps stand, every other cell of the
+     * two rows is air, and the bot never holds a walk key for more than
+     * {@link #MAX_PRESSED_STILL} ticks without its body moving — and on its
+     * approach to a hidden block, where the foot-high step stands in the
+     * straight walk from behind, no more than {@link #MAX_GO_ROUND_STILL}: it
+     * goes round at once.
+     */
+    @MinecraftTest(name = "Chunk miner walks a staircase row from the west", timeoutTicks = 4000,
+            order = 52, repeat = 3)
+    public void walksAStaircaseRowFromTheWest(TestContext ctx) {
+        walkStaircaseRow(ctx, 0, MAX_GO_ROUND_STILL, Runnable::run);
+    }
+
+    @MinecraftTest(name = "Chunk miner walks a staircase row from the east", timeoutTicks = 4000,
+            order = 53, repeat = 3)
+    public void walksAStaircaseRowFromTheEast(TestContext ctx) {
+        walkStaircaseRow(ctx, 13, MAX_GO_ROUND_STILL, Runnable::run);
+    }
+
+    /**
+     * The same row with the bump switched on for every approach
+     * ({@code wallBumpChance} 1): however long the bot stays pressed against
+     * the step before it goes round, never longer than {@code wallBumpMaxTicks}
+     * allows. That the bump is longer than going round at once is
+     * {@code HumanBehaviorTest}'s: measured here it is not, because a body
+     * sliding along the step while it presses is not standing still, and the
+     * controller counts the stall by distance, not by movement.
+     */
+    @MinecraftTest(name = "Chunk miner bumps into its staircase now and then", timeoutTicks = 4000,
+            order = 54, repeat = 3)
+    public void bumpsIntoItsStaircaseNowAndThen(TestContext ctx) {
+        final double configuredChance = BotController.CONFIG.wallBumpChance;
+        final int maxTicks = BotController.CONFIG.wallBumpMaxTicks;
+        // The miner's own slips stay off; withSlips is what lets the bot's
+        // blunders through for the length of the run and shuts them after.
+        walkStaircaseRow(ctx, 13, maxTicks + 1, run -> {
+            ctx.runOnClient(mc -> BotController.CONFIG.wallBumpChance = 1.0);
+            try {
+                withSlips(ctx, 0.0, 0.0, run);
+            } finally {
+                ctx.runOnClient(mc -> BotController.CONFIG.wallBumpChance = configuredChance);
+            }
+        });
+    }
+
+    private void walkStaircaseRow(TestContext ctx, int standDx, int maxApproachStill,
+                                  java.util.function.Consumer<Runnable> around) {
+        final int head = Y + Math.floorMod(
+                SpiralStairs.ringIndexAt(Y) - SpiralStairs.ringIndex(6, 0),
+                SpiralStairs.RING_LENGTH);
+        final int feet = head - 1;
+        prepareWithFloor(ctx, feet, standDx, 1, 0, 13, 0, 2);
+        fill(ctx, 1, feet, 0, 12, head, 1, "stone");
+        final BlockPos headStep = new BlockPos(BASE_X + 6, head, BASE_Z);
+        final BlockPos footStep = new BlockPos(BASE_X + 7, feet, BASE_Z);
+        final BlockPos lastCell = new BlockPos(BASE_X + 12, head, BASE_Z + 1);
+        ctx.waitFor(mc -> !mc.level.getBlockState(lastCell).isAir());
+        ctx.runCommand("give @s cobblestone 64");
+
+        final PressedStill still = new PressedStill();
+        around.accept(() -> {
+            startChunkMiner(ctx, true, head, feet);
+            ctx.waitFor(mc -> {
+                still.sample(mc);
+                return !BehaviorRunner.isActive();
+            });
+            awaitChunkMiner(ctx, true);
+        });
+
+        assertNotAir(ctx, headStep, "the head layer's step");
+        assertNotAir(ctx, footStep, "the foot layer's step");
+        for (int dx = 1; dx <= 12; dx++) {
+            for (int dz = 0; dz <= 1; dz++) {
+                for (int y = feet; y <= head; y++) {
+                    BlockPos pos = new BlockPos(BASE_X + dx, y, BASE_Z + dz);
+                    if (!pos.equals(headStep) && !pos.equals(footStep)) {
+                        assertAir(ctx, pos, "row cell " + dx + "/" + dz + " at y=" + y);
+                    }
+                }
+            }
+        }
+        if (still.longest > MAX_PRESSED_STILL) {
+            throw new AssertionError("The bot held a walk key for " + still.longest + " ticks without moving,"
+                    + " ending at " + still.where + " — pressed against its own staircase, allowed "
+                    + MAX_PRESSED_STILL);
+        }
+        if (still.longestApproach > maxApproachStill) {
+            throw new AssertionError("The approach stood pressed against the step for " + still.longestApproach
+                    + " ticks before going round, ending at " + still.whereApproach + " — allowed "
+                    + maxApproachStill);
+        }
+        LOGGER.info("Staircase row from x={} passed: longest pressed standstill {} ticks at {}, on the approach {}",
+                standDx, still.longest, still.where, still.longestApproach);
+    }
+
+    /**
+     * Ticks a walk key may stay down with the body not moving: a bump, not a
+     * stall. What is left in this fixture is the row walk pressing into the
+     * next face while the camera finds the row's angle (up to 10, in LOOKING);
+     * before the fixes it was 23 to 28 ticks, or the run died on top of the step.
+     */
+    private static final int MAX_PRESSED_STILL = 12;
+
+    /**
+     * Ticks the approach to a hidden block may press against what stands in
+     * its way before going round: the two the stall takes to show, and one to
+     * spare. It waited ten once, every time.
+     */
+    private static final int MAX_GO_ROUND_STILL = 3;
+
+    /**
+     * The longest run of ticks with a walk key down and the body not moving
+     * horizontally, and where the bot stood at its end. Not while a block is
+     * breaking: along a row the walk presses on into the face being mined by
+     * design (see {@code holds its heading along a row}), and that is work,
+     * not a stall.
+     */
+    private static final class PressedStill {
+        int run;
+        int longest;
+        String where = "nowhere";
+        int approachRun;
+        int longestApproach;
+        String whereApproach = "nowhere";
+        double lastX = Double.NaN;
+        double lastZ;
+
+        void sample(net.minecraft.client.Minecraft mc) {
+            var o = mc.options;
+            boolean pressed = o.keyUp.isDown() || o.keyDown.isDown() || o.keyLeft.isDown()
+                    || o.keyRight.isDown();
+            double x = mc.player.getX();
+            double z = mc.player.getZ();
+            boolean moved = Double.isNaN(lastX) || Math.abs(x - lastX) + Math.abs(z - lastZ) > 0.005;
+            lastX = x;
+            lastZ = z;
+            if (pressed && !moved && BotController.getPhase() == BotController.Phase.POSITIONING) {
+                approachRun++;
+                if (approachRun > longestApproach) {
+                    longestApproach = approachRun;
+                    whereApproach = String.format(java.util.Locale.US, "(%.2f, %.2f, %.2f)",
+                            x, mc.player.getY(), z);
+                }
+            } else {
+                approachRun = 0;
+            }
+            if (pressed && !moved && BotController.getPhase() != BotController.Phase.INTERACTING) {
+                run++;
+                if (run > longest) {
+                    longest = run;
+                    var task = BotController.getCurrentTask();
+                    where = String.format(java.util.Locale.US,
+                            "(%.2f, %.2f, %.2f) yaw=%.0f phase=%s keys=%s%s%s%s target=%s",
+                            x, mc.player.getY(), z, mc.player.getYRot(), BotController.getPhase(),
+                            o.keyUp.isDown() ? "W" : "", o.keyDown.isDown() ? "S" : "",
+                            o.keyLeft.isDown() ? "A" : "", o.keyRight.isDown() ? "D" : "",
+                            task == null ? "none" : task.targetPos().toShortString());
+                }
+            } else {
+                run = 0;
+            }
+        }
+    }
+
     /**
      * How far the bot turns its head while it lays a bridge: the yaw summed
      * tick by tick over its placements, from the first one's break onward — the

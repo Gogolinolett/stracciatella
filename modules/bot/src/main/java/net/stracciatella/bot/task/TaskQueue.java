@@ -1,13 +1,14 @@
 package net.stracciatella.bot.task;
 
 import java.util.ArrayDeque;
+import java.util.function.Predicate;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.Vec3;
 
 /**
  * Queue of bot tasks. Tasks can be taken in FIFO order ({@link #poll()}) or
- * by proximity to the player's current position ({@link #pollNearest}) — the
+ * by proximity to the player's current position ({@link #peekNearest}) — the
  * latter is what the bot uses so it works targets the way a human routes
  * through an area (always the closest one from where it stands) instead of
  * replaying a fixed scan order.
@@ -71,13 +72,29 @@ public class TaskQueue {
         return Math.sqrt(target.distSqr(from)) + TURN_COST_BLOCKS * turn;
     }
 
-    /** {@link #peekNearest}, and take it. */
-    public BotTask pollNearest(BlockPos from, Vec3 eye, Vec3 view) {
-        BotTask best = peekNearest(from, eye, view);
-        if (best != null) {
-            queue.remove(best);
+    /**
+     * Returns (without removing) the {@code eligible} task whose target lies
+     * nearest the crosshair: the smallest angle between {@code view} and the
+     * line from {@code eye} to the target's centre. Null when none is eligible.
+     */
+    public BotTask nearestToView(Vec3 eye, Vec3 view, Predicate<BotTask> eligible) {
+        BotTask best = null;
+        double bestDot = -2.0;
+        for (BotTask task : queue) {
+            if (!eligible.test(task)) {
+                continue;
+            }
+            double dot = Vec3.atCenterOf(task.targetPos()).subtract(eye).normalize().dot(view);
+            if (dot > bestDot) {
+                bestDot = dot;
+                best = task;
+            }
         }
         return best;
+    }
+
+    public void remove(BotTask task) {
+        queue.remove(task);
     }
 
     /** Whether a queued task's current target is {@code pos}. */

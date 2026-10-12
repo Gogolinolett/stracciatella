@@ -188,12 +188,23 @@ public class BotController {
      * horizontally, so that one has already arrived.
      */
     private static final int CLOSING_STALL_TICKS = 10;
+    /**
+     * Ticks without getting closer after which an occluded approach takes the
+     * path round. Two, not one: the first tick from a standstill can move less
+     * than {@link #CLOSING_EPSILON}. It waited the whole
+     * {@link #CLOSING_STALL_TICKS} once, which reads as a bot pressed against
+     * the step of the chunk miner's staircase for half a second every time;
+     * now and then it still does, see {@code BotConfig.wallBumpChance}.
+     */
+    private static final int GO_ROUND_STALL_TICKS = 2;
     /** How much closer counts as progress. Same bar as the collect walk's. */
     private static final double CLOSING_EPSILON = 0.05;
     private static final int WRONG_HIT_STREAK_TICKS = 8;
     /** Closest the current POSITIONING has got, and how long ago that was. */
     private static double closeBest = Double.MAX_VALUE;
     private static int closeStalledTicks = 0;
+    /** This POSITIONING phase's patience before the path round, rolled in transitionTo. */
+    private static int goRoundPatience = GO_ROUND_STALL_TICKS;
 
     // Bridging: the crouch that lets the bot place a block into the gap it is
     // standing at the edge of. See updateBridging for when it goes down and,
@@ -375,6 +386,9 @@ public class BotController {
     private static final double ROW_FLOOR_LOOKAHEAD = 0.6;
     private static final double ROW_LANE_DRIFT = 0.3;
     private static final double ROW_LANE_ENTRY = 0.5;
+    // Close enough to the entry cell's line that the step into a row's lane
+    // goes straight across; see walkAlongRow.
+    private static final double ROW_LINE_UP_SLACK = 0.05;
     // How far a body coasts once the strafe key is up, in ticks of its current
     // speed: ground friction leaves 0.546 of it each tick, and 0.546 / (1 -
     // 0.546) is about 1.2, plus the tick the key is still read on.
@@ -920,11 +934,15 @@ public class BotController {
             // into a corner the staircase closes off, the bot pressed into the
             // step that hid the next block for the whole position timeout,
             // three times over, and the run ended on cannot break.
-            if (!arrived && !closingIn(horizontalDistanceTo(player, approaching))
-                    && closeStalledTicks == CLOSING_STALL_TICKS
-                    && navigateToStandoff(player, approaching, true)) {
-                forceApproach = false;
-                return;
+            if (!arrived && !closingIn(horizontalDistanceTo(player, approaching), goRoundPatience)
+                    && closeStalledTicks == goRoundPatience) {
+                if (navigateToStandoff(player, approaching, true)) {
+                    forceApproach = false;
+                    return;
+                }
+                if (takeTaskInSightInstead(client, player)) {
+                    return;
+                }
             }
         } else if (forceApproach) {
             // Close range, measured the whole way, with no settling for reach:
@@ -941,7 +959,7 @@ public class BotController {
             // working distance existed and what it should do.
             double horizontal = horizontalDistanceTo(player, approaching);
             arrived = horizontal <= WORK_DISTANCE
-                    || (isWithinReach(player, approaching) && !closingIn(horizontal));
+                    || (isWithinReach(player, approaching) && !closingIn(horizontal, CLOSING_STALL_TICKS));
         }
         if (arrived) {
             forceApproach = false;
@@ -1095,6 +1113,24 @@ public class BotController {
     }
 
     private static void tickLooking(Minecraft client, LocalPlayer player) {
+        // Gone before the pick got to it: there is nothing to aim at, and the
+        // aim looked through the empty cell at whatever lay beyond until the
+        // look ran out, twice, and the task failed. Cave vines under a head
+        // block fall with it, and the chunk miner plans the two as one column:
+        // reported as a row's foot blocks left standing, logged as two look
+        // timeouts with the hit result on the block behind the target.
+        if (currentTask.interactionType() == InteractionType.ATTACK
+                && currentTask.isCurrentTargetComplete(client.level)) {
+            LOGGER.info("Target already gone: {}", currentTask.description());
+            if (currentTask.advanceToNextTarget()) {
+                lookRetryUsed = false;
+                transitionTo(Phase.LOOKING);
+                return;
+            }
+            releaseMovementKeys();
+            completeCurrentTask();
+            return;
+        }
         if (phaseTicks > CONFIG.lookTimeout) {
             if (!lookRetryUsed) {
                 // Couldn't get the raycast onto the target from here — step
@@ -1758,8 +1794,22 @@ public class BotController {
                 + (player.getZ() - (target.getZ() + 0.5)) * rowAxis.getStepZ();
         double lateral = rowLateral(player, target);
         if (Math.abs(lateral) > ROW_LANE_ENTRY) {
-            return stepToward(client, player, target, target.getX() + 0.5 - rowAxis.getStepX(),
-                    target.getZ() + 0.5 - rowAxis.getStepZ());
+            double entryX = target.getX() + 0.5 - rowAxis.getStepX();
+            double entryZ = target.getZ() + 0.5 - rowAxis.getStepZ();
+            // Lined up with the entry cell first where the body cannot step
+            // straight across into it. The step is mostly sideways, the keys
+            // come in eight directions, and the bit of it along the row is lost
+            // to the rounding: a body reaching three hundredths of a block into
+            // the column beside the entry cell strafed into the head-high step
+            // of the chunk miner's staircase standing there, and pressed
+            // against its corner for a second at a time.
+            AABB across = player.getBoundingBox().move(alongX ? 0.0 : -lateral, 0.0, alongX ? -lateral : 0.0);
+            double lineUp = alongX ? entryX - player.getX() : entryZ - player.getZ();
+            if (Math.abs(lineUp) > ROW_LINE_UP_SLACK && !client.level.noCollision(player, across)) {
+                return stepToward(client, player, target, alongX ? entryX : player.getX(),
+                        alongX ? player.getZ() : entryZ);
+            }
+            return stepToward(client, player, target, entryX, entryZ);
         }
         if (along > -ROW_BEHIND) {
             return false;
@@ -2780,6 +2830,16 @@ public class BotController {
      * presses the bot into the corner diagonally short of it until the cell
      * ahead is that block. The bot hopped onto it after the first block of
      * every corner and mined it from on top.
+     *
+     * <p>And onto nothing else that lifts the feet above the target: a climb
+     * is the way to work that lies higher up, never to work on the level the
+     * body already stands on or below it. The target block itself is only the
+     * nearest case. The chunk miner's staircase is the next one: walking along
+     * the ring row to the cell under the head-high step, the bot jumped onto
+     * the foot-high step in front of it and from there onto the head-high step
+     * itself, then stood on the lid of its own target and looked at the step
+     * under its feet until the run ended on {@code cannot break} — from either
+     * end of the row.
      */
     private static void stepUpIfBlocked(Minecraft client, LocalPlayer player,
                                         double dirX, double dirZ) {
@@ -2794,7 +2854,7 @@ public class BotController {
                 player.getY(),
                 player.getZ() + dirZ / length * STEP_UP_LOOKAHEAD);
         if (ahead.equals(feet) || !hasCollision(level, ahead)
-                || (currentTask != null && ahead.equals(currentTask.targetPos()))) {
+                || (currentTask != null && ahead.getY() >= currentTask.targetPos().getY())) {
             return;
         }
         if (hasCollision(level, ahead.above()) || hasCollision(level, ahead.above(2))
@@ -3526,6 +3586,7 @@ public class BotController {
         // have stopped using.
         closeBest = Double.MAX_VALUE;
         closeStalledTicks = 0;
+        goRoundPatience = HumanBehavior.randomGoRoundPatience(CONFIG, GO_ROUND_STALL_TICKS);
     }
 
     /**
@@ -3576,12 +3637,42 @@ public class BotController {
                         player.getViewVector(1.0f));
     }
 
+    /**
+     * Put the hidden task back at the head of the queue and take the queued
+     * mining task in sight nearest the crosshair instead; false when there is
+     * none. For an occluded approach that has stuck with no way round: at the
+     * chunk miner's staircase the foot block beside a step's corner is hidden
+     * by the step on one side and the next column on the other, and the bot
+     * stood at it for the whole position timeout with that column right in
+     * front of it and next in the queue. Taken first, it opens the line to the
+     * hidden one. Only here, not whenever the next block is hidden: a sweep
+     * hands over hidden blocks in their place on purpose and the approach walks
+     * to them, and taking a visible block first everywhere scrambled its order.
+     */
+    private static boolean takeTaskInSightInstead(Minecraft client, LocalPlayer player) {
+        BotTask inSight = taskQueue.nearestToView(player.getEyePosition(), player.getViewVector(1.0f),
+                task -> task.interactionType() == InteractionType.ATTACK && hasLineOfSight(client, player, task));
+        if (inSight == null) {
+            return false;
+        }
+        LOGGER.info("Hidden from here: {} — taking {} first", currentTask.description(), inSight.description());
+        taskQueue.remove(inSight);
+        taskQueue.addFirst(currentTask);
+        currentTask = inSight;
+        taskTotalTicks = 0;
+        lookRetryUsed = false;
+        forceApproach = false;
+        transitionTo(Phase.LOOKING);
+        return true;
+    }
+
     /** {@link #peekNextTask}, and take it. */
     private static BotTask pollNextTask(LocalPlayer player) {
-        return policy.orderedTasks() || player == null
-                ? taskQueue.poll()
-                : taskQueue.pollNearest(player.blockPosition(), player.getEyePosition(),
-                        player.getViewVector(1.0f));
+        BotTask next = peekNextTask(player);
+        if (next != null) {
+            taskQueue.remove(next);
+        }
+        return next;
     }
 
     private static void startNextTask() {
@@ -3764,13 +3855,13 @@ public class BotController {
      * walk can change — fed the full distance, this watchdog would be asked to
      * judge a walk by a number the walk does not control.
      */
-    private static boolean closingIn(double distance) {
+    private static boolean closingIn(double distance, int patience) {
         if (distance < closeBest - CLOSING_EPSILON) {
             closeBest = distance;
             closeStalledTicks = 0;
             return true;
         }
-        return ++closeStalledTicks < CLOSING_STALL_TICKS;
+        return ++closeStalledTicks < patience;
     }
 
     /**

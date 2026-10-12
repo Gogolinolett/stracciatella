@@ -69,7 +69,7 @@ public class ServerSettings {
      * Storages in the given dimension, in file order.
      *
      * <p>File order carries no preference — a restock picks the nearest of these,
-     * the same rule {@code TaskQueue.pollNearest} applies to blocks and for the
+     * the same rule {@code TaskQueue.peekNearest} applies to blocks and for the
      * same reason: a person walks to the chest they are standing closest to. The
      * order is just the order they were added in, so the file reads like a log.
      */

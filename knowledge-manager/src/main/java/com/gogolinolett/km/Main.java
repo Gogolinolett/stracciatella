@@ -20,16 +20,16 @@ public class Main {
 
         switch (args[0]) {
             case "save" -> {
-                requireArgs(args, 5, "save <ticketId> <problem> <lösung> <tag1,tag2,...>");
+                requireArgs(args, 5, 5, "save <ticketId> <problem> <lösung> <tag1,tag2,...>");
                 manager.saveNewTicket(args[1], args[2], args[3], List.of(args[4].split(",")));
             }
             case "search" -> {
-                requireArgs(args, 2, "search <query> [maxResults]");
+                requireArgs(args, 2, 3, "search <query> [maxResults]");
                 int maxResults = args.length > 2 ? Integer.parseInt(args[2]) : 3;
                 System.out.println(manager.searchKnowledge(args[1], maxResults));
             }
             case "update" -> {
-                requireArgs(args, 3, "update <ticketId> <neues Wissen>");
+                requireArgs(args, 3, 3, "update <ticketId> <neues Wissen>");
                 manager.updateExistingTicket(args[1], args[2]);
             }
             default -> {
@@ -53,9 +53,15 @@ public class Main {
         System.out.println(results);
     }
 
-    private static void requireArgs(String[] args, int expected, String usage) {
-        if (args.length < expected) {
-            System.err.println("Verwendung: " + usage);
+    /**
+     * Extra arguments are rejected, not ignored: a quote character inside a value ends
+     * its quoting early in Gradle's --args parsing, and the rest of the text would
+     * otherwise land in the next argument (save: split into tags) or vanish silently.
+     */
+    private static void requireArgs(String[] args, int min, int max, String usage) {
+        if (args.length < min || args.length > max) {
+            System.err.println("Verwendung: " + usage + " - " + (args.length - 1)
+                    + " Argumente erhalten; ein Anführungszeichen im Text beendet das Quoting vorzeitig");
             System.exit(1);
         }
     }
